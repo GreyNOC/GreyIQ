@@ -6,12 +6,40 @@ Nginx or another reverse proxy in front when exposing it on a server.
 ## Prerequisites
 
 - Node.js 22.12 or newer for the desktop build (Debian 13's `nodejs` package is Node 20)
-- Python 3.10 or newer recommended
+- Python 3.11 or newer — the only requirement of the `gn` CLI, and the floor its
+  launcher enforces (Debian 12 ships 3.11, Debian 13 ships 3.13)
 - npm
 - PM2 for process persistence when running as a server: `npm install -g pm2`
 - Nginx and Certbot only when exposing GreyIQ through a domain
 
 ## Install
+
+### CLI from a git clone (any Debian-family distro, any architecture)
+
+The `gn` bug-bounty CLI boots on the stdlib alone, so a clone and the
+distribution `python3` are the whole install — no venv, no pip, no root, no
+package:
+
+```bash
+git clone https://github.com/GreyNOC/GreyIQ.git
+cd GreyIQ
+./scripts/install-cli.sh
+gn dashboard
+```
+
+`install-cli.sh` writes `~/.local/bin/gn` (a wrapper around the checkout's `./gn`,
+so `git pull` updates it) and prints the `export PATH=…` line when that directory
+is not yet on PATH. `--extras` adds the two optional engine libraries from
+`requirements-cli.txt` in a checkout `.venv`; `--bin-dir`, `--name` and `--force`
+cover a different location, a name clash with Google's GN build tool, and
+replacing a foreign command. `scripts/smoke-source-cli.sh` gates this path in CI
+on Debian 12 (the Parrot 6 / Kali base) and Debian 13 containers holding nothing
+but `python3`.
+
+Use this on Parrot, Kali, and anywhere `dpkg --print-architecture` is not
+`amd64`. The `.deb`, AppImage and CLI tarball below are **release assets, not
+files in the clone**; README.md lists the exact `apt`/`dpkg` errors that follow
+from confusing the two.
 
 ### Debian 13 desktop package
 
@@ -71,7 +99,10 @@ For the portable AppImage, install `libfuse2t64` and `zstd`, then use `chmod +x`
 and launch it. A desktop session with working unprivileged user namespaces is
 required for Electron's sandbox; keep the sandbox enabled.
 
-### Debian 13 source checkout
+### Debian 13 source checkout (desktop + local models)
+
+This is the DESKTOP and local-model path. The `gn` CLI needs none of it — the
+clone install above covers hunting, scanning and the dashboard.
 
 Debian 13 supplies Python 3.13. Use a virtual environment for Python packages:
 Install [Node.js 22.12 or newer](https://nodejs.org/en/download) before `npm ci`;

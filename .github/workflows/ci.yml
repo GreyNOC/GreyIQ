@@ -54,6 +54,19 @@ jobs:
       - name: Run project checks
         run: npm run check
 
+  source-cli:
+    name: Source CLI install (Debian 12 + 13)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # The clone-and-run install is what Parrot/Kali/arm64 operators are given when
+      # the amd64 .deb does not apply, so it carries its own gate: python3 only, in a
+      # bookworm container (Parrot 6 / Kali base) and a trixie one.
+      - name: Smoke-test the clone-and-run CLI install
+        run: bash scripts/smoke-source-cli.sh
+
   debian-13:
     name: Debian 13 / system Python 3.13
     runs-on: ubuntu-24.04

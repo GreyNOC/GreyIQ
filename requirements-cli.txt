@@ -1,0 +1,20 @@
+# Optional extras for the SOURCE CLI (`./gn`), installed by
+# `scripts/install-cli.sh --extras` into the checkout's `.venv`.
+#
+# The CLI boot path is stdlib-only, so nothing here is required to run `gn` —
+# each line unlocks one engine capability that degrades silently without it:
+#
+#   PyYAML       YAML OpenAPI/Swagger specs during recon (api_discovery_service
+#                skips /openapi.yaml and still handles every JSON spec without it)
+#   cryptography RS256 signing that proves a leaked GCP service-account key is
+#                live (AWS key liveness uses stdlib hmac and needs no dependency)
+#
+# Deliberately NOT here: torch (the CLI is torch-free by design — see
+# backend/test_boot_no_torch.py), and the desktop/report stack (playwright,
+# Pillow, pypdf, python-docx, OCR). Use requirements.txt for those.
+#
+# Pins MUST match requirements.txt exactly; scripts/check-devops.cjs fails the
+# check if they drift, so the extras can never resolve to a different version
+# than the frozen release build audits.
+PyYAML>=6.0,<7.0
+cryptography>=50.0,<51.0

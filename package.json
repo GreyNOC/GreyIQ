@@ -105,7 +105,7 @@
         "libxtst6",
         "xdg-utils",
         "libatspi2.0-0",
-        "libasound2t64",
+        "libasound2t64 | libasound2",
         "libgbm1",
         "libuuid1",
         "libsecret-1-0",
