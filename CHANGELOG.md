@@ -4,6 +4,35 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- `gn dash` is now the **threat board, resident**. It opens the same full-screen board a hunt flies
+  arcs across (`gn_fx.Board`) in STANDBY — nothing running, DEFCON 5, `ASSETS 0/0`, live clock — with
+  a command line drawn under the box. It used to refuse unless a run already existed ("name a
+  target, or `--attach`"), which made the one verb you reach for on a fresh terminal the one that
+  needed a hunt first. `/hunt <url> -y` hands off to the real hunt rather than replaying one, so the
+  arcs are the engine's own and the summary and report path land in the scrollback; ENTER returns to
+  standby, `q` leaves. `/attach` and `/panels` hand over to the panel cockpit, which is unchanged and
+  still what `gn dash <target> -y`, `gn dash --attach` and `gn dash --panels` open (`--home` is kept
+  as the older spelling of `--panels`). The board's command set is deliberately small — the two
+  teletype rows cannot show a table, so `/usage`, `/leads`, `/program` and every `gn` verb stay in
+  `/panels`, and typing one here says so instead of printing two rows of a nine-row answer. Refusals
+  wrap to the width the board actually has, read off the board's own geometry rather than written
+  down. A terminal that will not take the board (under 74x24, a redirected stderr, `NO_COLOR`,
+  `GN_NO_FX`) refuses and names `--panels`; `--json` with no target refuses rather than quietly
+  opening a screen nothing can parse.
+- `-y/--authorize` now **puts the target it was typed about in scope**. `gn hunt
+  https://acme.example -y` is the whole command: no `-s acme.example` repeating the target, and no
+  "Target host acme.example is not explicitly named by the scope" for forgetting it. `gn auto` has
+  always derived scope from its own targets; this is that rule for `hunt`, `campaign`, `dash`,
+  `scan`, `takeover`, `cve`, `idor`, `idor-probe` and `bfla`. Three bounds make it safe: without
+  `-y` nothing is added (the flag is the attestation); the grant is **exact** — the target's own host
+  or repository root, never a `*.` wildcard, and `gn auto`'s wider apex is not used; and only the
+  target the operator NAMED is granted, so a host the engine discovers mid-run must still be in
+  scope on its own. `settings.excluded_hosts` still wins over it, a bare public suffix
+  (`herokuapp.com`), a single-label host, a local path and a credentialed URL grant nothing, and the
+  derived grant is produced in one place in the engine (`bounty.self_scope_grant`) that is pinned
+  against the scope preflight so the two cannot drift. The threat board's `SCOPE` heading and the
+  report's scope line now state the run's effective scope, which is what it is bound by.
+
 ## v4.12.0 - hunts that pause at the login wall
 
 - CLI hunts now pause at an authentication wall instead of reporting a protected

@@ -505,6 +505,22 @@ after saving.
   programs that have actually paid first** instead of alphabetically, and **retrains the offline
   ranker** from the corpus it is growing (the trainer's own gate refuses a corpus too small or a
   model that doesn't beat the rules). `gn sync` does the same pass by hand.
+- **The dash** — `gn dash` opens the **threat board** in standby: the same full-screen map a hunt
+  flies arcs across, with nothing running and a command line under it. Type `/hunt <url> -y` and the
+  board hands off to the real hunt (so the arcs are the engine's own), the summary and report path
+  land in your scrollback, and ENTER brings standby back; `q` leaves. `/panels` (or `gn dash
+  --panels`) switches to the **panel cockpit** — TARGETS / FINDINGS / RATE / LOG, an OUTPUT pane,
+  `/usage`, and every `gn` verb typed inside it. `gn dash <target> -y` and `gn dash --attach` still
+  open the panel cockpit over one specific run. The board needs a 74x24 terminal and draws on
+  stderr; anything narrower says so and names `--panels`. `gn fx wopr` replays the board's demo if
+  you just want to check a terminal.
+- **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
+  so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
+  you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository
+  root) and additive: your own `-s` text is kept, a `*.` wildcard is never invented, a host the
+  engine *discovers* mid-run still has to be in scope on its own, and a saved program's exclusion
+  still wins. Without `-y` nothing widens — the flag is the attestation. Use `-s` for anything
+  *beyond* the target, e.g. `-s '*.corp.example'`.
 - **Hunt a directory** — `gn auto -y` in a repo or a hunt folder. It reads
   the targets from `.greyiq/targets.txt` (one per line, `#` comments) or `.greyiq/hunt.json`; in a
   git repo with no targets listed, the **repository itself** is the target and its remote is the

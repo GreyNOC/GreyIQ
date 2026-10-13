@@ -1324,5 +1324,97 @@ class TheBoardIsWiredIntoTheHuntingVerbsTests(unittest.TestCase):
         self.assertNotIn("1049", proc.stderr, "the alternate-screen escape reached a pipe")
 
 
+class TheResidentBoardTakesACommandLineTests(unittest.TestCase):
+    """``interactive=True`` — the board `gn dash` sits on, with an input line under it.
+
+    The board is output-only by construction: the ticker thread owns the stream. So the driver
+    hands the typed text in and the ticker draws it, which is what these pin — plus the two things
+    an operator would notice immediately if they were missing: a cursor they can see, and one that
+    sits where they are typing rather than out on the map.
+    """
+
+    def _board(self, *, interactive: bool = True) -> gn_fx.Board:
+        return gn_fx.Board("t", stream=_tty("utf-8"), active=True, clock_base=0.0,
+                           interactive=interactive)
+
+    def _rows(self, board: gn_fx.Board, t: float = 3.0) -> list[str]:
+        board._grid.clear()
+        board._draw(t)
+        return [_ANSI.sub("", row) for row in board._grid.rows()]
+
+    def test_the_line_is_drawn_under_the_box_not_inside_it(self) -> None:
+        # Inside, it would have to take a row from the map, the status bar or the teletype — and
+        # every one of those is something the board exists to show.
+        board = self._board()
+        board.command_line("hunt https://t.example -y", 4)
+        rows = self._rows(board)
+        self.assertEqual(len(rows), gn_fx._BOARD_ROWS)
+        self.assertTrue(rows[-1].startswith("> hunt https://t.example -y"))
+        self.assertNotIn("hunt https", "\n".join(rows[:-1]))
+
+    def test_the_cursor_is_parked_where_the_operator_is_typing(self) -> None:
+        board = self._board()
+        board.command_line("abcdef", 3)
+        self._rows(board)
+        self.assertEqual(board._caret, (5, gn_fx._BOARD_ROWS - 1), "2 for the prompt, then 3")
+        board.command_line("abcdef", 0)
+        self._rows(board)
+        self.assertEqual(board._caret, (2, gn_fx._BOARD_ROWS - 1))
+
+    def test_a_caret_past_the_text_cannot_be_parked_off_the_board(self) -> None:
+        board = self._board()
+        board.command_line("ab", 9999)
+        self._rows(board)
+        x, _y = board._caret
+        self.assertLessEqual(x, board._cols - 1)
+        self.assertEqual(x, 4, "clamped to the end of the text, not to the edge")
+
+    def test_a_line_wider_than_the_board_is_cut_rather_than_folded(self) -> None:
+        board = self._board()
+        board.command_line("x" * 400, 400)
+        rows = self._rows(board)
+        self.assertEqual(len(rows[-1]), board._cols)
+
+    def test_every_frame_is_still_exactly_the_grid_it_promises(self) -> None:
+        board = self._board()
+        board.track(["a.example.com"])
+        board.command_line("/hunt", 5)
+        for row in self._rows(board):
+            self.assertEqual(len(row), board._cols)
+
+    def test_a_hunts_board_has_no_prompt_to_type_at(self) -> None:
+        # A prompt drawn under a board nothing is reading would invite typing into a dead field.
+        board = self._board(interactive=False)
+        board.command_line("hunt https://t.example -y", 4)
+        rows = self._rows(board)
+        self.assertNotIn("hunt https", "\n".join(rows))
+        self.assertIsNone(board._caret)
+
+    def test_the_cursor_is_shown_for_a_command_line_and_hidden_without_one(self) -> None:
+        for interactive, shown in ((True, True), (False, False)):
+            with self.subTest(interactive=interactive):
+                stream = _tty("utf-8")
+                board = gn_fx.Board("t", stream=stream, active=True, interactive=interactive)
+                try:
+                    board.start()
+                finally:
+                    board.stop()
+                written = stream.getvalue()
+                self.assertIn("\033[?1049h", written)
+                # Immediately after the enter sequence, which is the one that hid it. Anything
+                # later is the LEAVE sequence, which shows the cursor on both paths.
+                after = written.split(gn_fx._TERM_ENTER, 1)[1]
+                self.assertIs(after.startswith("\033[?25h"), shown)
+
+    def test_the_caret_escape_is_written_after_the_rows_it_follows(self) -> None:
+        board = self._board()
+        board.command_line("ab", 2)
+        with board._lock:
+            board._paint_locked(1.0)
+        painted = board._stream.getvalue()
+        self.assertTrue(painted.endswith(f"\033[{board._caret[1] + 1};{board._caret[0] + 1}H"),
+                        "a row write leaves the cursor where that row ended")
+
+
 if __name__ == "__main__":
     unittest.main()

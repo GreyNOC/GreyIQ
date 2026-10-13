@@ -582,10 +582,25 @@ class DashVerbTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("takes no target", err)
 
-    def test_dash_needs_a_target_or_attach(self) -> None:
-        code, _, err = _run(["dash"])
+    def test_bare_dash_opens_the_board_rather_than_refusing(self) -> None:
+        # It used to refuse ("name a target, or --attach"), which made the one verb you reach for
+        # on a fresh terminal the one that needed a run to exist first.
+        with mock.patch.object(gn_cli, "_cmd_dash_board", return_value=0) as board:
+            code = gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash"]))
+        self.assertEqual(code, 0)
+        board.assert_called_once()
+
+    def test_board_and_another_view_are_refused_together(self) -> None:
+        for extra in (["--panels"], ["--attach"], ["https://t.example"]):
+            with self.subTest(extra=extra):
+                code, _, err = _run(["dash", "--board", *extra])
+                self.assertEqual(code, 2)
+                self.assertIn("--board is the IDLE dash", err)
+
+    def test_the_board_refuses_a_machine_feed_instead_of_silently_hunting(self) -> None:
+        code, _, err = _run(["dash", "--json"])
         self.assertEqual(code, 2)
-        self.assertIn("--attach", err)
+        self.assertIn("no run to serialize", err)
 
     def test_authorization_is_refused_in_hunts_own_words(self) -> None:
         # Same sentence from both verbs: two wordings read as two rules.
@@ -604,14 +619,212 @@ class DashVerbTests(unittest.TestCase):
             self.assertIn(expected, out)
 
 
-class DashHomeTests(unittest.TestCase):
-    """``gn dash --home`` — the idle cockpit and the relaunch handoff `GreyNOC Start` depends on."""
+class AuthorizeCarriesScopeTests(unittest.TestCase):
+    """``-y`` is sudo for the thing you pointed at: it puts that target in scope.
+
+    Every verb here used to make the operator say it twice — `gn hunt https://acme.example -y -s
+    acme.example` — and refuse the run for forgetting the second half. These pin the three bounds
+    that make the shortcut safe: no -y, no widening; additive and exact; only the named target.
+    """
+
+    def _args(self, *argv: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(list(argv))
+
+    def test_y_puts_the_target_in_scope(self) -> None:
+        args = self._args("hunt", "https://acme.example", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "acme.example")
+
+    def test_without_y_nothing_is_added(self) -> None:
+        # The flag IS the attestation. A scope that widened without it would be this program
+        # asserting an authorization nobody gave.
+        args = self._args("hunt", "https://acme.example")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "")
+        args = self._args("hunt", "https://acme.example", "-s", "other.example")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "other.example")
+
+    def test_the_operators_own_scope_is_kept_and_added_to_never_rewritten(self) -> None:
+        args = self._args("hunt", "https://acme.example", "-y", "-s", "*.corp.example other.example")
+        scope = gn_cli._authorized_scope(args, args.target)
+        self.assertTrue(scope.startswith("*.corp.example other.example"))
+        self.assertIn("acme.example", scope.split())
+
+    def test_a_target_already_named_is_not_named_twice(self) -> None:
+        for typed in ("acme.example", "ACME.example", "other.example acme.example"):
+            with self.subTest(typed=typed):
+                args = self._args("hunt", "https://acme.example", "-y", "-s", typed)
+                self.assertEqual(gn_cli._authorized_scope(args, args.target), typed)
+
+    def test_nothing_is_added_for_a_target_that_needs_no_scope(self) -> None:
+        for target in (".", "./repo", "not a url"):
+            with self.subTest(target=target):
+                args = self._args("hunt", target, "-y", "-p", "source-code")
+                self.assertEqual(gn_cli._authorized_scope(args, args.target), "")
+
+    def test_a_wildcard_is_never_derived(self) -> None:
+        args = self._args("hunt", "https://sub.acme.example", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "sub.acme.example")
+
+    def test_two_targets_each_grant_only_themselves(self) -> None:
+        args = self._args("idor", "https://acme.example/a", "https://acme.example/b", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.url_a, args.url_b), "acme.example")
+        args = self._args("idor", "https://a.example/x", "https://b.example/y", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.url_a, args.url_b).split(),
+                         ["a.example", "b.example"])
+
+    def test_the_hunt_passes_the_derived_scope_to_the_engine_and_the_board(self) -> None:
+        captured: dict = {}
+
+        def _hunt(*a: object, **kw: object) -> dict:
+            captured["scope"] = a[4]
+            return {"ok": True, "findings": [], "severity_counts": {}, "report_path": "r.md"}
+
+        with mock.patch("bughunter.bounty.run_bounty_hunt", side_effect=_hunt), \
+             mock.patch.object(gn_cli, "_fx") as fx:
+            code = gn_cli._cmd_hunt(self._args("hunt", "https://acme.example", "-y", "--no-fx"))
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["scope"], "acme.example",
+                         "the engine reads permission out of the scope text")
+        self.assertEqual(fx.call_args.kwargs["scope"], "acme.example",
+                         "the board states the scope the run is actually bound by")
+
+    def test_scan_fills_the_scope_it_was_not_given_without_joining_one_it_was(self) -> None:
+        # Its gate takes exactly ONE exact grant, so this verb substitutes rather than appends.
+        with mock.patch("bughunter.chat_commands.validate_scoped_network_target",
+                        return_value={"ok": True, "scope_host": "acme.example"}) as gate, \
+             mock.patch("bughunter.web_scan_service.run_web_scan",
+                        return_value={"ok": True, "findings": []}), \
+             mock.patch("bughunter.triage.summarize_findings", return_value=""):
+            gn_cli._cmd_scan(self._args("scan", "https://acme.example", "-y"))
+            self.assertEqual(gate.call_args.args[2], "acme.example")
+            gn_cli._cmd_scan(self._args("scan", "https://acme.example", "-y",
+                                        "-s", "acme.example"))
+            self.assertEqual(gate.call_args.args[2], "acme.example")
+
+
+class DashBoardTests(unittest.TestCase):
+    """``gn dash`` — the resident threat board, and what each of its asks relaunches."""
 
     def _args(self, *extra: str) -> argparse.Namespace:
-        return gn_cli.build_parser().parse_args(["dash", "--home", *extra])
+        return gn_cli.build_parser().parse_args(["dash", *extra])
 
-    def test_home_is_registered_and_routes_to_the_home_driver(self) -> None:
-        self.assertTrue(self._args().home)
+    def _board(self, ask: object) -> tuple[int, dict]:
+        """Run the driver with one ask coming back from the board, then a quit."""
+        asks = [ask, None]
+        calls: dict = {}
+
+        def _run_board(**kw: object) -> object:
+            calls["kw"] = kw
+            return asks.pop(0)
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", side_effect=_run_board), \
+             mock.patch.object(gn_cli, "_dash_board_again", return_value=False), \
+             mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt, \
+             mock.patch.object(gn_cli, "_cmd_dash", return_value=0) as dash:
+            code = gn_cli._cmd_dash_board(self._args())
+        calls["hunt"], calls["dash"] = hunt, dash
+        return code, calls
+
+    def test_quitting_the_board_launches_nothing(self) -> None:
+        code, calls = self._board(None)
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        calls["dash"].assert_not_called()
+
+    def test_a_hunt_runs_the_real_verb_with_the_consent_and_depth_the_board_took(self) -> None:
+        # _cmd_hunt, NOT _cmd_dash: the hunt must draw its own live board (the arcs are the
+        # engine's) and leave its summary on a restored terminal.
+        code, calls = self._board({"action": "hunt", "target": "https://t.example",
+                                   "depth": {"theorize": True, "turns": 3}})
+        self.assertEqual(code, 0)
+        calls["dash"].assert_not_called()
+        nxt = calls["hunt"].call_args[0][0]
+        self.assertEqual(nxt.target, "https://t.example")
+        self.assertTrue(nxt.authorize, "the board demanded -y; that consent must carry through")
+        self.assertTrue(nxt.theorize)
+        self.assertEqual(nxt.turns, 3)
+        self.assertFalse(nxt.attach)
+        for flag in ("board", "home", "panels"):
+            self.assertFalse(getattr(nxt, flag), f"leaving --{flag} set would recurse")
+
+    def test_a_hunt_returns_to_standby_until_the_operator_says_otherwise(self) -> None:
+        asks = [{"action": "hunt", "target": "https://t.example", "depth": {}},
+                {"action": "hunt", "target": "https://t.example", "depth": {}}, None]
+        again = [True, False]
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", side_effect=lambda **_kw: asks.pop(0)), \
+             mock.patch.object(gn_cli, "_dash_board_again", side_effect=lambda: again.pop(0)), \
+             mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt:
+            code = gn_cli._cmd_dash_board(self._args())
+        self.assertEqual(code, 0)
+        self.assertEqual(hunt.call_count, 2, "ENTER brings the board back; q leaves")
+
+    def test_attach_and_panels_hand_over_to_the_cockpit(self) -> None:
+        for ask, expected in (({"action": "attach"}, {"attach": True, "target": ""}),
+                              ({"action": "panels"}, {"panels": True})):
+            with self.subTest(ask=ask):
+                code, calls = self._board(ask)
+                self.assertEqual(code, 0)
+                calls["hunt"].assert_not_called()
+                nxt = calls["dash"].call_args[0][0]
+                for field, value in expected.items():
+                    self.assertEqual(getattr(nxt, field), value)
+
+    def test_an_unknown_ask_launches_nothing(self) -> None:
+        code, calls = self._board({"action": "sudo-rm-rf"})
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        calls["dash"].assert_not_called()
+
+    def test_the_scope_the_operator_declared_is_what_the_board_states(self) -> None:
+        # The board prints it beside "AUTHORIZED SCOPE ONLY"; it may only ever be the operator's
+        # own words, never a target standing in for them.
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", return_value=None) as run_board:
+            gn_cli._cmd_dash_board(gn_cli.build_parser().parse_args(
+                ["dash", "-s", "*.acme.example"]))
+        self.assertEqual(run_board.call_args.kwargs["scope"], "*.acme.example")
+
+    def test_a_terminal_that_will_not_take_the_board_says_so(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value="too small, it says"), \
+             mock.patch("gn_dash.run_board") as run_board:
+            code, _out, err = _run(["dash"])
+        self.assertEqual(code, 2)
+        self.assertIn("too small, it says", err)
+        run_board.assert_not_called()
+
+    def test_a_non_tty_refuses_instead_of_silently_hunting(self) -> None:
+        code, _out, err = _run(["dash"])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal", err.lower())
+
+    def test_returning_to_standby_is_the_default_answer_and_q_is_not(self) -> None:
+        for typed, expected in (("", True), ("\n", True), ("q", False), ("Q", False),
+                                ("quit", False), ("yes", True)):
+            with self.subTest(typed=typed), mock.patch("builtins.input", return_value=typed):
+                self.assertIs(gn_cli._dash_board_again(), expected)
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(gn_cli._dash_board_again(), "a piped stdin has nobody to ask")
+
+
+class DashHomeTests(unittest.TestCase):
+    """``gn dash --panels`` — the idle cockpit and the relaunch handoff `GreyNOC Start` depends on."""
+
+    def _args(self, *extra: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(["dash", "--panels", *extra])
+
+    def test_the_older_home_spelling_still_opens_the_panels(self) -> None:
+        self.assertTrue(gn_cli.build_parser().parse_args(["dash", "--home"]).home)
+        with mock.patch.object(gn_cli, "_cmd_dash_home", return_value=0) as home:
+            gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash", "--home"]))
+        home.assert_called_once()
+
+    def test_panels_is_registered_and_routes_to_the_home_driver(self) -> None:
+        self.assertTrue(self._args().panels)
         with mock.patch.object(gn_cli, "_cmd_dash_home", return_value=0) as home:
             gn_cli._cmd_dash(self._args())
         home.assert_called_once()
