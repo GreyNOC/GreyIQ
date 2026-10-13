@@ -1116,16 +1116,26 @@ class DashBoardTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(hunt.call_count, 2, "ENTER brings the board back; q leaves")
 
-    def test_attach_and_panels_hand_over_to_the_cockpit(self) -> None:
-        for ask, expected in (({"action": "attach"}, {"attach": True, "target": ""}),
-                              ({"action": "panels"}, {"panels": True})):
-            with self.subTest(ask=ask):
-                code, calls = self._board(ask)
-                self.assertEqual(code, 0)
-                calls["hunt"].assert_not_called()
-                nxt = calls["dash"].call_args[0][0]
-                for field, value in expected.items():
-                    self.assertEqual(getattr(nxt, field), value)
+    def test_attach_watches_one_run_and_ends_the_switch(self) -> None:
+        # --attach is not a VIEW: it opens the panel cockpit over one specific run, so it hands
+        # back no view to switch to.
+        code, calls = self._board({"action": "attach"})
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        nxt = calls["dash"].call_args[0][0]
+        self.assertTrue(nxt.attach)
+        self.assertEqual(nxt.target, "")
+
+    def test_the_other_views_are_handed_back_by_name(self) -> None:
+        # The transition table, not the call graph: `_cmd_dash_views` is the one place a view
+        # switch happens, so these return a NAME and nothing calls another view from in here.
+        for action in ("panels", "studio"):
+            with self.subTest(action=action):
+                with mock.patch("gn_tui.refusal", return_value=""),                      mock.patch("gn_dash.board_refusal", return_value=""),                      mock.patch("gn_dash.run_board", return_value={"action": action}),                      mock.patch.object(gn_cli, "_cmd_dash") as dash,                      mock.patch.object(gn_cli, "_cmd_dash_home") as home:
+                    code, view = gn_cli._dash_board_view(self._args())
+                self.assertEqual((code, view), (0, action))
+                dash.assert_not_called()
+                home.assert_not_called()
 
     def test_an_unknown_ask_launches_nothing(self) -> None:
         code, calls = self._board({"action": "sudo-rm-rf"})
@@ -1164,6 +1174,116 @@ class DashBoardTests(unittest.TestCase):
                 self.assertIs(gn_cli._dash_board_again(), expected)
         with mock.patch("builtins.input", side_effect=EOFError):
             self.assertFalse(gn_cli._dash_board_again(), "a piped stdin has nobody to ask")
+
+
+class StudioVerbTests(_ProfileCase):
+    """`gn studio` / `gn dash --studio` — the third view, and the handoffs between the three."""
+
+    def test_it_is_registered_as_a_verb_and_as_a_dash_view(self) -> None:
+        self.assertIn("studio", gn_cli.CLI_COMMANDS)
+        self.assertIs(gn_cli.build_parser().parse_args(["studio"]).func, gn_cli._cmd_studio)
+        with mock.patch.object(gn_cli, "_cmd_studio", return_value=0) as studio:
+            gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash", "--studio"]))
+        studio.assert_called_once()
+
+    def test_the_studio_view_takes_no_target_and_no_other_view(self) -> None:
+        for extra in (["--board"], ["--panels"], ["--attach"], ["https://t.example"]):
+            with self.subTest(extra=extra):
+                code, _out, err = _run(["dash", "--studio", *extra])
+                self.assertEqual(code, 2)
+                self.assertIn("--studio is a view of its own", err)
+
+    def test_it_refuses_a_machine_feed_and_names_the_verbs_that_are_one(self) -> None:
+        code, _out, err = _run(["studio", "--json"])
+        self.assertEqual(code, 2)
+        for verb in ("gn stats", "gn traces", "gn settings"):
+            self.assertIn(verb, err)
+
+    def test_a_non_tty_refuses_instead_of_drawing(self) -> None:
+        code, _out, err = _run(["studio"])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal", err.lower())
+
+    def test_it_is_given_this_sessions_runtime_and_seed_directories(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value=""), \
+             mock.patch("gn_studio.run_studio", return_value=None) as run_studio:
+            code = gn_cli.main(["studio"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run_studio.call_args.kwargs["runtime_dir"], gn_cli.RUNTIME_DIR)
+        self.assertEqual(run_studio.call_args.kwargs["seed_dir"], gn_cli.SEED_DIR)
+        self.assertIsNotNone(run_studio.call_args.kwargs["profile"], "it shows the saved profile")
+
+    def test_a_terminal_too_small_for_it_says_so(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value="too small, it says"), \
+             mock.patch("gn_studio.run_studio") as run_studio:
+            code, _out, err = _run(["studio"])
+        self.assertEqual(code, 2)
+        self.assertIn("too small, it says", err)
+        run_studio.assert_not_called()
+
+    def test_board_and_panels_from_the_studio_are_handed_back_by_name(self) -> None:
+        # The transition table, not the call graph: `_cmd_dash_views` is the one place a view
+        # switch happens, so a view returns the NAME of the next one and calls nothing itself.
+        for action in ("board", "panels"):
+            with self.subTest(action=action):
+                with mock.patch("gn_tui.refusal", return_value=""), \
+                     mock.patch("gn_studio.size_refusal", return_value=""), \
+                     mock.patch("gn_studio.run_studio", return_value={"action": action}), \
+                     mock.patch.object(gn_cli, "_cmd_dash") as dash, \
+                     mock.patch.object(gn_cli, "_cmd_dash_home") as home:
+                    code, view = gn_cli._dash_studio_view(self.args("studio"))
+                self.assertEqual((code, view), (0, action))
+                dash.assert_not_called()
+                home.assert_not_called()
+
+    def test_the_view_loop_switches_without_growing_the_stack(self) -> None:
+        """Three frames per switch would end a long session in a RecursionError inside a repaint.
+
+        Driven by making two views hand each other back 400 times — about four times the depth
+        mutual recursion would have survived.
+        """
+        flips = {"n": 0}
+
+        def _board(_args: object) -> tuple[int, str]:
+            flips["n"] += 1
+            return (0, "studio" if flips["n"] < 400 else "")
+
+        with mock.patch.object(gn_cli, "_dash_board_view", side_effect=_board), \
+             mock.patch.object(gn_cli, "_dash_studio_view", return_value=(0, "board")):
+            code = gn_cli._cmd_dash_views(self.args("dash"), "board")
+        self.assertEqual(code, 0)
+        self.assertEqual(flips["n"], 400)
+
+    def test_a_view_is_never_handed_a_flag_the_last_one_left_set(self) -> None:
+        seen: list[dict] = []
+
+        def _studio(args: argparse.Namespace) -> tuple[int, str]:
+            seen.append({flag: getattr(args, flag)
+                         for flag in ("board", "panels", "home", "studio")})
+            return (0, "")
+
+        with mock.patch.object(gn_cli, "_dash_studio_view", side_effect=_studio):
+            gn_cli._cmd_dash_views(self.args("dash", "--board"), "studio")
+        self.assertEqual(seen, [{"board": False, "panels": False, "home": False, "studio": False}])
+
+    def test_an_unknown_ask_opens_nothing(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value=""), \
+             mock.patch("gn_studio.run_studio", return_value={"action": "sudo-rm-rf"}), \
+             mock.patch.object(gn_cli, "_cmd_dash") as dash:
+            self.assertEqual(gn_cli.main(["studio"]), 0)
+        dash.assert_not_called()
+
+    def test_the_board_hands_over_to_the_studio_through_the_loop(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", return_value={"action": "studio"}), \
+             mock.patch.object(gn_cli, "_dash_studio_view", return_value=(0, "")) as studio:
+            code = gn_cli._cmd_dash_board(gn_cli.build_parser().parse_args(["dash"]))
+        self.assertEqual(code, 0)
+        studio.assert_called_once()
 
 
 class DashHomeTests(unittest.TestCase):

@@ -1404,7 +1404,7 @@ BOARD_PHASE = "standby"
 BOARD_OPENING = "WOPR-IQ ONLINE  ::  NOTHING RUNNING  ::  STANDBY"
 #: One line, because the board has one line to say it on — the other teletype row carries whatever
 #: just happened.
-BOARD_HINT = "/hunt <url> -y   /attach   /panels   /quit"
+BOARD_HINT = "/hunt <url> -y   /attach   /studio   /panels   /quit"
 #: A refusal typed into the log. Red-orange out of the 256-colour ramp the board already draws in,
 #: not a severity colour from ``_BOARD_SEV``: nothing on this board may read as a verdict.
 BOARD_REFUSE_SGR = "1;38;5;203"
@@ -1430,6 +1430,10 @@ def parse_board_command(line: str) -> dict[str, Any]:
         return {"action": "quit"}
     if name in ("panels", "cockpit", "home"):
         return {"action": "panels"}
+    if name in ("studio", "agent", "learning"):
+        # The third view: the agent's own setup and what it has learned. Here rather than in the
+        # cockpit's verb table because it is a VIEW, not something a run can answer.
+        return {"action": "studio"}
     if name == "attach":
         # The board cannot draw someone else's run: arcs come from the engine's own progress lines
         # (gn_fx.BoardFeed), and an attached run is polled snapshots. The cockpit reads those.
@@ -1588,6 +1592,8 @@ def _board_ack(ask: dict[str, Any]) -> str:
         return f"PLOTTING {ask.get('target')}{'  ::  ' + asked if asked else ''}"
     if action == "attach":
         return "ATTACHING TO THE BACKEND'S NEWEST RUN  ::  PANELS"
+    if action == "studio":
+        return "OPENING THE AGENT STUDIO"
     return "SWITCHING TO PANELS"
 
 

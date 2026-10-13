@@ -4,6 +4,31 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- **An agent studio, in the board's own theme.** `gn studio` (also `/studio` from the threat board,
+  and `gn dash --studio`) is the third view of one cockpit: **BRAIN** (which bot answers, the
+  provider and model, agent skills and commands, internet — the key row says *configured* or *none*,
+  never the key), **LEARNING** (the hunt-trace corpus and its confirmed rows, bounty outcomes,
+  cooled endpoint/class pairs, the offline ranker, the tiny model's corpus and whether a trained
+  model is actually present), **AGENTS** (the local Hugging Face clones, labelled *inert* because
+  nothing in the store is ever executed) and a **CHAT**. Every row is a value some local store
+  already keeps, read through that store's own reader; a store that is missing, empty or unreadable
+  renders `--` with the reason rather than a zero, which would be indistinguishable from "nothing
+  has happened yet". The chat answers from `solin_domain` — the torch-free curated pack the shipped
+  build already answers from — through the same three branches the app's own chat uses: the
+  vuln-class table, the tool catalog, then a VERBATIM excerpt with its source path. Nothing on that
+  path generates text, and when nothing matches it says so instead of answering. A configured
+  external brain is displayed but **never called**: opening a dashboard must not send a prompt off
+  the machine or spend an API budget, and a round trip inside a repaint loop would stall the frame.
+  It is also the setup surface: `/settings` prints the whole table, and `/set bot local` /
+  `/unset <key>` write through `gn_profile` — the same whitelist, type checks and refusal of
+  anything resembling authorization that `gn settings set` enforces, so there is no second door
+  into the profile — with the panel re-read as soon as it saves. `render` is pure and escape-free
+  like `gn_dash.render`, every frame is folded to what the terminal's own CODEC can write (cp437
+  encodes the box glyphs but not the em-dash inside a quoted card, and a row that will not encode
+  would freeze the screen), the three views switch through one LOOP rather than by calling each
+  other (mutual recursion costs three stack frames per switch, which a week-long session would
+  eventually end in a RecursionError inside a repaint), and `/board`, `/panels`, `/refresh`,
+  `/clear` and `/quit` are the rest of the vocabulary.
 - **An operator profile, so a hunt is one line.** `gn setup` asks six questions once and writes
   `runtime/operator_profile.json`: the bot (default `tinygpt` — GreyIQ's own local model, no key,
   nothing off the machine), learning on, the default hunt profile, whether active verification is

@@ -2209,7 +2209,12 @@ def _dash_board_again() -> bool:
 
 
 def _cmd_dash_board(args: argparse.Namespace) -> int:
-    """`gn dash` — the threat board, resident, with nothing running.
+    """`gn dash` — the threat board, resident, with nothing running. Enters the view loop."""
+    return _cmd_dash_views(args, "board")
+
+
+def _dash_board_view(args: argparse.Namespace) -> tuple[int, str]:
+    """The board, resident over its own hunts. Returns ``(exit code, the next view or "")``.
 
     The board IS the dash: the same full-screen map `gn hunt` flies arcs on (``gn_fx.Board``), in
     standby, with a command line under it. `gn dash --panels` is the other view, and `gn dash
@@ -2221,9 +2226,11 @@ def _cmd_dash_board(args: argparse.Namespace) -> int:
     own progress lines, not off anything this would have to relay), and the summary lands in the
     scrollback where the report path stays readable. Then a keypress brings standby back.
 
-    ``/attach`` and ``/panels`` hand over to the cockpit and do NOT come back here: that view is
-    resident in its own right, and bouncing between two full-screen surfaces on one `q` would make
-    it impossible to tell which one the key was answering.
+    ``/panels`` and ``/studio`` hand the NAME of the next view back to :func:`_cmd_dash_views`,
+    which opens it in the same loop — never by calling it from here. ``/attach`` is not a view: it
+    watches one specific run through the panel cockpit and ends the switch, because bouncing
+    between two full-screen surfaces on one `q` would make it impossible to tell which one the key
+    was answering.
     """
     import gn_dash
     import gn_tui
@@ -2241,17 +2248,17 @@ def _cmd_dash_board(args: argparse.Namespace) -> int:
         refusal = gn_tui.refusal() or gn_dash.board_refusal()
         if refusal:
             # No hunt to fall back to here, so — like --attach — it says why instead of doing nothing.
-            return _err(refusal)
+            return (_err(refusal), "")
         try:
             ask = gn_dash.run_board(scope=args.scope or "")
         except gn_dash.SourceError as exc:
-            return _err(exc.message)
+            return (_err(exc.message), "")
         if not isinstance(ask, dict):
-            return 0
+            return (0, "")
         action = str(ask.get("action") or "")
-        # A FRESH namespace: mutating `args` would leave this view's flags set and recurse.
+        # A FRESH namespace: mutating `args` would leave this view's flags set.
         nxt = argparse.Namespace(**vars(args))
-        nxt.board = nxt.home = nxt.panels = False
+        nxt.board = nxt.home = nxt.panels = nxt.studio = False
         if action == "hunt":
             # The board demanded -y before it recorded the ask; this carries that consent through
             # rather than re-asking on a terminal the operator has already answered on.
@@ -2259,15 +2266,81 @@ def _cmd_dash_board(args: argparse.Namespace) -> int:
             _dash_depth_from(ask, nxt)
             code = _cmd_hunt(nxt)
             if not _dash_board_again():
-                return code
+                return (code, "")
             continue
         if action == "attach":
+            # Not a view: it watches one specific run through the panel cockpit, and ends the
+            # switch rather than returning somewhere.
             nxt.target, nxt.attach, nxt.authorize = "", True, False
-            return _cmd_dash(nxt)
-        if action == "panels":
-            nxt.panels = True
-            return _cmd_dash(nxt)
-        return 0
+            return (_cmd_dash(nxt), "")
+        return (0, action if action in _DASH_VIEWS else "")
+
+
+#: The three idle dash views. `gn dash` opens the board, `--panels` the live panel cockpit,
+#: `--studio` (or `gn studio`) the agent studio; each can switch to the others from its own
+#: command line, and :func:`_cmd_dash_views` is the ONE place that switch happens.
+_DASH_VIEWS = ("board", "panels", "studio")
+
+
+def _cmd_dash_views(args: argparse.Namespace, view: str) -> int:
+    """Run one idle dash view after another, in a LOOP — never by calling each other.
+
+    Mutual recursion is the obvious wiring for ``/studio`` and ``/board``, and it grows the Python
+    stack by three frames per switch: a cockpit left open for a week and flipped a few hundred
+    times would end in a ``RecursionError`` inside a repaint, which is the worst possible place for
+    one. A loop cannot, and it makes the set of views and the transitions between them readable in
+    one function instead of spread across three.
+
+    Each view is handed a FRESH namespace with every view flag cleared, so no view can re-enter
+    itself through a flag the last one left set.
+    """
+    code = 0
+    while view:
+        nxt = argparse.Namespace(**vars(args))
+        nxt.board = nxt.panels = nxt.home = nxt.studio = False
+        if view == "board":
+            code, view = _dash_board_view(nxt)
+        elif view == "studio":
+            code, view = _dash_studio_view(nxt)
+        else:
+            # The panel cockpit is resident in its own right (it loops over its own HomeSource),
+            # so it ends the switch rather than handing a view back.
+            code, view = _cmd_dash_home(nxt), ""
+    return code
+
+
+def _cmd_studio(args: argparse.Namespace) -> int:
+    """`gn studio` (and `gn dash --studio`) — the agent studio: setup, learning, and a chat.
+
+    The third view of one cockpit, in the board's own amber. The board answers "what is happening
+    to which host", the panel cockpit answers "what is this run doing", and neither answers "what is
+    my agent and what has it learned" — which is the question an operator has every time they come
+    back to the tool after a week away.
+    """
+    return _cmd_dash_views(args, "studio")
+
+
+def _dash_studio_view(args: argparse.Namespace) -> tuple[int, str]:
+    """One pass of the studio. Returns ``(exit code, the view to open next or "")``."""
+    import gn_studio
+    import gn_tui
+
+    if getattr(args, "json", False):
+        return (_err("the studio is a screen, not a feed; `gn stats --json`, `gn traces --json` "
+                     "and `gn settings` print the same numbers."), "")
+    refusal = gn_tui.refusal()
+    if refusal:
+        return (_err(refusal), "")
+    small = gn_studio.size_refusal(gn_tui.terminal_size(sys.stdout))
+    if small:
+        return (_err(small), "")
+    profile = _profile()
+    _profile_note(profile)
+    ask = gn_studio.run_studio(runtime_dir=RUNTIME_DIR, seed_dir=SEED_DIR, profile=profile)
+    if not isinstance(ask, dict):
+        return (0, "")
+    action = str(ask.get("action") or "")
+    return (0, action if action in _DASH_VIEWS else "")
 
 
 def _cmd_dash_home(args: argparse.Namespace) -> int:
@@ -2367,6 +2440,7 @@ def _cmd_dash(args: argparse.Namespace) -> int:
     attach = bool(getattr(args, "attach", False))
     target = str(getattr(args, "target", "") or "").strip()
     board = bool(getattr(args, "board", False))
+    studio = bool(getattr(args, "studio", False))
     # `--panels` (and `--home`, the older spelling of it) picks the OTHER view; everything else
     # about this verb is unchanged by which one is up.
     panels = bool(getattr(args, "panels", False)) or bool(getattr(args, "home", False))
@@ -2375,6 +2449,10 @@ def _cmd_dash(args: argparse.Namespace) -> int:
     if board and (attach or target or panels):
         return _err("--board is the IDLE dash; it takes no target and no other view. "
                     "`gn hunt <target> -y` draws the same board over a running hunt.")
+    if studio and (attach or target or panels or board):
+        return _err("--studio is a view of its own; it takes no target and no other view.")
+    if studio:
+        return _cmd_studio(args)
     if panels:
         return _cmd_dash_home(args)
     # Bare `gn dash` IS the board. It used to refuse — "name a target, or --attach to something
@@ -2829,6 +2907,9 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--board", action="store_true",
                       help="the threat board in standby — what bare `gn dash` opens; drive it with "
                            "/hunt <url> -y, /attach, /panels, /quit")
+    dash.add_argument("--studio", action="store_true",
+                      help="the AGENT STUDIO instead of the board: bot setup, learning, and a chat "
+                           "(same as `gn studio`)")
     dash.add_argument("--panels", action="store_true",
                       help="the idle PANEL cockpit instead of the board: TARGETS/FINDINGS/RATE/LOG, "
                            "an OUTPUT pane, and every `gn` verb (this is what `GreyNOC Start` runs)")
@@ -2848,6 +2929,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="draw one frame, tear it down, and report the glyph tier, key reader, console VT state, size and host counters")
     _register_depth_flags(dash)
     dash.set_defaults(func=_cmd_dash)
+
+    studio = sub.add_parser("studio", help="the AGENT STUDIO: your bot's setup, what it has learned, and a chat")
+    studio.add_argument("-s", "--scope", default="", help="scope to carry into a view opened from here")
+    studio.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    studio.set_defaults(func=_cmd_studio)
 
     setup = sub.add_parser("setup", help="write the operator profile: the defaults every verb reads")
     setup.add_argument("--defaults", action="store_true",

@@ -537,6 +537,23 @@ after saving.
   open the panel cockpit over one specific run. The board needs a 74x24 terminal and draws on
   stderr; anything narrower says so and names `--panels`. `gn fx wopr` replays the board's demo if
   you just want to check a terminal.
+- **The agent studio** — `gn studio` (also `/studio` from the board, or `gn dash --studio`) is the
+  third view of the same cockpit, in the same amber: **what your bot is set up as, what it has
+  learned, and a chat to ask it things.** BRAIN reads the profile and the app's runtime config (bot,
+  provider, model, agent skills/commands, internet; the key row says *configured* or *none*, never
+  the key). LEARNING reads the hunt-trace corpus, bounty outcomes, cooled endpoint/class pairs, the
+  offline ranker and the tiny model's corpus. AGENTS lists the local Hugging Face clones and says
+  *inert*, because they are never executed. A store that will not answer renders `--` with the
+  reason — never a zero, which would be indistinguishable from "nothing has happened yet". Type a
+  question and it answers from the **bundled playbook pack**, quoted verbatim with its source path
+  (`solin_domain`, the torch-free path the shipped app uses — nothing on it generates text, so a
+  chat window on a security tool cannot invent a security claim); when nothing matches it says so.
+  A configured external brain is shown but **never called**: opening a dashboard must not send a
+  prompt off the machine or spend an API budget. It is also where you *change* the setup —
+  `/settings` lists everything, `/set bot local` and `/unset <key>` write through the same profile
+  `gn settings set` writes (same whitelist, same refusals, no second door), and the panel updates
+  as soon as it saves. `/board`, `/panels` and `/studio` move between the three views; `/refresh`
+  re-reads every store.
 - **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
   so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
   you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository
