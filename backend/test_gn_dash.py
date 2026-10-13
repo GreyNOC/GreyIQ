@@ -30,9 +30,11 @@ import re
 import sys
 import threading
 import unittest
+from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -2167,6 +2169,257 @@ class PaletteTests(unittest.TestCase):
         plain_hostile = gn_dash.render(_state(events=hostile), gn_tui.Size(100, 30), _tier())
         for row in plain_hostile:
             self.assertNotIn("\033", row)
+
+
+class _FakeBoard:
+    """A Board's public surface, recorded. The real one is exercised in test_gn_fx."""
+
+    active = True
+
+    def __init__(self, *, active: bool = True) -> None:
+        self.active = active
+        self.logs: list[tuple[str, str | None]] = []
+        self.prompts: list[tuple[str, int]] = []
+        self.phases: list[str] = []
+        self.holds: list[float] = []
+        self.entered = self.exited = 0
+
+    def __enter__(self) -> "_FakeBoard":
+        self.entered += 1
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.exited += 1
+
+    def phase(self, text: str) -> None:
+        self.phases.append(text)
+
+    def log(self, text: str, color: str | None = None) -> None:
+        self.logs.append((text, color))
+
+    def command_line(self, text: str, caret: int) -> None:
+        self.prompts.append((text, caret))
+
+    def hold(self, seconds: float) -> None:
+        self.holds.append(seconds)
+
+    @property
+    def said(self) -> str:
+        return "\n".join(text for text, _c in self.logs)
+
+
+class _Keys:
+    """A scripted key reader. Runs out into CTRL-C so no test can hang the loop."""
+
+    def __init__(self, script: Sequence[str]) -> None:
+        self.script = list(script)
+        self.reads = 0
+
+    def read(self, timeout: float = 0.06) -> str | None:
+        self.reads += 1
+        return self.script.pop(0) if self.script else "CTRL-C"
+
+
+class BoardCommandTests(unittest.TestCase):
+    """``parse_board_command`` — pure, and the board's whole vocabulary."""
+
+    def test_the_four_asks_it_can_hand_back(self) -> None:
+        cases = {
+            "/hunt https://t.example -y": {"action": "hunt", "target": "https://t.example",
+                                           "depth": {}},
+            "/attach": {"action": "attach"},
+            "/panels": {"action": "panels"},
+            "/quit": {"action": "quit"},
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(gn_dash.parse_board_command(line), expected)
+
+    def test_the_spellings_an_operator_will_actually_type(self) -> None:
+        for line, action in (("q", "quit"), ("exit", "quit"), ("QUIT", "quit"),
+                             ("home", "panels"), ("cockpit", "panels"), ("/PANELS", "panels"),
+                             ("?", "help"), ("/help", "help")):
+            with self.subTest(line=line):
+                self.assertEqual(gn_dash.parse_board_command(line)["action"], action)
+
+    def test_a_blank_line_is_not_an_error(self) -> None:
+        for line in ("", "   ", "\t"):
+            self.assertEqual(gn_dash.parse_board_command(line), {"action": "none"})
+
+    def test_a_hunt_without_consent_is_refused_in_the_flags_own_words(self) -> None:
+        parsed = gn_dash.parse_board_command("/hunt https://t.example")
+        self.assertEqual(parsed["action"], "error")
+        self.assertIn("-y", parsed["message"])
+
+    def test_depth_flags_reach_the_ask_and_a_typo_does_not_launch(self) -> None:
+        parsed = gn_dash.parse_board_command("/hunt https://t.example -y -Th -Ch -Tn 4")
+        self.assertEqual(parsed["depth"], {"theorize": True, "chain": True, "turns": 4})
+        typo = gn_dash.parse_board_command("/hunt https://t.example -y --activ")
+        self.assertEqual(typo["action"], "error", "an unknown flag must not hunt with it dropped")
+
+    def test_a_verb_the_board_cannot_answer_names_where_it_can_be_answered(self) -> None:
+        # /usage is nine rows; the board has two. Saying so beats printing two of them.
+        for line in ("/usage", "/leads", "programs", "/stop"):
+            with self.subTest(line=line):
+                parsed = gn_dash.parse_board_command(line)
+                self.assertEqual(parsed["action"], "error")
+                self.assertIn("/panels", parsed["message"])
+
+    def test_the_board_refuses_to_open_a_board_inside_itself(self) -> None:
+        for line in ("/dash", "dash --board", "gn"):
+            with self.subTest(line=line):
+                self.assertEqual(gn_dash.parse_board_command(line),
+                                 {"action": "error", "message": gn_dash.DASH_REFUSAL})
+
+
+class BoardLoopTests(unittest.TestCase):
+    """``run_board`` — driven with a scripted keyboard, no terminal involved."""
+
+    def drive(self, script: Sequence[str], **kwargs: object) -> tuple[object, _FakeBoard]:
+        board = kwargs.pop("board", None) or _FakeBoard()
+        ask = gn_dash.run_board(board=board, keys=_Keys(script), **kwargs)  # type: ignore[arg-type]
+        return ask, board
+
+    @staticmethod
+    def typed(line: str) -> list[str]:
+        return [*line, "ENTER"]
+
+    def test_standby_says_nothing_is_running_and_offers_the_commands(self) -> None:
+        _ask, board = self.drive(["CTRL-C"])
+        self.assertEqual(board.phases, [gn_dash.BOARD_PHASE])
+        self.assertIn("NOTHING RUNNING", board.said)
+        self.assertIn(gn_dash.BOARD_HINT, board.said)
+        self.assertEqual(board.prompts[0], ("", 0), "the input line exists before a key is pressed")
+
+    def test_the_screen_is_always_given_back(self) -> None:
+        for script in (["CTRL-C"], self.typed("/quit"), self.typed("/hunt https://t.example -y")):
+            with self.subTest(script=script[:6]):
+                _ask, board = self.drive(script)
+                self.assertEqual((board.entered, board.exited), (1, 1))
+
+    def test_a_hunt_is_handed_back_rather_than_started_here(self) -> None:
+        ask, board = self.drive(self.typed("/hunt https://t.example -y -Th"))
+        self.assertEqual(ask, {"action": "hunt", "target": "https://t.example",
+                               "depth": {"theorize": True}})
+        self.assertIn("PLOTTING https://t.example", board.said)
+        self.assertIn("THEORIZE", board.said)
+        self.assertTrue(board.holds, "the line saying why the board is going must be readable")
+
+    def test_quit_and_ctrl_c_both_mean_nothing_was_asked_for(self) -> None:
+        for script in (self.typed("/quit"), self.typed("q"), ["CTRL-C"]):
+            with self.subTest(script=script[:3]):
+                self.assertIsNone(self.drive(script)[0])
+
+    def test_a_refusal_is_typed_into_the_log_and_the_board_stays_up(self) -> None:
+        ask, board = self.drive([*self.typed("/usage"), *self.typed("/quit")])
+        self.assertIsNone(ask)
+        self.assertIn("/panels", board.said)
+        self.assertEqual(board.logs[-1][1], gn_dash.BOARD_REFUSE_SGR,
+                         "a refusal is coloured as a refusal, never as a severity")
+
+    def test_help_answers_on_the_board_without_leaving_it(self) -> None:
+        ask, board = self.drive([*self.typed("/help"), "CTRL-C"])
+        self.assertIsNone(ask)
+        self.assertEqual(board.said.count(gn_dash.BOARD_HINT), 2, "the opening line, then the ask")
+
+    def test_every_keystroke_reaches_the_input_line(self) -> None:
+        _ask, board = self.drive([*"/pa", "BACKSPACE", *"anels", "ENTER"])
+        lines = [text for text, _caret in board.prompts]
+        self.assertIn("/panels", lines, "editing keys included: /pa <bs> anels")
+        self.assertEqual(lines[-1], "", "ENTER submits and clears the line")
+
+    def test_keys_the_board_has_no_field_for_are_ignored_not_echoed(self) -> None:
+        _ask, board = self.drive(["TAB", "CTRL-L", "CTRL-C"])
+        self.assertEqual([text for text, _ in board.prompts], [""],
+                         "Tab and Ctrl-L must not land in the line as characters")
+
+    def test_a_board_that_will_not_draw_refuses_instead_of_reading_keys(self) -> None:
+        keys = _Keys(["CTRL-C"])
+        with self.assertRaises(gn_dash.SourceError) as caught:
+            gn_dash.run_board(board=_FakeBoard(active=False), keys=keys)  # type: ignore[arg-type]
+        self.assertTrue(caught.exception.fatal)
+        self.assertEqual(keys.reads, 0, "no point reading keys for a screen nobody can see")
+
+
+class BoardSayTests(unittest.TestCase):
+    """``board_lines`` — the board has 67 columns of teletype, and an instruction that gets cut
+    mid-word is how a refusal stops being one. Found by driving the real board, not by a test."""
+
+    def test_the_width_is_read_off_the_boards_own_geometry(self) -> None:
+        import gn_fx
+
+        self.assertEqual(gn_dash.board_say_width(), (gn_fx._MAP_W + 2) - 5 - 2)
+
+    def test_a_line_that_fits_keeps_the_spacing_it_was_written_with(self) -> None:
+        # BOARD_HINT separates its commands with runs of spaces; wrapping would collapse them.
+        self.assertEqual(gn_dash.board_lines(gn_dash.BOARD_HINT), [gn_dash.BOARD_HINT])
+        self.assertEqual(gn_dash.board_lines(gn_dash.BOARD_OPENING), [gn_dash.BOARD_OPENING])
+
+    def test_nothing_to_say_says_nothing(self) -> None:
+        for text in ("", "   ", None):
+            self.assertEqual(gn_dash.board_lines(text), [])  # type: ignore[arg-type]
+
+    def test_a_long_refusal_wraps_to_the_two_rows_the_teletype_shows(self) -> None:
+        text = " ".join(["add -y to confirm you are AUTHORIZED to test"] + ["x" * 40] * 6)
+        lines = gn_dash.board_lines(text)
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertLessEqual(len(line), gn_dash.board_say_width())
+        self.assertTrue(lines[-1].endswith("~"), "a message cut short must say that it was")
+
+    def test_one_unbreakable_token_is_cut_rather_than_overflowing(self) -> None:
+        lines = gn_dash.board_lines("https://" + "a" * 400)
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertLessEqual(len(line), gn_dash.board_say_width())
+
+    def test_the_loop_sends_every_refusal_through_it(self) -> None:
+        board = _FakeBoard()
+        long_target = "https://" + "sub.".join(["host"] * 20) + ".example"
+        gn_dash.run_board(board=board,  # type: ignore[arg-type]
+                          keys=_Keys([*f"/hunt {long_target}", "ENTER"]))
+        for text, _color in board.logs:
+            self.assertLessEqual(len(text), gn_dash.board_say_width() + 2, text)
+
+
+class BoardRefusalTests(unittest.TestCase):
+    """``board_refusal`` — measured on STDERR, which is the stream the board draws on."""
+
+    def test_it_names_the_other_view_rather_than_just_refusing(self) -> None:
+        with mock.patch("gn_fx.enabled", return_value=False):
+            self.assertIn("--panels", gn_dash.board_refusal())
+        with mock.patch("gn_fx.enabled", return_value=True), \
+             mock.patch("gn_fx.board_fits", return_value=False), \
+             mock.patch("gn_fx._terminal_size", return_value=(40, 12)):
+            refusal = gn_dash.board_refusal()
+        self.assertIn("40x12", refusal)
+        self.assertIn("--panels", refusal)
+
+    def test_a_terminal_that_takes_it_refuses_nothing(self) -> None:
+        with mock.patch("gn_fx.enabled", return_value=True), \
+             mock.patch("gn_fx.board_fits", return_value=True):
+            self.assertEqual(gn_dash.board_refusal(), "")
+
+
+class HuntRequestTests(unittest.TestCase):
+    """``parse_hunt_request`` — one parser, so the two dashes cannot disagree about -y -Th -Ch -Tn."""
+
+    def test_both_surfaces_resolve_the_same_line_the_same_way(self) -> None:
+        line = ["https://t.example", "-y", "-Th", "-Tn", "2"]
+        ask, error = gn_dash.parse_hunt_request(line)
+        self.assertEqual(error, "")
+        self.assertEqual(ask, {"target": "https://t.example",
+                               "depth": {"theorize": True, "turns": 2}})
+        board = gn_dash.parse_board_command("/hunt " + " ".join(line))
+        self.assertEqual({"target": board["target"], "depth": board["depth"]}, ask)
+
+    def test_turns_without_theorize_is_refused_rather_than_quietly_ignored(self) -> None:
+        _ask, error = gn_dash.parse_hunt_request(["https://t.example", "-y", "-Tn", "3"])
+        self.assertIn("-Th", error)
+
+    def test_two_targets_is_a_refusal_not_a_hunt_on_the_first(self) -> None:
+        _ask, error = gn_dash.parse_hunt_request(["https://a.example", "https://b.example", "-y"])
+        self.assertIn("one target at a time", error)
 
 
 if __name__ == "__main__":

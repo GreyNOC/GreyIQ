@@ -51,6 +51,7 @@ import os
 import re
 import shlex
 import sys
+import textwrap
 import threading
 import time
 import urllib.error
@@ -1319,6 +1320,281 @@ class HomeSource:
 
     def governor(self) -> tuple[dict[str, Any], ...]:
         return ()
+
+
+def parse_hunt_request(args: Sequence[Any]) -> tuple[dict[str, Any] | None, str]:
+    """``<url> -y [-Th] [-Ch] [-Tn N]`` as typed at a dash, resolved to an ask or a refusal.
+
+    Pure, and shared by BOTH surfaces — the panel cockpit's ``/hunt`` and the board's — because the
+    two must not drift about what ``-y -Th -Ch -Tn`` mean. Returns ``({"target": …, "depth": …}, "")``
+    or ``(None, "why not")``.
+
+    ``-y`` is demanded HERE rather than inherited from however the dash was opened. A hunt sends
+    live traffic at someone's host, and `GreyNOC Start` carries no authorization with it — treating
+    the act of opening a dashboard as consent to probe a target typed into it later is exactly the
+    confusion the flag exists to prevent.
+    """
+    flags = {"-y", "--authorize"}
+    authorized = any(str(arg) in flags for arg in args)
+    rest = [str(arg) for arg in args if str(arg) not in flags]
+    depth: dict[str, Any] = {}
+    targets: list[str] = []
+    expecting = False
+    for arg in rest:
+        if expecting:                       # the N of `-Tn N`
+            if arg.startswith("-"):
+                return (None, "-Tn needs a number of turns, e.g. `-Tn 5`.")
+            depth["turns"] = arg
+            expecting = False
+            continue
+        low = arg.lower()
+        if low in ("-th", "--theorize"):
+            depth["theorize"] = True
+        elif low in ("-ch", "--chain"):
+            depth["chain"] = True
+        elif low in ("-tn", "--turns"):
+            expecting = True
+        elif arg.startswith("-"):
+            # NOT swept into targets. Everything unrecognised used to land there and only
+            # targets[0] survived, so `-Chh` (a typo) or `--active` was silently discarded and
+            # the hunt launched with materially different probing than the operator asked for.
+            return (None, f"unknown option {arg} - a dash takes -y, -Th, -Ch and -Tn N. "
+                          f"`/help -v` lists them.")
+        else:
+            targets.append(arg)
+    if expecting:
+        return (None, "-Tn needs a number of turns, e.g. `-Tn 5`.")
+    if not targets:
+        return (None, "hunt needs a target, e.g. `/hunt https://example.com -y`.")
+    if len(targets) > 1:
+        # Silently hunting the first of several is the same class of bug: the operator named
+        # two hosts and only one would have been probed.
+        return (None, f"one target at a time; got {len(targets)}: {' '.join(targets)}.")
+    if depth.get("turns") is not None:
+        try:
+            depth["turns"] = int(depth["turns"])
+        except (TypeError, ValueError):
+            return (None, f"-Tn needs a whole number, not {depth['turns']!r}.")
+        if not depth.get("theorize"):
+            # Accepting it silently would let the operator think they asked for more depth.
+            return (None, "-Tn only has an effect with -Th; add -Th or drop -Tn.")
+    if not authorized:
+        return (None, f"add -y to confirm you are AUTHORIZED to test {targets[0]} - "
+                      f"`/hunt {targets[0]} -y`.")
+    return ({"target": targets[0], "depth": depth}, "")
+
+
+# --- the board view -------------------------------------------------------------------------------
+# `gn dash` draws the THREAT BOARD, resident, with nothing running — the same board `gn hunt` flies
+# arcs on (gn_fx.Board), in standby. It is a second view over the same verb rather than a second
+# verb: the panels are one keystroke away (`/panels`, or `gn dash --panels`) and answer everything
+# the board's two teletype rows cannot.
+#
+# The division of labour is the board's own shape. It has a map and two rows of engine prose, so it
+# is the right surface for "what is happening to which host" and the wrong one for a table. The
+# cockpit has an OUTPUT pane, so it keeps `/usage`, `/leads`, `/program` and every `gn` verb.
+
+#: Title and footer for the RESIDENT board. ``gn_cli._BOARD_TITLE`` is the same words for a hunt's
+#: board; this module owns the standby one because this module drives it.
+BOARD_TITLE = "GREYNOC // WOPR-IQ"
+BOARD_FOOTER = "STANDBY  ::  AUTHORIZED SCOPE ONLY"
+BOARD_PHASE = "standby"
+#: The opening teletype lines. "NOTHING RUNNING" for the same reason the cockpit's pill reads IDLE:
+#: a board that looks like a hunt must never be mistakable for one.
+BOARD_OPENING = "WOPR-IQ ONLINE  ::  NOTHING RUNNING  ::  STANDBY"
+#: One line, because the board has one line to say it on — the other teletype row carries whatever
+#: just happened.
+BOARD_HINT = "/hunt <url> -y   /attach   /studio   /panels   /quit"
+#: A refusal typed into the log. Red-orange out of the 256-colour ramp the board already draws in,
+#: not a severity colour from ``_BOARD_SEV``: nothing on this board may read as a verdict.
+BOARD_REFUSE_SGR = "1;38;5;203"
+
+
+def parse_board_command(line: str) -> dict[str, Any]:
+    """One line typed at the resident board, resolved to an action. Pure, so it is testable.
+
+    ``{"action": …}`` where the action is ``hunt`` (with ``target`` and ``depth``), ``attach``,
+    ``panels``, ``help``, ``quit``, ``none`` for a blank line, or ``error`` with a ``message``.
+
+    The command set is SMALL on purpose, and deliberately smaller than the cockpit's: the board
+    answers on two teletype rows, so a verb whose answer is a table has nowhere to print it. Those
+    are not removed, they are one keystroke away in ``/panels`` — and saying so is better than
+    accepting `/usage` here and showing two rows of a nine-row answer.
+    """
+    text = str(line or "").strip()
+    if not text:
+        return {"action": "none"}
+    tokens = text.split()
+    name = tokens[0].lstrip("/").lower()
+    if name in ("quit", "exit", "q"):
+        return {"action": "quit"}
+    if name in ("panels", "cockpit", "home"):
+        return {"action": "panels"}
+    if name in ("studio", "agent", "learning"):
+        # The third view: the agent's own setup and what it has learned. Here rather than in the
+        # cockpit's verb table because it is a VIEW, not something a run can answer.
+        return {"action": "studio"}
+    if name == "attach":
+        # The board cannot draw someone else's run: arcs come from the engine's own progress lines
+        # (gn_fx.BoardFeed), and an attached run is polled snapshots. The cockpit reads those.
+        return {"action": "attach"}
+    if name in ("help", "?"):
+        return {"action": "help"}
+    if name == "hunt":
+        ask, error = parse_hunt_request(tokens[1:])
+        return {"action": "error", "message": error} if error or ask is None else {"action": "hunt", **ask}
+    if name in _SELF_VERBS:
+        return {"action": "error", "message": DASH_REFUSAL}
+    return {"action": "error",
+            "message": f"not a board command: `{name}`. /panels has the full set."}
+
+
+def board_say_width() -> int:
+    """How many columns a board log line actually has, derived from the board's own geometry.
+
+    ``_draw`` clips each teletype row to ``box_w - 5`` and the box is ``_MAP_W + 2`` wide; the
+    ``"> "`` prefix every line here carries takes two more. Read out of ``gn_fx`` rather than
+    written down, because a sentence that fits today and is cut tomorrow is exactly how an
+    instruction turns into "the board takes /hunt <url> -y   /attach   /pane".
+    """
+    import gn_fx
+
+    return max(24, (gn_fx._MAP_W + 2) - 5 - 2)  # noqa: SLF001 - one feature, two modules
+
+
+def board_lines(text: str, width: int | None = None, rows: int = 2) -> list[str]:
+    """One message as the lines a board can show it on. Pure.
+
+    The teletype shows the last two rows, so a refusal is wrapped to two and the remainder is
+    elided — a message that needs more than that is one to shorten, not to scroll past.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return []
+    cut = int(width) if width else board_say_width()
+    if len(body) <= cut:
+        # Unwrapped, so a line laid out on purpose keeps its spacing: BOARD_HINT separates its
+        # commands with runs of spaces, and textwrap would collapse every one of them.
+        return [body]
+    lines = textwrap.wrap(" ".join(body.split()), cut,
+                          break_long_words=True, break_on_hyphens=False) or [body]
+    if len(lines) > rows:
+        lines = lines[:rows]
+        lines[-1] = lines[-1][: max(1, cut - 1)] + "~"
+    return lines
+
+
+def _board_say(live: Any, text: str, color: str | None = None) -> None:
+    for line in board_lines(text):
+        live.log(f"> {line}", color) if color else live.log(f"> {line}")
+
+
+def board_refusal(stream: Any = None) -> str:
+    """One sentence for ``_err()`` when this terminal will not take the board, or ``""``.
+
+    Separate from :func:`size_refusal` because the board's floor is its own (``gn_fx.board_fits``,
+    ~74x24 for the map) and so is its stream: it draws on STDERR, like every other gn_fx surface,
+    so a refusal measured on stdout would be measuring the wrong pipe.
+    """
+    import gn_fx
+
+    target = sys.stderr if stream is None else stream
+    if not gn_fx.enabled(target):
+        return ("the board needs a terminal on stderr (it is redirected, NO_COLOR is set, or "
+                "GN_NO_FX is on). `gn dash --panels` draws the panel cockpit instead.")
+    if not gn_fx.board_fits(target):
+        cols, rows = gn_fx._terminal_size(target)  # noqa: SLF001 - one feature, two modules
+        return (f"the board needs a {gn_fx._BOARD_MIN_COLS}x{gn_fx._BOARD_ROWS} terminal; this one "  # noqa: SLF001
+                f"is {cols}x{rows}. Resize it, or run `gn dash --panels`.")
+    return ""
+
+
+def run_board(*, scope: str = "", opening: Sequence[str] = (), stream: Any = None,
+              inp: Any = None, board: Any = None, keys: Any = None,
+              poll: float = 0.06) -> dict[str, Any] | None:
+    """Draw the board with nothing running, take commands under it, hand back what was asked.
+
+    Returns the ask (``{"action": "hunt"|"attach"|"panels", …}``) or None when the operator left.
+
+    It STARTS nothing, exactly as :class:`HomeSource` starts nothing: ``gn_cli`` reads the ask back
+    and runs the real verb on a restored terminal. That is what makes the arcs real — the hunt
+    draws its OWN live board through ``gn_fx.BoardFeed``, rather than this one replaying a run it
+    would have to be told about second-hand — and it is what keeps the hunt's summary, and the
+    report path in it, in the operator's scrollback instead of under the next frame.
+
+    Acquisition order is the teardown contract, the same one :meth:`Dashboard.run` documents:
+    console modes, then the keyboard, then the screen — unwound in reverse, so the alternate screen
+    is gone before the tty settings it was drawn under are handed back.
+    """
+    import gn_fx
+
+    out = sys.stderr if stream is None else stream
+    with ExitStack() as stack:
+        console = stack.enter_context(gn_tui.WinConsole())
+        if not console.vt_enabled:
+            # Clear-and-home would destroy the operator's scrollback, which is worse than not
+            # running at all — so this refuses instead of degrading.
+            raise SourceError("this console will not enable ANSI (VT) processing, and the board "
+                              "cannot draw without it.", fatal=True)
+        reader = keys if keys is not None else stack.enter_context(gn_tui.KeyReader(inp))
+        live = board if board is not None else gn_fx.board(
+            BOARD_TITLE, scope=scope, stream=out, footer=BOARD_FOOTER, interactive=True)
+        stack.enter_context(live)
+        if not getattr(live, "active", False):
+            raise SourceError(board_refusal(out) or "this terminal will not take the board.",
+                              fatal=True)
+        line = gn_tui.CommandLine()
+        live.phase(BOARD_PHASE)
+        for text in (opening or (BOARD_OPENING, BOARD_HINT)):
+            _board_say(live, text)
+        live.command_line("", 0)
+        while True:
+            key = reader.read(poll)
+            if key is None:
+                continue
+            if key == "CTRL-C":
+                # Windows getwch delivers ^C literally; on POSIX cbreak keeps ISIG and a real
+                # SIGINT has already raised. Either way this is the operator asking to leave.
+                return None
+            if key in ("TAB", "CTRL-L"):
+                # Nothing to complete and nowhere to move: one field, and the ticker repaints the
+                # whole frame anyway, so there is no stale screen for Ctrl-L to fix.
+                continue
+            submitted = line.feed(key)
+            live.command_line(line.text, line.cursor)
+            if submitted is None:
+                continue
+            ask = parse_board_command(submitted)
+            action = str(ask.get("action") or "")
+            if action == "none":
+                continue
+            if action == "quit":
+                return None
+            if action == "help":
+                _board_say(live, BOARD_HINT)
+                continue
+            if action == "error":
+                _board_say(live, str(ask.get("message") or ""), BOARD_REFUSE_SGR)
+                continue
+            _board_say(live, _board_ack(ask))
+            # The board is about to go; the line that says why must be on screen long enough to
+            # read. The teletype types at 62 cps, so a short hold is the whole message.
+            live.hold(0.45)
+            return ask
+
+
+def _board_ack(ask: dict[str, Any]) -> str:
+    """What the board says on its way out, in its own voice."""
+    action = str(ask.get("action") or "")
+    if action == "hunt":
+        depth = ask.get("depth") or {}
+        asked = " ".join(k.upper() for k in ("theorize", "chain") if depth.get(k))
+        return f"PLOTTING {ask.get('target')}{'  ::  ' + asked if asked else ''}"
+    if action == "attach":
+        return "ATTACHING TO THE BACKEND'S NEWEST RUN  ::  PANELS"
+    if action == "studio":
+        return "OPENING THE AGENT STUDIO"
+    return "SWITCHING TO PANELS"
 
 
 def usage_report(*, snapshot: dict[str, Any] | None, governor: Sequence[dict[str, Any]] | None,
@@ -2635,61 +2911,13 @@ class Dashboard:
         return (True, "usage is in the OUTPUT pane")
 
     def _verb_home_hunt(self, args: Sequence[str]) -> tuple[bool, str]:
-        """``/hunt <url> -y`` on HOME: record the ask and leave, so the caller relaunches for real.
-
-        ``-y`` is demanded HERE rather than inherited from however the cockpit was opened. A hunt
-        sends live traffic at someone's host, and `GreyNOC Start` carries no authorization with it —
-        treating the act of opening a dashboard as consent to probe a target typed into it later is
-        exactly the confusion the flag exists to prevent.
-        """
-        flags = {"-y", "--authorize"}
-        authorized = any(str(arg) in flags for arg in args)
-        rest = [str(arg) for arg in args if str(arg) not in flags]
-        depth, targets, expecting = {}, [], False
-        for arg in rest:
-            if expecting:                       # the N of `-Tn N`
-                if arg.startswith("-"):
-                    return (False, "-Tn needs a number of turns, e.g. `-Tn 5`.")
-                depth["turns"] = arg
-                expecting = False
-                continue
-            low = arg.lower()
-            if low in ("-th", "--theorize"):
-                depth["theorize"] = True
-            elif low in ("-ch", "--chain"):
-                depth["chain"] = True
-            elif low in ("-tn", "--turns"):
-                expecting = True
-            elif arg.startswith("-"):
-                # NOT swept into targets. Everything unrecognised used to land there and only
-                # targets[0] survived, so `-Chh` (a typo) or `--active` was silently discarded and
-                # the hunt launched with materially different probing than the operator asked for.
-                return (False, f"unknown option {arg} - this pane takes -y, -Th, -Ch and -Tn N. "
-                               f"`/help -v` lists them.")
-            else:
-                targets.append(arg)
-        if expecting:
-            return (False, "-Tn needs a number of turns, e.g. `-Tn 5`.")
-        if not targets:
-            return (False, "hunt needs a target, e.g. `/hunt https://example.com -y`.")
-        if len(targets) > 1:
-            # Silently hunting the first of several is the same class of bug: the operator named
-            # two hosts and only one would have been probed.
-            return (False, f"one target at a time; got {len(targets)}: {' '.join(targets)}.")
-        if depth.get("turns") is not None:
-            try:
-                depth["turns"] = int(depth["turns"])
-            except (TypeError, ValueError):
-                return (False, f"-Tn needs a whole number, not {depth['turns']!r}.")
-            if not depth.get("theorize"):
-                # Accepting it silently would let the operator think they asked for more depth.
-                return (False, "-Tn only has an effect with -Th; add -Th or drop -Tn.")
-        if not authorized:
-            return (False, f"add -y to confirm you are AUTHORIZED to test {targets[0]} - "
-                           f"`/hunt {targets[0]} -y`.")
-        asked = " ".join(k for k in ("theorize", "chain") if depth.get(k))
-        return self._set_pending({"action": "hunt", "target": targets[0], "depth": depth},
-                                 done=f"starting a hunt on {targets[0]}"
+        """``/hunt <url> -y`` on HOME: record the ask and leave, so the caller relaunches for real."""
+        ask, error = parse_hunt_request(args)
+        if error or ask is None:
+            return (False, error)
+        asked = " ".join(k for k in ("theorize", "chain") if (ask.get("depth") or {}).get(k))
+        return self._set_pending({"action": "hunt", **ask},
+                                 done=f"starting a hunt on {ask['target']}"
                                       + (f" ({asked})" if asked else "") + " ...")
 
     def _verb_home_attach(self, _args: Sequence[str]) -> tuple[bool, str]:

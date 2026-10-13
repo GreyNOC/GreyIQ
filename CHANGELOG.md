@@ -4,6 +4,121 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- **An agent studio, in the board's own theme.** `gn studio` (also `/studio` from the threat board,
+  and `gn dash --studio`) is the third view of one cockpit: **BRAIN** (which bot answers, the
+  provider and model, agent skills and commands, internet — the key row says *configured* or *none*,
+  never the key), **LEARNING** (the hunt-trace corpus and its confirmed rows, bounty outcomes,
+  cooled endpoint/class pairs, the offline ranker, the tiny model's corpus and whether a trained
+  model is actually present), **AGENTS** (the local Hugging Face clones, labelled *inert* because
+  nothing in the store is ever executed) and a **CHAT**. Every row is a value some local store
+  already keeps, read through that store's own reader; a store that is missing, empty or unreadable
+  renders `--` with the reason rather than a zero, which would be indistinguishable from "nothing
+  has happened yet". The chat answers from `solin_domain` — the torch-free curated pack the shipped
+  build already answers from — through the same three branches the app's own chat uses: the
+  vuln-class table, the tool catalog, then a VERBATIM excerpt with its source path. Nothing on that
+  path generates text, and when nothing matches it says so instead of answering. A configured
+  external brain is displayed but **never called**: opening a dashboard must not send a prompt off
+  the machine or spend an API budget, and a round trip inside a repaint loop would stall the frame.
+  It is also the setup surface: `/settings` prints the whole table, and `/set bot local` /
+  `/unset <key>` write through `gn_profile` — the same whitelist, type checks and refusal of
+  anything resembling authorization that `gn settings set` enforces, so there is no second door
+  into the profile — with the panel re-read as soon as it saves. `render` is pure and escape-free
+  like `gn_dash.render`, every frame is folded to what the terminal's own CODEC can write (cp437
+  encodes the box glyphs but not the em-dash inside a quoted card, and a row that will not encode
+  would freeze the screen), the three views switch through one LOOP rather than by calling each
+  other (mutual recursion costs three stack frames per switch, which a week-long session would
+  eventually end in a RecursionError inside a repaint), and `/board`, `/panels`, `/refresh`,
+  `/clear` and `/quit` are the rest of the vocabulary.
+- **`learning off` now stops the writing, not just the label.** The setting shipped reaching only
+  the studio header, so a hunt kept recording its trace, its surface baseline and negative
+  knowledge while the dashboard said `LEARNING OFF` — a data-retention control that retained
+  nothing it promised. `gn settings set learning off` sets one master switch
+  (`GREYIQ_NO_LEARNING`) that every automatic writer honours: `hunt_trace.record_trace`,
+  `surface_drift.record_snapshot`, `negative_knowledge.enabled` and `hunt_train.maybe_auto_train`
+  (the auto-trainer is gated on the trace write, so the same switch stops the corpus growing and
+  the retrain that reads it). An EXPLICIT `gn learn` or `gn train-brain` is an instruction, not
+  automatic learning, and still runs. Verified on a real hunt: with learning on it writes
+  `hunt_traces.jsonl`, `surface_snapshots.jsonl`, `bughunter_negative_knowledge.json` and
+  `hunt_model/`; with it off, nothing but the report.
+- **A typed flag wins even when it is the default.** `-p/--profile` and `--platform` defaulted to
+  concrete values, so "typed `-p full-sweep`" and "said nothing" were the same thing and a saved
+  `hunt.profile: api` silently overrode an explicit `-p full-sweep`. Both now use an unset
+  sentinel, which also means a saved `platform` finally reaches `gn campaign`, `gn idor` and
+  `gn bfla` when the flag is omitted — before, argparse's own default made that branch unreachable.
+- **`gn output` applies to every report writer.** It filled only namespaces carrying an `-o`, so
+  `gn campaign` and `gn auto` — which have none — kept writing to `runtime/reports` while the
+  operator had chosen somewhere else. `_reports_dir()` now resolves the configured folder for all
+  of them, per-target folders included, and keeps the engine's own containment rule for an
+  operator-named path (it may create its leaf, never a brand-new tree), pinned against
+  `bounty._resolve_output_dir` by a test so the two readings cannot drift.
+- **A stored setting that cannot be honoured is reported.** A hand-edited `"hunt.active": "maybe"`
+  was dropped silently and the default presented as an ordinary default, so an operator who meant
+  to arm active probing was told nothing and got a passive run. Coercion refusals now accumulate
+  into `Profile.error`, which is the one line `gn settings` and every verb's first-run hint print.
+- **An operator profile, so a hunt is one line.** `gn setup` asks six questions once and writes
+  `runtime/operator_profile.json`: the bot (default `tinygpt` — GreyIQ's own local model, no key,
+  nothing off the machine), learning on, the default hunt profile, whether active verification is
+  armed by default, the operator handle and the report folder. Every question defaults to the
+  local-first answer, so ENTER through all of them is a valid way to answer, and `--defaults` writes
+  that without asking. `gn settings` lists every setting with its value, whether that value is yours
+  or the default, what it does, and the commands that change it; `gn settings get/set/unset/path`
+  manage them, saving on every `set`. A verb now reads the profile for anything the command line did
+  not say — hunt profile, brain, active, per-finding, prompting, platform, output folder — so a flag
+  you typed always wins and no setting can turn an armed flag off. **The profile cannot authorize
+  anything**: there is no such setting, `set` refuses every key it does not know, and a hand-edited
+  `"authorize": true` has no effect, because a file on disk may not assert that a human is
+  authorized (the rule `hunt_dir` already states for `.greyiq/hunt.json`). A missing, unreadable,
+  non-JSON or wrongly-typed profile is the defaults plus one sentence, never an exception, and `gn`
+  with no verb announces the first run rather than blocking on it — a CLI that demands a wizard
+  cannot be driven from a script.
+- **The authorization attestation can be answered at the terminal.** `gn hunt <target>`, `gn
+  campaign`, `gn auto` and `gn dash <target>` without `-y` now ASK, on a terminal, naming the target:
+  "A hunt sends live traffic at it… Confirm you are AUTHORIZED to test it [y/N]". A yes is the same
+  attestation `-y` is — it is still a human saying it, in the moment, about a named target — and it
+  carries the same scope. Anything else, `--json`, `--no-prompt`, a redirected stream or a
+  non-terminal leaves the refusal exactly as before, and nothing in the profile or any file can
+  pre-answer it.
+- **`gn auto hunt -s acme.example`** hunts a scope with no directory and no target list: each host
+  (or `*.wildcard` apex) in the scope seeds an `https://` target, and it produces the same `HuntPlan`
+  a directory does, so the portfolio record, the learning memory, the ledger and the
+  `host_in_active_scope` gate are reached by one path either way. A URL, path or bare public suffix
+  in the scope is refused by name with the host to use instead, rather than widened into a grant. A
+  scope hunt stays passive until `--active` or `hunt.active` arms it (a considered `hunt.json` may
+  ask for active; one line typed at a prompt does not), `--passive` still wins over both, and `gn
+  auto` gained `--active` because the scope form has no hunt file to ask for it.
+- **`gn output` chooses where reports go.** `gn output --path <folder>` for everything, `gn output -s
+  <target|program|campaign> --path <folder>` for one (its subdomains follow it unless they have an
+  entry of their own), `gn output` to list and `--clear` to drop one. `-o` on a single run still
+  wins, and a folder is recorded rather than created.
+- `gn dash` is now the **threat board, resident**. It opens the same full-screen board a hunt flies
+  arcs across (`gn_fx.Board`) in STANDBY — nothing running, DEFCON 5, `ASSETS 0/0`, live clock — with
+  a command line drawn under the box. It used to refuse unless a run already existed ("name a
+  target, or `--attach`"), which made the one verb you reach for on a fresh terminal the one that
+  needed a hunt first. `/hunt <url> -y` hands off to the real hunt rather than replaying one, so the
+  arcs are the engine's own and the summary and report path land in the scrollback; ENTER returns to
+  standby, `q` leaves. `/attach` and `/panels` hand over to the panel cockpit, which is unchanged and
+  still what `gn dash <target> -y`, `gn dash --attach` and `gn dash --panels` open (`--home` is kept
+  as the older spelling of `--panels`). The board's command set is deliberately small — the two
+  teletype rows cannot show a table, so `/usage`, `/leads`, `/program` and every `gn` verb stay in
+  `/panels`, and typing one here says so instead of printing two rows of a nine-row answer. Refusals
+  wrap to the width the board actually has, read off the board's own geometry rather than written
+  down. A terminal that will not take the board (under 74x24, a redirected stderr, `NO_COLOR`,
+  `GN_NO_FX`) refuses and names `--panels`; `--json` with no target refuses rather than quietly
+  opening a screen nothing can parse.
+- `-y/--authorize` now **puts the target it was typed about in scope**. `gn hunt
+  https://acme.example -y` is the whole command: no `-s acme.example` repeating the target, and no
+  "Target host acme.example is not explicitly named by the scope" for forgetting it. `gn auto` has
+  always derived scope from its own targets; this is that rule for `hunt`, `campaign`, `dash`,
+  `scan`, `takeover`, `cve`, `idor`, `idor-probe` and `bfla`. Three bounds make it safe: without
+  `-y` nothing is added (the flag is the attestation); the grant is **exact** — the target's own host
+  or repository root, never a `*.` wildcard, and `gn auto`'s wider apex is not used; and only the
+  target the operator NAMED is granted, so a host the engine discovers mid-run must still be in
+  scope on its own. `settings.excluded_hosts` still wins over it, a bare public suffix
+  (`herokuapp.com`), a single-label host, a local path and a credentialed URL grant nothing, and the
+  derived grant is produced in one place in the engine (`bounty.self_scope_grant`) that is pinned
+  against the scope preflight so the two cannot drift. The threat board's `SCOPE` heading and the
+  report's scope line now state the run's effective scope, which is what it is bound by.
+
 ## v4.12.0 - hunts that pause at the login wall
 
 - CLI hunts now pause at an authentication wall instead of reporting a protected

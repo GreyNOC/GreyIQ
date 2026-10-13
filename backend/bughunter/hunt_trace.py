@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from bughunter import negative_knowledge
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.learning import program_key
 
@@ -277,8 +278,15 @@ def record_trace(
 
     Best-effort + fail-closed: ``runtime_dir is None`` or any write error (bad path,
     OneDrive/Windows lock) returns False and never raises — a trace write must never
-    break a hunt."""
+    break a hunt.
+
+    Returns False WITHOUT writing when the operator has turned automatic learning off
+    (``GREYIQ_NO_LEARNING``, which `gn settings set learning off` sets for the process). The
+    auto-trainer is gated on this return value, so that one switch both stops the corpus growing
+    and stops the retrain that reads it."""
     if runtime_dir is None:
+        return False
+    if negative_knowledge.learning_disabled():
         return False
     try:
         rows = _normalize_outcomes(outcomes if outcomes is not None else outcomes_from_findings(consolidated))

@@ -505,6 +505,69 @@ after saving.
   programs that have actually paid first** instead of alphabetically, and **retrains the offline
   ranker** from the corpus it is growing (the trainer's own gate refuses a corpus too small or a
   model that doesn't beat the rules). `gn sync` does the same pass by hand.
+- **Set it up once** — `gn setup` writes the operator profile: the bot (`tinygpt`, GreyIQ's own
+  local model, by default — no key, nothing leaves the machine), learning on, the default hunt
+  profile, whether active verification is armed by default, and where reports go. ENTER through
+  every question is a valid way to answer it, and `gn setup --defaults` writes exactly that without
+  asking (for scripts, CI and containers). `gn settings` lists every setting with its value, where
+  that value came from, and the commands that change it; `gn settings set hunt.profile api` saves
+  immediately. A verb then reads the profile for anything you did **not** type, so a flag you do
+  type always wins — including when you type the default — and no setting can turn an armed flag
+  off. `learning off` genuinely stops the automatic writing: no hunt trace, no surface baseline, no
+  negative knowledge, no auto-retrain (an explicit `gn learn` or `gn train-brain` is still yours to
+  run). A stored value that cannot be honoured is named rather than silently replaced by its
+  default. **The profile cannot authorize
+  anything** — there is no such setting, unknown keys are refused, and a hand-edited
+  `"authorize": true` does nothing: a file on disk may not assert that a human is authorized.
+  Secrets stay in the perms-restricted store, never in the profile.
+- **One line to hunt** — `gn hunt <target>` with no other flags: the profile supplies the posture,
+  `-y` supplies the target's scope, and on a terminal the authorization question is **asked** (it
+  names the target, and answering it is the same attestation as `-y`). `gn auto hunt -s acme.example`
+  is the scope form — no directory, no target list: each host in the scope seeds an `https://`
+  target, it becomes a saved program so the learning memory accumulates, and the hunt asks for a
+  session when it reaches a login wall. `--json`, `--no-prompt` and a non-terminal still require
+  `-y` outright, because there is nobody there to ask.
+- **Where reports go** — `gn output --path D:/reports` sets the default; `gn output -s acme.example
+  --path D:/engagements/acme` sends that host (and its subdomains, unless they have their own entry)
+  somewhere of its own; `gn output` lists what is set and `--clear` drops one. `-o` on a single run
+  still wins. It applies to **every** report writer, including `gn campaign` and `gn auto`, which
+  have no `-o` of their own. A configured folder keeps the same rule `-o` has: it may create its
+  own leaf, never a brand-new multi-level tree, so a saved report folder cannot become a
+  write-anywhere primitive — a path that fails that falls back to `runtime/reports`, and the path
+  printed at the end of a run is always the one actually written to.
+- **The dash** — `gn dash` opens the **threat board** in standby: the same full-screen map a hunt
+  flies arcs across, with nothing running and a command line under it. Type `/hunt <url> -y` and the
+  board hands off to the real hunt (so the arcs are the engine's own), the summary and report path
+  land in your scrollback, and ENTER brings standby back; `q` leaves. `/panels` (or `gn dash
+  --panels`) switches to the **panel cockpit** — TARGETS / FINDINGS / RATE / LOG, an OUTPUT pane,
+  `/usage`, and every `gn` verb typed inside it. `gn dash <target> -y` and `gn dash --attach` still
+  open the panel cockpit over one specific run. The board needs a 74x24 terminal and draws on
+  stderr; anything narrower says so and names `--panels`. `gn fx wopr` replays the board's demo if
+  you just want to check a terminal.
+- **The agent studio** — `gn studio` (also `/studio` from the board, or `gn dash --studio`) is the
+  third view of the same cockpit, in the same amber: **what your bot is set up as, what it has
+  learned, and a chat to ask it things.** BRAIN reads the profile and the app's runtime config (bot,
+  provider, model, agent skills/commands, internet; the key row says *configured* or *none*, never
+  the key). LEARNING reads the hunt-trace corpus, bounty outcomes, cooled endpoint/class pairs, the
+  offline ranker and the tiny model's corpus. AGENTS lists the local Hugging Face clones and says
+  *inert*, because they are never executed. A store that will not answer renders `--` with the
+  reason — never a zero, which would be indistinguishable from "nothing has happened yet". Type a
+  question and it answers from the **bundled playbook pack**, quoted verbatim with its source path
+  (`solin_domain`, the torch-free path the shipped app uses — nothing on it generates text, so a
+  chat window on a security tool cannot invent a security claim); when nothing matches it says so.
+  A configured external brain is shown but **never called**: opening a dashboard must not send a
+  prompt off the machine or spend an API budget. It is also where you *change* the setup —
+  `/settings` lists everything, `/set bot local` and `/unset <key>` write through the same profile
+  `gn settings set` writes (same whitelist, same refusals, no second door), and the panel updates
+  as soon as it saves. `/board`, `/panels` and `/studio` move between the three views; `/refresh`
+  re-reads every store.
+- **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
+  so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
+  you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository
+  root) and additive: your own `-s` text is kept, a `*.` wildcard is never invented, a host the
+  engine *discovers* mid-run still has to be in scope on its own, and a saved program's exclusion
+  still wins. Without `-y` nothing widens — the flag is the attestation. Use `-s` for anything
+  *beyond* the target, e.g. `-s '*.corp.example'`.
 - **Hunt a directory** — `gn auto -y` in a repo or a hunt folder. It reads
   the targets from `.greyiq/targets.txt` (one per line, `#` comments) or `.greyiq/hunt.json`; in a
   git repo with no targets listed, the **repository itself** is the target and its remote is the

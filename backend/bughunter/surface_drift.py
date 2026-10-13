@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+from bughunter import negative_knowledge
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.learning import program_key
 
@@ -335,8 +336,13 @@ def record_snapshot(
     now: str | None = None,
 ) -> bool:
     """Append ONE snapshot line. Best-effort and fail-closed: any write error returns False and
-    never raises, because a memory write must never break a hunt."""
+    never raises, because a memory write must never break a hunt.
+
+    Returns False without writing when automatic learning is off (``GREYIQ_NO_LEARNING``): a
+    baseline of someone's host is a record of it, and the operator asked for none."""
     if runtime_dir is None:
+        return False
+    if negative_knowledge.learning_disabled():
         return False
     try:
         prog, hostname = _snapshot_key(program, target, host)

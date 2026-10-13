@@ -114,6 +114,66 @@ class StdlibOnlyCliBootTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertTrue(proc.stdout.strip(), f"{args} printed nothing")
 
+    def test_the_profile_verbs_work_on_a_bare_python(self) -> None:
+        """`gn setup` / `settings` / `output` are the first thing a new operator runs.
+
+        They are the verbs most likely to be reached straight after `git clone`, so they are the
+        ones that may not need a pip install to answer.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"GREYIQ_RUNTIME_DIR": tmp}
+            for args in (["setup", "--defaults"], ["settings"], ["settings", "get", "bot"],
+                         ["output"], ["output", "--path", str(Path(tmp) / "reports")],
+                         ["settings", "set", "hunt.profile", "api"],
+                         ["settings", "get", "hunt.profile"]):
+                with self.subTest(args=args):
+                    proc = _run_cli(args, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(proc.stdout.strip(), f"{args} printed nothing")
+            self.assertTrue(Path(tmp, "operator_profile.json").is_file())
+
+    def test_the_dash_views_refuse_for_the_right_reason_not_an_import_error(self) -> None:
+        # Captured stdout is not a terminal, so both must say so — and a missing third-party
+        # import would surface here as a traceback instead.
+        for args in (["dash"], ["studio"], ["dash", "--panels"]):
+            with self.subTest(args=args):
+                proc = _run_cli(args)
+                self.assertEqual(proc.returncode, 2, proc.stdout)
+                self.assertIn("terminal", proc.stderr.lower())
+                self.assertNotIn("Traceback", proc.stderr)
+
+    def test_the_studio_reads_every_store_it_shows_on_a_bare_python(self) -> None:
+        """The panels are the studio's whole claim, and each one is a different engine store.
+
+        A reader that needs site-packages would not crash the studio — ``_call`` renders ``--``
+        with the reason — it would quietly show an operator ``--`` where a real number belongs,
+        on exactly the machine the source install targets. So this asserts the numbers are REAL.
+        """
+        script = _GUARD + """
+import sys
+sys.path.insert(0, %r)
+import gn_profile, gn_studio
+panels = gn_studio.collect(%r, %r, gn_profile.load(%r))
+for name, rows in panels.items():
+    for row in rows:
+        print("%%s|%%s|%%s" %% (name, row.label, row.value))
+body, how = gn_studio.answer("what is ssrf", seed_dir=%r)
+print("chat|answered|%%s" %% bool(body and how))
+""" % (str(BACKEND_DIR), str(BACKEND_DIR.parent / "runtime"), str(BACKEND_DIR / "seed"),
+       str(BACKEND_DIR.parent / "runtime"), str(BACKEND_DIR / "seed"))
+        proc = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(PROJECT_ROOT), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        rows = dict(line.split("|", 2)[1:] for line in proc.stdout.splitlines() if "|" in line)
+        self.assertEqual(rows.get("answered"), "True", "the chat must answer from the bundled pack")
+        for label in ("bot", "corpus", "confirmed", "store"):
+            with self.subTest(label=label):
+                self.assertIn(label, rows)
+                self.assertFalse(rows[label].startswith("--"),
+                                 f"{label} could not be read without site-packages: {rows[label]}")
+
     def test_local_code_scan_finds_a_planted_defect(self) -> None:
         """The engine itself — not just argparse — has to work on a bare Python."""
         with tempfile.TemporaryDirectory() as tmp:

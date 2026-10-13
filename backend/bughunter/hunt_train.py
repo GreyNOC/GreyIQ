@@ -77,6 +77,10 @@ _MAX_PARAM_SUGGESTIONS = 12
 _AUTO_STATE_NAME = "auto_train_state.json"
 _AUTO_MIN_NEW_TRACES = 5
 _AUTO_DISABLE_ENV = "GREYIQ_NO_AUTO_TRAIN_BRAIN"
+#: The master learning opt-out. Duplicated from ``negative_knowledge._ENV_NO_LEARNING`` for the
+#: same reason the paths above are duplicated — this module stays stdlib-only at import time — and
+#: a test asserts the two never drift apart.
+_NO_LEARNING_ENV = "GREYIQ_NO_LEARNING"
 _AUTO_LOCK = threading.Lock()
 
 # rule_id prefixes that discriminate the two access-control selectors. Both IDOR and BFLA
@@ -651,6 +655,14 @@ def maybe_auto_train(runtime_dir: str | Path | None, *, seed_dir: str | Path | N
         return {"attempted": False, "reason": "no runtime directory"}
     if os.getenv(_AUTO_DISABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
         return {"attempted": False, "reason": "disabled"}
+    # The master learning opt-out, read here rather than imported: this module is deliberately
+    # stdlib-only at import time (see the note on _OUT_SUBDIR), and `negative_knowledge` is not.
+    # ``negative_knowledge.learning_disabled`` is the canonical reading of the same variable.
+    if os.getenv(_NO_LEARNING_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        # Belt and braces: record_trace already refuses, and this is gated on its return value.
+        # Stated anyway, because a direct caller would otherwise retrain from the corpus an
+        # operator has asked to stop adding to.
+        return {"attempted": False, "reason": "learning is off"}
 
     attempted = False
     try:

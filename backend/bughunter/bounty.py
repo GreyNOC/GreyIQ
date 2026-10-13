@@ -642,6 +642,52 @@ def _url_scope_preflight(target: str, scope: str, settings: Any = None) -> tuple
     return host, ""
 
 
+def self_scope_grant(target: str) -> str:
+    """The scope grant a target makes for ITSELF: its exact host, or its repository root.
+
+    ``-y/--authorize`` on the CLI is a human attesting authorization for the target they just
+    named. Permission is read out of the scope TEXT (:func:`_url_scope_preflight` below), which
+    used to mean saying the same thing twice — ``gn hunt https://acme.example -y -s acme.example``
+    — and a refusal, "Target host acme.example is not explicitly named by the scope", for
+    forgetting the second half. ``gn auto`` has always derived scope from its own targets for the
+    same reason (``hunt_dir._derive_scope``); this is that rule, one place, for every verb.
+
+    THE ONE PLACE a target becomes a grant, so the CLI never reimplements host identity and the
+    two cannot disagree about what ``acme.example`` means. Deliberately NARROWER than ``gn auto``'s
+    derived scope, which takes the apex and admits subdomains: this grants the exact host and
+    nothing else. ``-s *.acme.example`` is how an operator asks for more.
+
+    Returns ``""`` — never a guess — for a local path (which needs no scope), for anything
+    unparseable, and for any token the preflight would then reject as ambiguous, so the operator
+    is never shown a complaint about a scope they did not type.
+    """
+    clean = str(target or "").strip()
+    if not clean or any(ch.isspace() for ch in clean) or "\\" in clean:
+        return ""
+    kind = _infer_kind(clean)
+    if kind == "git":
+        return _canonical_repository_root(clean)
+    if kind != "url":
+        return ""
+    try:
+        parsed = urlparse(clean if "://" in clean else f"https://{clean}")
+        host = _canonical_scope_host(parsed.hostname or "")
+    except ValueError:
+        return ""
+    # Embedded credentials are refused by the preflight below, so a grant derived from one would
+    # be a grant for a target that can never be hunted — and this is not a place to be holding a
+    # password at all.
+    if "@" in parsed.netloc:
+        return ""
+    # The same validity test _url_scope_preflight applies to a token the OPERATOR typed. A grant
+    # that fails it is one the preflight would reject, and the test below pins that agreement.
+    if not host or is_bare_public_suffix(host):
+        return ""
+    if "." not in host and ":" not in host and host != "localhost":
+        return ""
+    return host
+
+
 def _canonical_repository_root(value: str) -> str:
     """Use the clone transport's parser for the same repository identity."""
     return canonical_repo_root(value)

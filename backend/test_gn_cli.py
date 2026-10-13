@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -116,7 +117,8 @@ class GnCliTests(unittest.TestCase):
         # `greyiq-backend.exe takeover ...` fell through and booted the API server.
         for verb in ("hunt", "campaign", "osint", "scan", "learn", "stats", "traces", "operator",
                      "dashboard", "path", "leads", "profiles", "classes", "tools", "version",
-                     "platforms", "bundle", "takeover", "cve", "idor", "bfla", "idor-probe"):
+                     "platforms", "bundle", "takeover", "cve", "idor", "bfla", "idor-probe",
+                     "setup", "settings", "output"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
 
     def test_osint_hunt_requires_authorization_and_scope_before_lookup(self) -> None:
@@ -582,10 +584,25 @@ class DashVerbTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("takes no target", err)
 
-    def test_dash_needs_a_target_or_attach(self) -> None:
-        code, _, err = _run(["dash"])
+    def test_bare_dash_opens_the_board_rather_than_refusing(self) -> None:
+        # It used to refuse ("name a target, or --attach"), which made the one verb you reach for
+        # on a fresh terminal the one that needed a run to exist first.
+        with mock.patch.object(gn_cli, "_cmd_dash_board", return_value=0) as board:
+            code = gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash"]))
+        self.assertEqual(code, 0)
+        board.assert_called_once()
+
+    def test_board_and_another_view_are_refused_together(self) -> None:
+        for extra in (["--panels"], ["--attach"], ["https://t.example"]):
+            with self.subTest(extra=extra):
+                code, _, err = _run(["dash", "--board", *extra])
+                self.assertEqual(code, 2)
+                self.assertIn("--board is the IDLE dash", err)
+
+    def test_the_board_refuses_a_machine_feed_instead_of_silently_hunting(self) -> None:
+        code, _, err = _run(["dash", "--json"])
         self.assertEqual(code, 2)
-        self.assertIn("--attach", err)
+        self.assertIn("no run to serialize", err)
 
     def test_authorization_is_refused_in_hunts_own_words(self) -> None:
         # Same sentence from both verbs: two wordings read as two rules.
@@ -604,14 +621,896 @@ class DashVerbTests(unittest.TestCase):
             self.assertIn(expected, out)
 
 
-class DashHomeTests(unittest.TestCase):
-    """``gn dash --home`` — the idle cockpit and the relaunch handoff `GreyNOC Start` depends on."""
+class _Tty(io.StringIO):
+    """A stream that claims to be a terminal, for the paths that only run when one is."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+@contextlib.contextmanager
+def _terminal(answers: list[str]):
+    """Run with stdin/stdout that look like a terminal, answering input() from `answers`.
+
+    The prompts land on ``out.prompts``: a real ``input()`` writes its prompt to the terminal, so
+    without that a test cannot see the one line that carries the question.
+    """
+    replies = iter(answers)
+    out = _Tty()
+    out.prompts = []  # type: ignore[attr-defined]
+
+    def _input(prompt: str = "") -> str:
+        out.prompts.append(str(prompt))  # type: ignore[attr-defined]
+        return next(replies)
+
+    with mock.patch("sys.stdout", out), mock.patch("sys.stdin", _Tty()), \
+         mock.patch("builtins.input", _input):
+        yield out
+
+
+class _ProfileCase(unittest.TestCase):
+    """A CLI with its own runtime directory, so no test can read or write the real profile."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="gn-profile-")
+        self.runtime = Path(self._tmp.name)
+        self._saved = gn_cli.RUNTIME_DIR
+        gn_cli.RUNTIME_DIR = self.runtime
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        gn_cli.RUNTIME_DIR = self._saved
+        self._tmp.cleanup()
+
+    def args(self, *argv: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(list(argv))
+
+    def set(self, key: str, value: str) -> None:
+        self.assertEqual(_run(["settings", "set", key, value])[0], 0)
+
+
+class SettingsVerbTests(_ProfileCase):
+    """`gn setup`, `gn settings`, `gn output` — the profile as an operator drives it."""
+
+    def test_setup_defaults_writes_a_profile_without_asking(self) -> None:
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            code, out, err = _run(["setup", "--defaults"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").is_file())
+        self.assertIn("tinygpt", out)
+        self.assertIn("learning: on", out)
+
+    def test_setup_records_the_answers_it_was_given(self) -> None:
+        with _terminal(["greynoc", "local", "off", "api", "on", str(self.runtime / "reports")]):
+            code = gn_cli.main(["setup"])
+        self.assertEqual(code, 0)
+        import gn_profile
+
+        profile = gn_profile.load(self.runtime)
+        self.assertEqual(profile.get("operator.handle"), "greynoc")
+        self.assertEqual(profile.get("bot"), "local")
+        self.assertIs(profile.get("learning"), False)
+        self.assertEqual(profile.get("hunt.profile"), "api")
+        self.assertIs(profile.get("hunt.active"), True)
+
+    def test_setup_writes_nothing_when_an_answer_is_refused(self) -> None:
+        with _terminal(["", "skynet"]), contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli.main(["setup"])
+        self.assertEqual(code, 2)
+        self.assertIn("nothing was written", err.getvalue())
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_setup_on_an_existing_profile_shows_it_instead_of_overwriting(self) -> None:
+        _run(["setup", "--defaults"])
+        self.set("bot", "off")
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            code, out, _err = _run(["setup"])
+        self.assertEqual(code, 0)
+        self.assertIn("already written", out)
+        self.assertEqual(_run(["settings", "get", "bot"])[1].strip(), "off")
+
+    def test_setup_with_no_terminal_says_what_it_needs_instead_of_answering_itself(self) -> None:
+        # A pipe, or a dash pane: writing the defaults there would be this verb answering its own
+        # questions on the operator's behalf and saving the result.
+        code, _out, err = _run(["setup"])
+        self.assertEqual(code, 2)
+        self.assertIn("--defaults", err)
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_settings_lists_every_setting_and_the_commands_that_change_them(self) -> None:
+        import gn_profile
+
+        code, out, _err = _run(["settings"])
+        self.assertEqual(code, 0)
+        for item in gn_profile.SETTINGS:
+            self.assertIn(item.key, out)
+        self.assertIn("gn settings set", out)
+        self.assertIn("gn output", out)
+        self.assertIn("gn setup", out, "with no profile it must name the way to write one")
+
+    def test_get_prints_a_bare_value_for_a_script_to_read(self) -> None:
+        self.assertEqual(_run(["settings", "get", "bot"])[1], "tinygpt\n")
+        self.set("learning", "off")
+        self.assertEqual(_run(["settings", "get", "learning"])[1], "off\n")
+
+    def test_set_saves_immediately_and_survives_the_process(self) -> None:
+        code, out, _err = _run(["settings", "set", "hunt.profile", "api"])
+        self.assertEqual(code, 0)
+        self.assertIn("operator_profile.json", out, "it says where it wrote")
+        self.assertEqual(_run(["settings", "get", "hunt.profile"])[1].strip(), "api")
+
+    def test_an_unknown_key_or_value_is_refused_and_nothing_is_written(self) -> None:
+        for argv, expected in ((["settings", "set", "authorize", "true"], "no setting called"),
+                               (["settings", "set", "always_authorize", "1"], "no setting called"),
+                               (["settings", "set", "bot", "gpt5"], "tinygpt"),
+                               (["settings", "set", "learning", "sometimes"], "on or off"),
+                               (["settings", "get", "authorize"], "no setting called"),
+                               (["settings", "unset", "authorize"], "no setting called")):
+            with self.subTest(argv=argv):
+                code, _out, err = _run(argv)
+                self.assertEqual(code, 2)
+                self.assertIn(expected, err)
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_unset_returns_a_setting_to_its_default(self) -> None:
+        self.set("bot", "off")
+        code, out, _err = _run(["settings", "unset", "bot"])
+        self.assertEqual(code, 0)
+        self.assertIn("tinygpt", out)
+        self.assertEqual(_run(["settings", "get", "bot"])[1].strip(), "tinygpt")
+
+    def test_path_prints_where_the_profile_lives(self) -> None:
+        code, out, _err = _run(["settings", "path"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), str(self.runtime / "operator_profile.json"))
+
+    def test_output_sets_a_folder_for_one_target_and_lists_it(self) -> None:
+        folder = str(self.runtime / "acme")
+        code, out, err = _run(["output", "-s", "https://acme.example/app", "--path", folder])
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme.example", out)
+        code, out, _err = _run(["output"])
+        self.assertEqual(code, 0)
+        self.assertIn(folder, out)
+
+    def test_output_with_no_scope_sets_the_default_folder(self) -> None:
+        folder = str(self.runtime / "all")
+        self.assertEqual(_run(["output", "--path", folder])[0], 0)
+        self.assertEqual(_run(["settings", "get", "output.dir"])[1].strip(), folder)
+
+    def test_output_clear_drops_one_entry(self) -> None:
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        code, out, _err = _run(["output", "-s", "acme.example", "--clear"])
+        self.assertEqual(code, 0)
+        self.assertIn("cleared", out)
+        self.assertNotIn("acme.example", _run(["output"])[1])
+
+    def test_output_lists_runtime_reports_when_nothing_is_set(self) -> None:
+        code, out, _err = _run(["output"])
+        self.assertEqual(code, 0)
+        self.assertIn("runtime/reports", out)
+
+
+class ProfileDrivesTheVerbsTests(_ProfileCase):
+    """The profile fills what the command line did not say — and nothing else."""
+
+    def test_the_saved_posture_reaches_a_hunt_that_named_none_of_it(self) -> None:
+        self.set("hunt.profile", "api")
+        self.set("hunt.active", "on")
+        self.set("hunt.brain", "on")
+        self.set("hunt.per_finding", "on")
+        self.assertEqual(_run(["output", "--path", str(self.runtime / "r")])[0], 0)
+        args = self.args("hunt", "https://acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.profile, "api")
+        self.assertTrue(args.active)
+        self.assertTrue(args.brain)
+        self.assertTrue(args.per_finding)
+        self.assertEqual(args.out, str(self.runtime / "r"))
+
+    def test_a_flag_the_operator_typed_always_wins(self) -> None:
+        self.set("hunt.profile", "api")
+        args = self.args("hunt", "https://acme.example", "-y", "-p", "secrets",
+                         "-o", str(self.runtime / "typed"))
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.profile, "secrets")
+        self.assertEqual(args.out, str(self.runtime / "typed"))
+
+    def test_no_setting_can_turn_an_armed_flag_off(self) -> None:
+        # There is no "hunt.active off" that disarms --active: the profile fills blanks only.
+        self.set("hunt.active", "off")
+        args = self.args("hunt", "https://acme.example", "-y", "--active")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertTrue(args.active)
+
+    def test_no_setting_can_authorize_a_hunt(self) -> None:
+        import gn_profile
+
+        # Even a profile file that was hand-edited to carry one.
+        gn_profile.profile_path(self.runtime).write_text(
+            json.dumps({"settings": {"authorize": True, "hunt.active": True}}), encoding="utf-8")
+        args = self.args("hunt", "https://acme.example")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertFalse(args.authorize, "a file on disk cannot assert authorization")
+        code, _out, err = _run(["hunt", "https://acme.example", "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn(gn_cli._HUNT_AUTHORIZE, err)
+
+    def test_prompting_off_in_the_profile_means_no_prompt(self) -> None:
+        self.set("hunt.prompt", "off")
+        args = self.args("hunt", "https://acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertTrue(args.no_prompt)
+
+    def test_the_per_target_folder_beats_the_default_one(self) -> None:
+        _run(["output", "--path", str(self.runtime / "all")])
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        args = self.args("hunt", "https://app.acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.out, str(self.runtime / "acme"))
+
+    def test_a_first_run_hints_once_and_hunts_anyway(self) -> None:
+        # A CLI that refuses to work until a wizard is answered cannot be driven from a script.
+        with mock.patch.object(gn_cli, "_cmd_hunt", wraps=gn_cli._cmd_hunt), \
+             mock.patch("bughunter.bounty.run_bounty_hunt",
+                        return_value={"ok": True, "findings": [], "severity_counts": {},
+                                      "report_path": "r.md"}):
+            code, _out, err = _run(["hunt", "https://acme.example", "-y", "--no-fx"])
+        self.assertEqual(code, 0, err)
+
+
+class ProfilePrecedenceTests(_ProfileCase):
+    """A flag the operator TYPED always wins — including when they typed the default.
+
+    `default="full-sweep"` made "typed it" and "said nothing" the same value, so an operator who
+    ran `-p full-sweep` against a saved `hunt.profile: api` silently got api: the opposite of the
+    precedence `_from_profile` promises. Both options now use None as their unset sentinel.
+    """
+
+    def test_an_explicitly_typed_default_beats_the_saved_one(self) -> None:
+        self.set("hunt.profile", "api")
+        for argv, expected in ((["hunt", "https://t.example", "-y", "-p", "full-sweep"], "full-sweep"),
+                               (["hunt", "https://t.example", "-y", "-p", "secrets"], "secrets"),
+                               (["hunt", "https://t.example", "-y"], "api"),
+                               (["dash", "https://t.example", "-y", "-p", "full-sweep"], "full-sweep"),
+                               (["dash", "https://t.example", "-y"], "api")):
+            with self.subTest(argv=argv):
+                args = self.args(*argv)
+                gn_cli._from_profile(args)
+                self.assertEqual(args.profile, expected)
+
+    def test_the_parser_leaves_both_unset_rather_than_guessing(self) -> None:
+        for argv in (["hunt", "https://t.example"], ["dash", "https://t.example"]):
+            self.assertIsNone(self.args(*argv).profile, f"{argv[0]} must leave -p unset")
+        self.assertIsNone(self.args("campaign", "https://t.example").platform)
+
+    def test_a_namespace_that_never_met_a_profile_still_gets_a_profile(self) -> None:
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertEqual(args.profile, gn_cli._DEFAULT_HUNT_PROFILE)
+
+    def test_the_saved_platform_reaches_a_campaign_that_omitted_the_flag(self) -> None:
+        self.set("platform", "intigriti")
+        args = self.args("campaign", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertEqual(args.platform, "intigriti")
+        typed = self.args("campaign", "https://t.example", "-y", "--platform", "manual")
+        gn_cli._from_profile(typed)
+        self.assertEqual(typed.platform, "manual", "a typed platform wins")
+
+    def test_the_report_verbs_whose_out_is_a_file_resolve_the_platform_too(self) -> None:
+        # `gn idor` / `gn bfla` take a report FILE in -o, so they cannot run _from_profile (it
+        # would point that file at a folder) — they resolve the platform on its own.
+        self.set("platform", "yeswehack")
+        for argv in (["idor", "https://a.example/1", "https://b.example/1", "-y"],
+                     ["bfla", "https://a.example/admin", "-y"]):
+            with self.subTest(argv=argv[0]):
+                self.assertEqual(gn_cli._report_platform(self.args(*argv)), "yeswehack")
+        typed = self.args("idor", "https://a.example/1", "https://b.example/1", "-y",
+                          "--platform", "manual")
+        self.assertEqual(gn_cli._report_platform(typed), "manual")
+
+
+class ReportFolderTests(_ProfileCase):
+    """`gn output --path` is advertised as the folder for everything, so every writer honours it.
+
+    Filling only the namespaces that carry an ``-o`` left `gn campaign` — which has no such flag —
+    writing to runtime/reports while the operator had chosen somewhere else.
+    """
+
+    def test_the_default_folder_applies_with_no_target_named(self) -> None:
+        folder = self.runtime / "all"
+        self.assertEqual(_run(["output", "--path", str(folder)])[0], 0)
+        self.assertEqual(gn_cli._reports_dir(), folder)
+
+    def test_a_per_target_folder_applies_to_a_verb_with_no_out_flag(self) -> None:
+        _run(["output", "--path", str(self.runtime / "all")])
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        self.assertEqual(gn_cli._reports_dir("https://app.acme.example/x"), self.runtime / "acme")
+        self.assertEqual(gn_cli._reports_dir("https://other.example/"), self.runtime / "all")
+
+    def test_the_campaign_names_its_target_so_the_per_target_folder_is_reachable(self) -> None:
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        captured: dict = {}
+
+        def _campaign(*_a: object, **kw: object) -> dict:
+            captured["dir"] = kw.get("default_reports_dir")
+            return {"ok": True, "findings": [], "severity_counts": {}, "report_path": "r.md"}
+
+        with mock.patch("bughunter.campaign.run_campaign", side_effect=_campaign):
+            gn_cli._cmd_campaign(self.args("campaign", "https://acme.example", "-y", "--no-fx"))
+        self.assertEqual(captured["dir"], self.runtime / "acme")
+
+    def test_nothing_configured_is_still_runtime_reports(self) -> None:
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+
+    def test_a_configured_folder_keeps_the_engines_one_level_rule(self) -> None:
+        """An operator-named folder may create its LEAF, never a brand-new tree.
+
+        That is what stops a saved report folder becoming a write-anywhere primitive, and it is
+        the same rule `bounty._resolve_output_dir` applies to `-o`. A path that fails it falls
+        back to runtime/reports, which this program chose and may create with its parents.
+        """
+        leaf = self.runtime / "engagements"           # parent exists: the leaf may be created
+        _run(["output", "--path", str(leaf)])
+        self.assertEqual(gn_cli._reports_dir(), leaf.resolve())
+        self.assertTrue(leaf.is_dir())
+
+        tree = self.runtime / "never" / "existed" / "before"
+        _run(["output", "--path", str(tree)])
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+        self.assertFalse(tree.exists(), "a multi-level tree must not be conjured")
+
+    def test_it_resolves_a_folder_exactly_as_the_engine_would(self) -> None:
+        # One rule, two readings: this one is repeated rather than imported (bughunter.bounty is a
+        # heavy import for a verb that only wants a directory), so the two are pinned together.
+        from bughunter.bounty import _resolve_output_dir
+
+        default = self.runtime / "reports"
+        cases = (self.runtime,                                  # an existing directory
+                 self.runtime / "leaf",                         # a new leaf under an existing parent
+                 self.runtime / "deep" / "tree" / "here",       # a brand-new tree
+                 self.runtime / "a-file" / "under-a-file")      # a parent that is a file
+        (self.runtime / "a-file").write_text("not a directory", encoding="utf-8")
+        for folder in cases:
+            with self.subTest(folder=folder.name):
+                _run(["output", "--path", str(folder)])
+                self.assertEqual(gn_cli._reports_dir(),
+                                 _resolve_output_dir(str(folder), default))
+
+    def test_an_unreadable_profile_means_the_default_never_no_reports(self) -> None:
+        gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").write_text("{ broken", encoding="utf-8")
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+
+
+class LearningOptOutTests(_ProfileCase):
+    """`learning off` has to STOP the writing, not just label it.
+
+    The setting shipped as a studio header and nothing else: hunts went on recording traces, the
+    surface baseline and negative knowledge while the dashboard said LEARNING OFF. That is a
+    data-retention control that does not retain anything of what it promises.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._learning_flag = gn_cli._LEARNING_OFF_BY_PROFILE
+        gn_cli._LEARNING_OFF_BY_PROFILE = False
+        os.environ.pop("GREYIQ_NO_LEARNING", None)
+
+    def tearDown(self) -> None:
+        gn_cli._LEARNING_OFF_BY_PROFILE = self._learning_flag
+        os.environ.pop("GREYIQ_NO_LEARNING", None)
+
+    def test_off_sets_the_switch_every_automatic_writer_reads(self) -> None:
+        self.set("learning", "off")
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        from bughunter import negative_knowledge
+
+        self.assertTrue(negative_knowledge.learning_disabled())
+        self.assertFalse(negative_knowledge.enabled())
+
+    def test_on_leaves_every_writer_alone(self) -> None:
+        self.set("learning", "on")
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        from bughunter import negative_knowledge
+
+        self.assertFalse(negative_knowledge.learning_disabled())
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_the_default_does_not_touch_the_environment(self) -> None:
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_every_automatic_writer_refuses_once_it_is_set(self) -> None:
+        """The switch, exercised through the engine's own writers rather than mocked."""
+        self.set("learning", "off")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        from bughunter import hunt_trace, hunt_train, negative_knowledge, surface_drift
+
+        store = str(self.runtime / "learn")
+        self.assertFalse(hunt_trace.record_trace(
+            store, program=None, target="https://t.example",
+            surface={"urls": ["https://t.example/a"]}, plan={"probe_priority": []},
+            outcomes=[{"endpoint": "t.example/a", "class": "xss", "rule_id": "r",
+                       "proof_status": "confirmed", "severity": "high", "dedup_key": "k"}]))
+        self.assertFalse(surface_drift.record_snapshot(
+            store, program=None, target="https://t.example", host="t.example",
+            observations={}, surface={}))
+        self.assertFalse(negative_knowledge.enabled())
+        self.assertEqual(hunt_train.maybe_auto_train(store).get("reason"), "learning is off")
+        self.assertFalse(Path(store).exists(), "nothing was written at all")
+
+    def test_flipping_it_back_on_inside_a_session_takes_effect(self) -> None:
+        # The studio is a setup surface: `/set learning on` and then `/hunt` run in ONE process,
+        # so a switch that is only ever set would leave learning off for the rest of the session.
+        args = self.args("hunt", "https://t.example", "-y")
+        self.set("learning", "off")
+        gn_cli._from_profile(args)
+        self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1")
+        self.set("learning", "on")
+        gn_cli._from_profile(args)
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_it_never_clobbers_a_switch_the_operator_exported(self) -> None:
+        # An env var in their shell is immediate; a saved default is not, so the shell wins.
+        gn_cli._LEARNING_OFF_BY_PROFILE = False
+        os.environ["GREYIQ_NO_LEARNING"] = "1"
+        self.set("learning", "on")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1")
+
+    def test_the_two_readings_of_the_switch_cannot_drift(self) -> None:
+        # hunt_train stays stdlib-only at import time, so it reads the variable rather than
+        # importing the canonical reading of it.
+        from bughunter import hunt_train, negative_knowledge
+
+        self.assertEqual(hunt_train._NO_LEARNING_ENV, negative_knowledge._ENV_NO_LEARNING)
+
+
+class TerminalAttestationTests(_ProfileCase):
+    """``-y``, or the same question asked at a terminal. Never a file, never a setting."""
+
+    def test_yes_at_the_terminal_is_the_attestation(self) -> None:
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["y"]) as out:
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target))
+        self.assertTrue(args.authorize)
+        self.assertIn("acme.example", out.getvalue(), "the question names the target")
+        self.assertIn("AUTHORIZED", "".join(out.prompts), "and asks for the attestation by name")
+
+    def test_anything_but_yes_is_a_refusal(self) -> None:
+        for answer in ("", "n", "no", "maybe", "sure", "Y E S", "ok"):
+            with self.subTest(answer=answer):
+                args = self.args("hunt", "https://acme.example")
+                with _terminal([answer]):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+                self.assertFalse(args.authorize)
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["YES"]):
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target), "case is not the test")
+
+    def test_eof_and_ctrl_c_are_refusals(self) -> None:
+        for raised in (EOFError, KeyboardInterrupt):
+            with self.subTest(raised=raised.__name__):
+                args = self.args("hunt", "https://acme.example")
+                with mock.patch("sys.stdout", _Tty()), mock.patch("sys.stdin", _Tty()), \
+                     mock.patch("builtins.input", side_effect=raised):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+
+    def test_nobody_is_asked_when_nobody_is_there(self) -> None:
+        for extra in ([], ["--json"], ["--no-prompt"]):
+            with self.subTest(extra=extra):
+                args = self.args("hunt", "https://acme.example", *extra)
+                with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+
+    def test_y_on_the_command_line_asks_nothing(self) -> None:
+        args = self.args("hunt", "https://acme.example", "-y")
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target))
+
+    def test_the_attestation_also_carries_the_scope(self) -> None:
+        # Answering the question is the same act as typing -y, so it scopes the target too.
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["yes"]):
+            gn_cli._confirm_authorization(args, args.target)
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "acme.example")
+
+
+class AutoScopeFormTests(_ProfileCase):
+    """`gn auto hunt -s acme.example` — the one-line hunt, with no directory involved."""
+
+    def test_a_scope_becomes_the_plan_a_directory_would_have(self) -> None:
+        code, out, err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("https://greynoc.com", out)
+        self.assertIn("--scope", out)
+        self.assertIn("dry run", out)
+
+    def test_the_bare_word_hunt_is_accepted_because_it_reads_like_a_sentence(self) -> None:
+        for argv in (["auto", "hunt", "-s", "greynoc.com", "--dry-run"],
+                     ["auto", "-s", "greynoc.com", "--dry-run"]):
+            with self.subTest(argv=argv):
+                code, out, _err = _run(argv)
+                self.assertEqual(code, 0)
+                self.assertIn("https://greynoc.com", out)
+
+    def test_hunt_without_a_scope_names_both_forms(self) -> None:
+        code, _out, err = _run(["auto", "hunt"])
+        self.assertEqual(code, 2)
+        self.assertIn("-s acme.example", err)
+        self.assertIn("gn auto <path>", err)
+
+    def test_a_scope_and_a_directory_together_are_refused(self) -> None:
+        code, _out, err = _run(["auto", str(BACKEND_DIR), "-s", "greynoc.com"])
+        self.assertEqual(code, 2)
+        self.assertIn("not both", err)
+
+    def test_a_real_folder_called_hunt_is_still_a_folder(self) -> None:
+        (self.runtime / "hunt").mkdir()
+        here = os.getcwd()
+        os.chdir(self.runtime)
+        try:
+            code, out, _err = _run(["auto", "hunt", "--dry-run"])
+        finally:
+            os.chdir(here)
+        self.assertEqual(code, 2, "an empty folder has nothing to hunt")
+        self.assertNotIn("needs a scope", out)
+
+    def test_a_scope_hunt_is_passive_until_something_arms_it(self) -> None:
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertIn("passive only", out)
+        self.set("hunt.active", "on")
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertIn("ACTIVE", out)
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run", "--passive"])
+        self.assertIn("passive only", out, "--passive wins over the profile")
+
+    def test_active_cannot_be_armed_without_a_scope_to_bind_it(self) -> None:
+        # An empty scope makes host_in_active_scope refuse every host, so "ACTIVE" there would be
+        # a posture line that sends no probes.
+        with mock.patch("bughunter.hunt_dir.from_scope") as planner:
+            planner.return_value = __import__("bughunter.hunt_dir", fromlist=["HuntPlan"]).HuntPlan(
+                ok=True, targets=["https://acme.example"], scope_text="", name="acme")
+            code, out, _err = _run(["auto", "-s", "acme.example", "--dry-run", "--active"])
+        self.assertEqual(code, 0)
+        self.assertIn("passive only", out)
+
+    def test_a_scope_hunt_still_needs_the_attestation(self) -> None:
+        code, _out, err = _run(["auto", "hunt", "-s", "greynoc.com"])
+        self.assertEqual(code, 2)
+        self.assertIn("-y/--authorize", err)
+
+
+class AuthorizeCarriesScopeTests(unittest.TestCase):
+    """``-y`` is sudo for the thing you pointed at: it puts that target in scope.
+
+    Every verb here used to make the operator say it twice — `gn hunt https://acme.example -y -s
+    acme.example` — and refuse the run for forgetting the second half. These pin the three bounds
+    that make the shortcut safe: no -y, no widening; additive and exact; only the named target.
+    """
+
+    def _args(self, *argv: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(list(argv))
+
+    def test_y_puts_the_target_in_scope(self) -> None:
+        args = self._args("hunt", "https://acme.example", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "acme.example")
+
+    def test_without_y_nothing_is_added(self) -> None:
+        # The flag IS the attestation. A scope that widened without it would be this program
+        # asserting an authorization nobody gave.
+        args = self._args("hunt", "https://acme.example")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "")
+        args = self._args("hunt", "https://acme.example", "-s", "other.example")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "other.example")
+
+    def test_the_operators_own_scope_is_kept_and_added_to_never_rewritten(self) -> None:
+        args = self._args("hunt", "https://acme.example", "-y", "-s", "*.corp.example other.example")
+        scope = gn_cli._authorized_scope(args, args.target)
+        self.assertTrue(scope.startswith("*.corp.example other.example"))
+        self.assertIn("acme.example", scope.split())
+
+    def test_a_target_already_named_is_not_named_twice(self) -> None:
+        for typed in ("acme.example", "ACME.example", "other.example acme.example"):
+            with self.subTest(typed=typed):
+                args = self._args("hunt", "https://acme.example", "-y", "-s", typed)
+                self.assertEqual(gn_cli._authorized_scope(args, args.target), typed)
+
+    def test_nothing_is_added_for_a_target_that_needs_no_scope(self) -> None:
+        for target in (".", "./repo", "not a url"):
+            with self.subTest(target=target):
+                args = self._args("hunt", target, "-y", "-p", "source-code")
+                self.assertEqual(gn_cli._authorized_scope(args, args.target), "")
+
+    def test_a_wildcard_is_never_derived(self) -> None:
+        args = self._args("hunt", "https://sub.acme.example", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "sub.acme.example")
+
+    def test_two_targets_each_grant_only_themselves(self) -> None:
+        args = self._args("idor", "https://acme.example/a", "https://acme.example/b", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.url_a, args.url_b), "acme.example")
+        args = self._args("idor", "https://a.example/x", "https://b.example/y", "-y")
+        self.assertEqual(gn_cli._authorized_scope(args, args.url_a, args.url_b).split(),
+                         ["a.example", "b.example"])
+
+    def test_the_hunt_passes_the_derived_scope_to_the_engine_and_the_board(self) -> None:
+        captured: dict = {}
+
+        def _hunt(*a: object, **kw: object) -> dict:
+            captured["scope"] = a[4]
+            return {"ok": True, "findings": [], "severity_counts": {}, "report_path": "r.md"}
+
+        with mock.patch("bughunter.bounty.run_bounty_hunt", side_effect=_hunt), \
+             mock.patch.object(gn_cli, "_fx") as fx:
+            code = gn_cli._cmd_hunt(self._args("hunt", "https://acme.example", "-y", "--no-fx"))
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["scope"], "acme.example",
+                         "the engine reads permission out of the scope text")
+        self.assertEqual(fx.call_args.kwargs["scope"], "acme.example",
+                         "the board states the scope the run is actually bound by")
+
+    def test_scan_fills_the_scope_it_was_not_given_without_joining_one_it_was(self) -> None:
+        # Its gate takes exactly ONE exact grant, so this verb substitutes rather than appends.
+        with mock.patch("bughunter.chat_commands.validate_scoped_network_target",
+                        return_value={"ok": True, "scope_host": "acme.example"}) as gate, \
+             mock.patch("bughunter.web_scan_service.run_web_scan",
+                        return_value={"ok": True, "findings": []}), \
+             mock.patch("bughunter.triage.summarize_findings", return_value=""):
+            gn_cli._cmd_scan(self._args("scan", "https://acme.example", "-y"))
+            self.assertEqual(gate.call_args.args[2], "acme.example")
+            gn_cli._cmd_scan(self._args("scan", "https://acme.example", "-y",
+                                        "-s", "acme.example"))
+            self.assertEqual(gate.call_args.args[2], "acme.example")
+
+
+class DashBoardTests(unittest.TestCase):
+    """``gn dash`` — the resident threat board, and what each of its asks relaunches."""
 
     def _args(self, *extra: str) -> argparse.Namespace:
-        return gn_cli.build_parser().parse_args(["dash", "--home", *extra])
+        return gn_cli.build_parser().parse_args(["dash", *extra])
 
-    def test_home_is_registered_and_routes_to_the_home_driver(self) -> None:
-        self.assertTrue(self._args().home)
+    def _board(self, ask: object) -> tuple[int, dict]:
+        """Run the driver with one ask coming back from the board, then a quit."""
+        asks = [ask, None]
+        calls: dict = {}
+
+        def _run_board(**kw: object) -> object:
+            calls["kw"] = kw
+            return asks.pop(0)
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", side_effect=_run_board), \
+             mock.patch.object(gn_cli, "_dash_board_again", return_value=False), \
+             mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt, \
+             mock.patch.object(gn_cli, "_cmd_dash", return_value=0) as dash:
+            code = gn_cli._cmd_dash_board(self._args())
+        calls["hunt"], calls["dash"] = hunt, dash
+        return code, calls
+
+    def test_quitting_the_board_launches_nothing(self) -> None:
+        code, calls = self._board(None)
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        calls["dash"].assert_not_called()
+
+    def test_a_hunt_runs_the_real_verb_with_the_consent_and_depth_the_board_took(self) -> None:
+        # _cmd_hunt, NOT _cmd_dash: the hunt must draw its own live board (the arcs are the
+        # engine's) and leave its summary on a restored terminal.
+        code, calls = self._board({"action": "hunt", "target": "https://t.example",
+                                   "depth": {"theorize": True, "turns": 3}})
+        self.assertEqual(code, 0)
+        calls["dash"].assert_not_called()
+        nxt = calls["hunt"].call_args[0][0]
+        self.assertEqual(nxt.target, "https://t.example")
+        self.assertTrue(nxt.authorize, "the board demanded -y; that consent must carry through")
+        self.assertTrue(nxt.theorize)
+        self.assertEqual(nxt.turns, 3)
+        self.assertFalse(nxt.attach)
+        for flag in ("board", "home", "panels"):
+            self.assertFalse(getattr(nxt, flag), f"leaving --{flag} set would recurse")
+
+    def test_a_hunt_returns_to_standby_until_the_operator_says_otherwise(self) -> None:
+        asks = [{"action": "hunt", "target": "https://t.example", "depth": {}},
+                {"action": "hunt", "target": "https://t.example", "depth": {}}, None]
+        again = [True, False]
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", side_effect=lambda **_kw: asks.pop(0)), \
+             mock.patch.object(gn_cli, "_dash_board_again", side_effect=lambda: again.pop(0)), \
+             mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt:
+            code = gn_cli._cmd_dash_board(self._args())
+        self.assertEqual(code, 0)
+        self.assertEqual(hunt.call_count, 2, "ENTER brings the board back; q leaves")
+
+    def test_attach_watches_one_run_and_ends_the_switch(self) -> None:
+        # --attach is not a VIEW: it opens the panel cockpit over one specific run, so it hands
+        # back no view to switch to.
+        code, calls = self._board({"action": "attach"})
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        nxt = calls["dash"].call_args[0][0]
+        self.assertTrue(nxt.attach)
+        self.assertEqual(nxt.target, "")
+
+    def test_the_other_views_are_handed_back_by_name(self) -> None:
+        # The transition table, not the call graph: `_cmd_dash_views` is the one place a view
+        # switch happens, so these return a NAME and nothing calls another view from in here.
+        for action in ("panels", "studio"):
+            with self.subTest(action=action):
+                with mock.patch("gn_tui.refusal", return_value=""),                      mock.patch("gn_dash.board_refusal", return_value=""),                      mock.patch("gn_dash.run_board", return_value={"action": action}),                      mock.patch.object(gn_cli, "_cmd_dash") as dash,                      mock.patch.object(gn_cli, "_cmd_dash_home") as home:
+                    code, view = gn_cli._dash_board_view(self._args())
+                self.assertEqual((code, view), (0, action))
+                dash.assert_not_called()
+                home.assert_not_called()
+
+    def test_an_unknown_ask_launches_nothing(self) -> None:
+        code, calls = self._board({"action": "sudo-rm-rf"})
+        self.assertEqual(code, 0)
+        calls["hunt"].assert_not_called()
+        calls["dash"].assert_not_called()
+
+    def test_the_scope_the_operator_declared_is_what_the_board_states(self) -> None:
+        # The board prints it beside "AUTHORIZED SCOPE ONLY"; it may only ever be the operator's
+        # own words, never a target standing in for them.
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", return_value=None) as run_board:
+            gn_cli._cmd_dash_board(gn_cli.build_parser().parse_args(
+                ["dash", "-s", "*.acme.example"]))
+        self.assertEqual(run_board.call_args.kwargs["scope"], "*.acme.example")
+
+    def test_a_terminal_that_will_not_take_the_board_says_so(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value="too small, it says"), \
+             mock.patch("gn_dash.run_board") as run_board:
+            code, _out, err = _run(["dash"])
+        self.assertEqual(code, 2)
+        self.assertIn("too small, it says", err)
+        run_board.assert_not_called()
+
+    def test_a_non_tty_refuses_instead_of_silently_hunting(self) -> None:
+        code, _out, err = _run(["dash"])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal", err.lower())
+
+    def test_returning_to_standby_is_the_default_answer_and_q_is_not(self) -> None:
+        for typed, expected in (("", True), ("\n", True), ("q", False), ("Q", False),
+                                ("quit", False), ("yes", True)):
+            with self.subTest(typed=typed), mock.patch("builtins.input", return_value=typed):
+                self.assertIs(gn_cli._dash_board_again(), expected)
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(gn_cli._dash_board_again(), "a piped stdin has nobody to ask")
+
+
+class StudioVerbTests(_ProfileCase):
+    """`gn studio` / `gn dash --studio` — the third view, and the handoffs between the three."""
+
+    def test_it_is_registered_as_a_verb_and_as_a_dash_view(self) -> None:
+        self.assertIn("studio", gn_cli.CLI_COMMANDS)
+        self.assertIs(gn_cli.build_parser().parse_args(["studio"]).func, gn_cli._cmd_studio)
+        with mock.patch.object(gn_cli, "_cmd_studio", return_value=0) as studio:
+            gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash", "--studio"]))
+        studio.assert_called_once()
+
+    def test_the_studio_view_takes_no_target_and_no_other_view(self) -> None:
+        for extra in (["--board"], ["--panels"], ["--attach"], ["https://t.example"]):
+            with self.subTest(extra=extra):
+                code, _out, err = _run(["dash", "--studio", *extra])
+                self.assertEqual(code, 2)
+                self.assertIn("--studio is a view of its own", err)
+
+    def test_it_refuses_a_machine_feed_and_names_the_verbs_that_are_one(self) -> None:
+        code, _out, err = _run(["studio", "--json"])
+        self.assertEqual(code, 2)
+        for verb in ("gn stats", "gn traces", "gn settings"):
+            self.assertIn(verb, err)
+
+    def test_a_non_tty_refuses_instead_of_drawing(self) -> None:
+        code, _out, err = _run(["studio"])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal", err.lower())
+
+    def test_it_is_given_this_sessions_runtime_and_seed_directories(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value=""), \
+             mock.patch("gn_studio.run_studio", return_value=None) as run_studio:
+            code = gn_cli.main(["studio"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run_studio.call_args.kwargs["runtime_dir"], gn_cli.RUNTIME_DIR)
+        self.assertEqual(run_studio.call_args.kwargs["seed_dir"], gn_cli.SEED_DIR)
+        self.assertIsNotNone(run_studio.call_args.kwargs["profile"], "it shows the saved profile")
+
+    def test_a_terminal_too_small_for_it_says_so(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value="too small, it says"), \
+             mock.patch("gn_studio.run_studio") as run_studio:
+            code, _out, err = _run(["studio"])
+        self.assertEqual(code, 2)
+        self.assertIn("too small, it says", err)
+        run_studio.assert_not_called()
+
+    def test_board_and_panels_from_the_studio_are_handed_back_by_name(self) -> None:
+        # The transition table, not the call graph: `_cmd_dash_views` is the one place a view
+        # switch happens, so a view returns the NAME of the next one and calls nothing itself.
+        for action in ("board", "panels"):
+            with self.subTest(action=action):
+                with mock.patch("gn_tui.refusal", return_value=""), \
+                     mock.patch("gn_studio.size_refusal", return_value=""), \
+                     mock.patch("gn_studio.run_studio", return_value={"action": action}), \
+                     mock.patch.object(gn_cli, "_cmd_dash") as dash, \
+                     mock.patch.object(gn_cli, "_cmd_dash_home") as home:
+                    code, view = gn_cli._dash_studio_view(self.args("studio"))
+                self.assertEqual((code, view), (0, action))
+                dash.assert_not_called()
+                home.assert_not_called()
+
+    def test_the_view_loop_switches_without_growing_the_stack(self) -> None:
+        """Three frames per switch would end a long session in a RecursionError inside a repaint.
+
+        Driven by making two views hand each other back 400 times — about four times the depth
+        mutual recursion would have survived.
+        """
+        flips = {"n": 0}
+
+        def _board(_args: object) -> tuple[int, str]:
+            flips["n"] += 1
+            return (0, "studio" if flips["n"] < 400 else "")
+
+        with mock.patch.object(gn_cli, "_dash_board_view", side_effect=_board), \
+             mock.patch.object(gn_cli, "_dash_studio_view", return_value=(0, "board")):
+            code = gn_cli._cmd_dash_views(self.args("dash"), "board")
+        self.assertEqual(code, 0)
+        self.assertEqual(flips["n"], 400)
+
+    def test_a_view_is_never_handed_a_flag_the_last_one_left_set(self) -> None:
+        seen: list[dict] = []
+
+        def _studio(args: argparse.Namespace) -> tuple[int, str]:
+            seen.append({flag: getattr(args, flag)
+                         for flag in ("board", "panels", "home", "studio")})
+            return (0, "")
+
+        with mock.patch.object(gn_cli, "_dash_studio_view", side_effect=_studio):
+            gn_cli._cmd_dash_views(self.args("dash", "--board"), "studio")
+        self.assertEqual(seen, [{"board": False, "panels": False, "home": False, "studio": False}])
+
+    def test_an_unknown_ask_opens_nothing(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_studio.size_refusal", return_value=""), \
+             mock.patch("gn_studio.run_studio", return_value={"action": "sudo-rm-rf"}), \
+             mock.patch.object(gn_cli, "_cmd_dash") as dash:
+            self.assertEqual(gn_cli.main(["studio"]), 0)
+        dash.assert_not_called()
+
+    def test_the_board_hands_over_to_the_studio_through_the_loop(self) -> None:
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.board_refusal", return_value=""), \
+             mock.patch("gn_dash.run_board", return_value={"action": "studio"}), \
+             mock.patch.object(gn_cli, "_dash_studio_view", return_value=(0, "")) as studio:
+            code = gn_cli._cmd_dash_board(gn_cli.build_parser().parse_args(["dash"]))
+        self.assertEqual(code, 0)
+        studio.assert_called_once()
+
+
+class DashHomeTests(unittest.TestCase):
+    """``gn dash --panels`` — the idle cockpit and the relaunch handoff `GreyNOC Start` depends on."""
+
+    def _args(self, *extra: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(["dash", "--panels", *extra])
+
+    def test_the_older_home_spelling_still_opens_the_panels(self) -> None:
+        self.assertTrue(gn_cli.build_parser().parse_args(["dash", "--home"]).home)
+        with mock.patch.object(gn_cli, "_cmd_dash_home", return_value=0) as home:
+            gn_cli._cmd_dash(gn_cli.build_parser().parse_args(["dash", "--home"]))
+        home.assert_called_once()
+
+    def test_panels_is_registered_and_routes_to_the_home_driver(self) -> None:
+        self.assertTrue(self._args().panels)
         with mock.patch.object(gn_cli, "_cmd_dash_home", return_value=0) as home:
             gn_cli._cmd_dash(self._args())
         home.assert_called_once()

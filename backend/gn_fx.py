@@ -814,8 +814,17 @@ class Board:
     """
 
     def __init__(self, title: str, *, scope: str = "", stream: TextIO | None = None,
-                 active: bool | None = None, footer: str = "", clock_base: float | None = None) -> None:
+                 active: bool | None = None, footer: str = "", clock_base: float | None = None,
+                 interactive: bool = False) -> None:
         self._stream = stream if stream is not None else sys.stderr
+        #: ``gn dash`` drives the board as a RESIDENT surface with an input line under it, which a
+        #: hunt's board does not have. The board is output-only by construction — the ticker thread
+        #: owns the stream — so the driver cannot write that line itself without two threads racing
+        #: for the same cells. It hands the text in through :meth:`command_line` instead and the
+        #: ticker draws it with everything else.
+        self._interactive = bool(interactive)
+        self._prompt: tuple[str, int] | None = None
+        self._caret: tuple[int, int] | None = None
         self._active = (enabled(self._stream) and board_fits(self._stream)) if active is None else bool(active)
         self._encoding = (getattr(self._stream, "encoding", None) or "ascii")
         self._glyphs = _BOARD_UNI if self._encodable(_glyph_probe(_BOARD_UNI)) else _BOARD_ASCII
@@ -864,7 +873,10 @@ class Board:
         self._top = max(0, (rows - _BOARD_ROWS) // 2)
         _enable_vt(self._stream)
         try:
-            self._stream.write(_TERM_ENTER)
+            # _TERM_ENTER hides the cursor, which is right for a board nobody types at. A resident
+            # board HAS an input line, and a command line you cannot see your cursor on is the one
+            # thing worse than no command line.
+            self._stream.write(_TERM_ENTER + ("\033[?25h" if self._interactive else ""))
             self._stream.flush()
         except Exception:  # noqa: BLE001 - a stream that cannot take the board gets no board
             self._active = False
@@ -992,6 +1004,20 @@ class Board:
         clean = self._clean(text)
         with self._lock:
             self._phase = clean
+
+    def command_line(self, text: str, caret: int) -> None:
+        """Put the operator's input line under the board, with their cursor at ``caret``.
+
+        ``gn dash`` reads keys on the main thread and calls this; the ticker draws the line and
+        parks the hardware cursor on it, so the two threads never write the same cells. Ignored on
+        a board that was not opened ``interactive`` — a hunt's board is output-only, and a prompt
+        drawn under one would invite typing that nothing is reading.
+        """
+        if not self._interactive:
+            return
+        clean = self._clean(text)
+        with self._lock:
+            self._prompt = (clean, max(0, min(int(caret), len(clean))))
 
     def hit(self, severity: str, text: str = "") -> None:
         """A finding landed but nothing said where. Typed into the log; no arc moves, because an arc
@@ -1161,6 +1187,11 @@ class Board:
             if index >= len(previous) or previous[index] != row
         ]
         self._last_rows = rows
+        # The cursor is parked LAST and on every frame that wrote anything: a row write leaves it
+        # wherever that row ended, so an input line whose caret is only set when the caret itself
+        # moved would blink somewhere out on the map.
+        if painted and self._caret is not None:
+            painted.append(f"\033[{self._top + self._caret[1] + 1};{self._left + self._caret[0] + 1}H")
         if painted:
             self._write("".join(painted))
             self._flush()
@@ -1319,6 +1350,18 @@ class Board:
             if spare > 3:
                 footer = f" SCOPE {scope}  ::  {self._footer} "
         grid.text(box_x + 2, box_y + box_h - 1, footer[:room], dim)
+
+        # --- the command line, UNDER the box ------------------------------------------------------
+        # Outside the frame rather than inside it: the box is exactly map + status + two teletype
+        # rows + footer, and taking a row from any of those costs something the board exists to
+        # show. The row below the box is the one cell of the grid nothing else claims, and a prompt
+        # beneath the screen it drives is where a shell puts one anyway.
+        if self._prompt is not None:
+            text, caret = self._prompt
+            row = self._grid.h - 1
+            line = ("> " + text)[: self._cols]
+            grid.text(0, row, line, "1;38;5;214")
+            self._caret = (min(2 + caret, max(0, self._cols - 1)), row)
 
     def _clock(self, t: float) -> str:
         if self._clock_base is None:

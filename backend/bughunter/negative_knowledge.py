@@ -58,6 +58,21 @@ _MAX_PAIRS_PER_PROGRAM = 4000
 _KEY_SEP = "\t"  # separates endpoint-key from class inside a stored pair id; neither field contains it
 
 _ENV_DISABLE = "GREYIQ_NO_NEGATIVE_KNOWLEDGE"
+#: The MASTER learning opt-out, honoured by every automatic writer (this memory, the hunt trace,
+#: the surface baseline and the auto-trainer). `gn settings set learning off` sets it for the
+#: process, so an operator who turns learning off gets no new records rather than a label that
+#: says off over a memory that keeps growing. An EXPLICIT instruction (`gn learn`,
+#: `gn train-brain`) is not automatic and is not gated by it.
+_ENV_NO_LEARNING = "GREYIQ_NO_LEARNING"
+
+
+def learning_disabled() -> bool:
+    """True when the operator has turned automatic learning off for this process.
+
+    Lives here because this module already owns the only kill switch of its kind; every other
+    automatic writer imports it so there is exactly one reading of what "off" means.
+    """
+    return str(os.getenv(_ENV_NO_LEARNING, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 # Sentinel meaning "the whole host changed, re-enable everything". surface_drift COLLAPSES a
 # site-wide control loss into ONE delta whose subject is prose ("3 endpoint(s)"), not a URL — see
@@ -75,7 +90,9 @@ _NUM_SEG = re.compile(r"/\d+(?=/|$)")
 
 
 def enabled() -> bool:
-    """False when the operator has turned negative knowledge off for this process."""
+    """False when the operator has turned negative knowledge — or all learning — off."""
+    if learning_disabled():
+        return False
     return str(os.getenv(_ENV_DISABLE, "")).strip().lower() not in {"1", "true", "yes", "on"}
 
 

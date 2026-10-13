@@ -181,5 +181,77 @@ class RepositoryScopePreflightTests(unittest.TestCase):
                 self.assertEqual(scanners.call_args.args[1], "path")
 
 
+class SelfScopeGrantTests(unittest.TestCase):
+    """``-y`` carries the target it was typed about into scope. What that grant may and may not be.
+
+    The load-bearing test is :meth:`test_every_grant_it_produces_satisfies_the_preflight`: this
+    function and the preflight are two readings of "what does `acme.example` mean", and the day
+    they disagree the operator gets refused for a scope they never typed.
+    """
+
+    def test_a_url_grants_its_exact_host_and_nothing_wider(self) -> None:
+        for target, grant in (
+            ("https://acme.example", "acme.example"),
+            ("https://acme.example/a/b?c=1#d", "acme.example"),
+            ("acme.example", "acme.example"),
+            ("http://sub.acme.example:8443/x", "sub.acme.example"),
+            ("https://192.0.2.5/admin", "192.0.2.5"),
+            ("https://localhost:8080/", "localhost"),
+            ("https://ACME.Example/", "acme.example"),
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(bounty.self_scope_grant(target), grant)
+                self.assertNotIn("*", bounty.self_scope_grant(target),
+                                 "-y attests to a host, never to its subdomains")
+
+    def test_a_repository_grants_its_own_root(self) -> None:
+        self.assertEqual(bounty.self_scope_grant("https://github.com/org/repo"),
+                         "https://github.com/org/repo")
+
+    def test_what_grants_nothing_rather_than_guessing(self) -> None:
+        for target in (
+            "",
+            "   ",
+            "not a url",
+            "./repo",                      # a local path needs no scope
+            "C:/code/project",
+            "https://herokuapp.com",       # a bare public suffix: every tenant on the platform
+            "http://intranet/",            # single label: ambiguous, and the preflight says so
+            "https://user:pw@acme.example/",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(bounty.self_scope_grant(target), "")
+
+    def test_every_grant_it_produces_satisfies_the_preflight(self) -> None:
+        # Two readings of the same question. A grant this derives must be one the gate accepts for
+        # that same target, or -y would hand the operator a complaint about their own scope.
+        urls = ("https://acme.example", "https://acme.example/x", "acme.example",
+                "http://sub.acme.example:8443/x", "https://192.0.2.5/admin",
+                "https://localhost:8080/", "https://a.b.c.acme.example/")
+        for target in urls:
+            with self.subTest(target=target):
+                grant = bounty.self_scope_grant(target)
+                self.assertTrue(grant)
+                host, error = bounty._url_scope_preflight(target, grant)
+                self.assertEqual(error, "")
+                self.assertEqual(host, grant)
+        repo = "https://github.com/org/repo"
+        self.assertEqual(bounty._repository_scope_preflight(repo, bounty.self_scope_grant(repo)), "")
+
+    def test_a_grant_does_not_reach_a_neighbouring_host(self) -> None:
+        grant = bounty.self_scope_grant("https://acme.example")
+        for other in ("https://notacme.example", "https://acme.example.evil.test",
+                      "https://sub.acme.example"):
+            with self.subTest(other=other):
+                _host, error = bounty._url_scope_preflight(other, grant)
+                self.assertTrue(error, f"{grant} must not authorize {other}")
+
+    def test_a_program_exclusion_still_wins_over_the_self_grant(self) -> None:
+        settings = SimpleNamespace(excluded_hosts=("acme.example",))
+        _host, error = bounty._url_scope_preflight(
+            "https://acme.example", bounty.self_scope_grant("https://acme.example"), settings)
+        self.assertIn("excluded", error)
+
+
 if __name__ == "__main__":
     unittest.main()

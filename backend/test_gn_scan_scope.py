@@ -28,17 +28,21 @@ def _run(argv: list[str]) -> tuple[int, str, str]:
 class ScanScopeCliTests(unittest.TestCase):
     def test_web_and_repo_denials_do_not_call_either_scanner(self) -> None:
         cases = (
+            # No -y: the flag is the authorization assertion, and nothing stands in for it.
             ["scan", "https://app.example.com/"],
-            ["scan", "https://app.example.com/", "-y"],
+            ["scan", "https://github.com/acme/widget"],
+            # A scope the operator DID give is theirs: it is matched exactly, never widened to
+            # cover the target, and -y does not rescue a mismatch they typed.
             ["scan", "https://app.example.com/", "-y", "--scope", "example.com"],
             ["scan", "https://app.example.com/", "-y", "--scope", "*.example.com"],
             ["scan", "https://app.example.com/", "-y", "--scope", "app.example.com.evil"],
-            ["scan", "https://github.com/acme/widget"],
-            ["scan", "https://github.com/acme/widget", "-y"],
             ["scan", "https://github.com/acme/widget", "-y", "--scope", "acme.github.com"],
             ["scan", "https://github.com/acme/widget", "-y", "--scope", "github.com"],
             ["scan", "https://github.com/acme/widget", "-y", "--scope", "https://github.com/acme/other"],
+            # An unsupported transport has no repository root to grant, with or without a scope.
             ["scan", "git@github.com:acme/widget.git", "-y", "--scope", "github.com"],
+            ["scan", "git@github.com:acme/widget.git", "-y"],
+            ["scan", "ssh://git@github.com/acme/widget.git", "-y"],
         )
         with patch("bughunter.web_scan_service.run_web_scan") as web:
             with patch("bughunter.scan_service.run_code_scan") as code:
@@ -49,6 +53,25 @@ class ScanScopeCliTests(unittest.TestCase):
                         self.assertIn("gn:", error)
                 web.assert_not_called()
                 code.assert_not_called()
+
+    def test_y_alone_scopes_the_target_it_was_typed_about(self) -> None:
+        """``-y`` is the attestation for the target named on the same command line.
+
+        It used to be refused for not also naming that target in ``--scope`` — a fail-closed gate
+        asking a question the operator had already answered. The grant it stands in for is EXACT:
+        the host, or the repository root, and nothing else (the denials above pin the rest).
+        """
+        with patch("bughunter.web_scan_service.run_web_scan",
+                   return_value={"ok": True, "findings": []}) as web:
+            status, _out, error = _run(["scan", "https://app.example.com/", "-y", "--json"])
+        self.assertEqual(status, 0, error)
+        web.assert_called_once_with("https://app.example.com/", scope_host="app.example.com")
+
+        with patch("bughunter.scan_service.run_code_scan",
+                   return_value={"ok": True, "findings": []}) as code:
+            status, _out, error = _run(["scan", "https://github.com/acme/widget", "-y", "--json"])
+        self.assertEqual(status, 0, error)
+        code.assert_called_once_with("https://github.com/acme/widget", "git_remote")
 
     def test_authorized_web_scan_receives_exact_scope_host(self) -> None:
         with patch("bughunter.web_scan_service.run_web_scan", return_value={"ok": True, "findings": []}) as web:
