@@ -2,8 +2,154 @@
 
 Notable changes to GreyIQ.
 
-## Unreleased
+## v4.13.0 - your bots, and the studio that drives them
 
+- **Full control over the bots, and `bot` finally means something.** A bot was a provider name —
+  one of five, in one setting, which the studio displayed and `_load_coder_config` ignored, so the
+  BRAIN panel could say `bot anthropic` while the hunt planner ran on whatever the desktop app had
+  last written into `solin_runtime_config.json`. That is the same shape of defect `learning off`
+  had, one entry below. A bot is now a RECORD in a local store (`runtime/bots.json`, `gn_bots`): a
+  name, a provider, a model, an endpoint, a persona, a style, a temperature and the standing
+  instructions you have taught it. `gn bot ls / show / use / new / set / rm / clone / reset / teach
+  / forget / train / fields / hf` is the whole lifecycle from the shell, and every one of them is a
+  single slash command inside `gn studio` — `/bots`, `/use <bot>`, `/new <bot> [provider] [model]`,
+  `/clone <bot> [as <new>]`, `/model`, `/persona`, `/style`, `/teach <lesson>`, `/train`,
+  `/hf <ref>`, plus `/bot <verb>` for the rest. A name can be a prefix (`/use cl`), `<field>
+  <value>` with no name means the live bot, and Tab completes the command, the verb and the bot
+  name (advancing to the common prefix when several match, the way a shell does), because an
+  operator who has to remember a flag keeps using whichever bot they set up first.
+  **Picking a bot now changes the hunt**: `_load_coder_config` resolves the live bot over the app's
+  runtime config, so `gn bot use anthropic` decides which brain `hunt_brain` plans with, with the
+  key still coming from the perms-restricted secrets store. A bot that stays on this machine
+  (`tinygpt`) or is `off` means the bounded offline planner — a real posture, which `gn bot show`
+  says in those words — and without `--brain` nothing is loaded at all. A `bots.json` that will not
+  parse costs the operator their SELECTION, never their hunt: the built-ins still resolve, a custom
+  bot that goes missing falls back to the local default rather than silently becoming whichever
+  provider the config happened to name, and a refused entry is reported instead of quietly becoming
+  a default. Six bots ship and are synthesized rather than written at first run (so a default that
+  improves later reaches an existing install); they can be edited and reset but not deleted,
+  because the fallback has to exist. The store cannot hold a key (`gn bot show` says *configured*
+  or *none*), cannot hold authorization, and does not carry a persona into the hunt planner — a
+  chat voice steering an engagement's probe budget is nobody's feature. `gn bot use` is the ONE
+  writer of the `bot` setting: `gn settings set bot`, the studio's `/set bot` and `gn setup` all
+  route through it, so a bot that does not exist is refused at every door instead of being parked
+  in a profile where nothing will honour it, and `gn_profile` keeps validating the shape so an
+  operator's own slug survives a round trip.
+- **`gn bot train` trains what a bot actually has, and claims nothing else.** There are two real
+  local trainers and neither trains a hosted model's weights: the offline hunt ranker (`hunt_train`,
+  from the trace corpus) and the bundled TinyGPT's checkpoint (`gn train-coder`, which needs torch
+  and so stays its own verb rather than something a dashboard starts). A hosted bot therefore trains
+  its RANKER and the verb says so; `mark_trained` is the only writer of a trained stamp and is
+  called with the trainer's own result, so a refused gate (too few rows, no improvement over the
+  incumbent) is reported as the gate's reason and leaves no stamp behind. Saying "trained" about an
+  API model would be exactly the unreproducible number this program's house rule forbids.
+- **Hugging Face bots plug in, and the two kinds are not treated alike.** `gn bot hf <ref>` (or
+  `/hf <ref>`) resolves what the Hub actually serves. A **GGUF model repository** is imported into
+  the local Ollama — its own `hf.co/` registry pull first, falling back to the verified split-GGUF
+  importer when the repository is sharded — then PROBED for chat and tool calls and registered as a
+  runnable `local` bot pinned to the resulting alias; a model that fails the chat probe is recorded
+  and reported as not ready rather than quietly made live, and one that chats but fails the
+  tool-call probe says *chat only*, because the Workbench agent and the hunt planner both need tool
+  calls. An **agent repository** is cloned by `hf_agent_clone` at a pinned, digest-verified commit
+  and registered **inert**: `coder_overlay` builds no config for it, its provider field refuses to
+  change, and nothing cloned is ever imported or executed. A `spaces/` reference is an agent,
+  `--agent`/`--model` are explicit, and a models repo with no GGUF falls through to the clone path
+  with that said out loud — the normal shape of a smolagents repo. The long download runs in the
+  studio's worker with its progress on the footer, because a studio frozen mid-fetch looks broken.
+- **The studio's chat asks the bot you picked.** `tinygpt`, `offline` and cloned agents still answer
+  from `solin_domain` — verbatim excerpts with a source path, nothing generated — while a
+  `local`/`anthropic`/`openai` bot is CALLED through `coder.generate` with its persona, style and
+  lessons as the system prompt, under a short standing instruction about evidence, and its answer is
+  labelled as a model's: the difference between a quoted card and a generated sentence is the
+  difference this program's house rule turns on. A failed call says why and falls back to the pack,
+  labelled as both. The rule that opening a dashboard must not spend an API budget or stall a frame
+  is UNCHANGED and now tested directly: nothing on the collect/render path calls a model, every
+  answer runs in the worker, and a prompt leaves only because the operator typed a question — the
+  same way `gn learn` is an instruction and the auto-trainer is not. The header names the live bot
+  and marks it `->net` when asking it sends off this machine, the first such question says so in the
+  transcript, and `/pack <q>` asks the offline pack whichever bot is live.
+- **Sixteen defects from an adversarial review of the above, every one reproduced before it was
+  fixed.** Two reviewers were pointed at the diff and told to refute it, one at the store and one at
+  the studio's invariants. The pattern in nearly all of them is the same, and it is the one this
+  program cares most about: a surface telling the operator something that was not true.
+  - *The store could destroy every bot in it.* Reading is lossy by design and every mutator
+    rewrites the whole file, so one hand-edited `"provider": "ollama"` plus any ordinary
+    `gn bot new` deleted that bot, its persona and its lessons and reported success; one trailing
+    comma deleted all of them. Refused entries are now written back verbatim, an unparseable store
+    is never replaced, and `create` refuses an id a refused entry holds.
+  - *Id numbering collapsed on a long name.* `bot_id` truncates at 32 characters, so for a
+    31-character base — which `gn bot hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` derives — every
+    numbered candidate came back as the base. `clone` refused with a false sentence and `register`
+    fell out of its loop and REPLACED the operator's bot with an inert clone, printing "plugged in".
+  - *An endpoint could carry a credential.* `base_url` accepted a query string and userinfo, so
+    `?api_key=sk-live-...` was stored and printed verbatim by `gn bot show` — from the one module
+    that promises it cannot hold a key. `user:pass@host` was also classed as on-machine, because
+    `_is_loopback` strips userinfo. Refused now on `set` and on load, and the refusal does not quote
+    what it rejected (that error reaches a footer too).
+  - *A prompt could leave the machine with nothing marked.* `Bot.off_machine` read the bot's own
+    `base_url`, but a `local` bot with none inherits the app's — so with Ollama on another host the
+    question left while the header, the BRAIN panel and the transcript said it had not.
+    `sends_off_machine` resolves the endpoint the request will use, every surface reads it, and the
+    `->net` marker survives the narrow header variants instead of vanishing below 80 columns.
+  - *Three sentences claimed things that were false.* `gn setup` stored the PREFIX typed
+    (`bot: anth`), bypassing the single writer and leaving a selection nothing honours. `/use` and
+    `gn bot use` told the operator that `off`, `offline` and an inert clone "answer chat and plan
+    the hunt", when none of the three does either. BRAIN's key row read `api_key` from the runtime
+    config — never where a key lives — so it said `none` on a working hosted brain.
+  - *And the rest.* `/teach local file reads are out of scope` taught the bot called `local` a
+    lesson with its first word eaten, because a top-level alias prefix-resolved its first argument.
+    C1 control characters (U+0080–U+009F) were missing from `_plain`'s table, so a model's answer
+    carrying ECMA-48's CSI could repaint the terminal — newly reachable because the chat calls a
+    live model. `/hf --agent` raised IndexError out of `submit`. A UTF-16 store or secrets file —
+    what PowerShell's `Out-File` writes here — raised `UnicodeDecodeError` out of every `gn bot`
+    verb with no way back, and deeply nested JSON raised `RecursionError`. Two shells both wrote
+    `bots.json.tmp`, which on Windows is an access-denied rather than a race. An answer over 8000
+    characters was cut mid-word unmarked and fed back to the model as its own turn. A stored
+    `temperature: 9.5` was clamped and `effort: ultra` dropped, where `gn bot set` refuses both.
+
+  Three invariants the reviewers tried and failed to break, each now pinned by a test that drives
+  the real thing: an inert clone cannot become a brain, no renderer can print a key, and nothing on
+  the repaint path calls a model or touches the network.
+- **A security review of the same branch found one more, and it was the same class.** Whether a
+  prompt leaves the machine was decided by a STRING test: `_is_loopback` ended in
+  `host.startswith("127.")`, applied to a value that may be a DNS name. `127.0.0.1.evil.com` is a
+  registrable hostname that satisfied it, so a `local` bot pointed there read as on-machine and
+  every warning went quiet — the header's `->net`, the BRAIN `sends` row, the `/use` line, `gn bot
+  show`'s endpoint note, the once-per-session transcript notice — while `coder.generate` posted the
+  system prompt, the persona, the lessons and the whole conversation to that host with the local
+  provider's key as a bearer token. The host is now parsed and the address object asked, the way
+  `coder.ollama_host_is_loopback`, `coder.unattended_config` and `coder._ollama_open` all already
+  do; a name that is not an IP literal fails CLOSED, because the job of the check is to decide
+  whether to warn. A test pins it against `coder`'s own helper across eight URLs, since a fourth
+  answer to a question this codebase already answers three times is a bug waiting to happen.
+  Two defence-in-depth gaps closed with it: `register` now round-trips a Bot through the READ path,
+  so one built from Hugging Face metadata is held to exactly the rules a stored one is (a hostile
+  `agent.json` name survives `hf_agent_clone._one_line`, which collapses whitespace, and ESC is not
+  whitespace), and `gn_bot_hf.ollama_endpoint` validates the configured endpoint through
+  `coder.ollama_setup_host` rather than taking it on trust from a file.
+
+  The same encoding hole was in `gn_profile.load`, which is read by EVERY verb through
+  `_from_profile` — so a profile saved as UTF-16 did not cost an operator their settings, it stopped
+  the hunt, against a docstring promising that anything unreadable comes back as the defaults.
+  Fixed with the rest, since the file was open.
+- **Bugs this work exposed, each fixed with the test that found it.** A multi-line turn in the
+  studio's transcript was flowed into one paragraph, because `_plain` maps every control character —
+  newline included — to a space, so splitting after cleaning found nothing to split on: the
+  `/help` text and the `/settings` table have been arriving as reflowed prose since they were
+  written, and a bot listing would have too. Lines are split before cleaning now, a folded line
+  hangs under its own indentation, and the `gn >` prefix is written once per TURN rather than once
+  per line (which is what `submit` always claimed). `gn_bots._text` had to drop control characters
+  properly rather than rely on `split()`, which does not treat ESC as whitespace — a stored persona
+  reaches a raw terminal through `gn bot show`. A FIELD SETTER WITH NO VALUE now reads the field
+  instead of writing one: an empty string coerces cleanly for every text field, so a bare `/model`
+  (or `gn bot set scout model`) blanked the setting the operator was reaching for a picker to look
+  at; clearing stays possible and explicit (`""`), which also meant keeping shlex's empty tokens
+  rather than filtering them. Deleting the LIVE bot re-points the profile again — the check asked a
+  resolved bot whether it was live, and `resolve` is total, so by then it had already fallen back
+  and the branch could never fire. `save()` returns its refusal for a path Windows cannot represent
+  at all (`ValueError` from inside pathlib, not `OSError`) instead of raising into a footer. And the
+  agent-clone row is always present, even when the store is empty: a clone made by `gn agent clone`
+  rather than `gn bot hf` is not a registry entry, so a vanishing row made those clones invisible.
 - **An agent studio, in the board's own theme.** `gn studio` (also `/studio` from the threat board,
   and `gn dash --studio`) is the third view of one cockpit: **BRAIN** (which bot answers, the
   provider and model, agent skills and commands, internet — the key row says *configured* or *none*,

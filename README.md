@@ -5,7 +5,9 @@ GreyIQ (GreyNOC-IQ) is a **local-first AI** desktop/web app. It's a GreyNOC prod
 It includes:
 
 - **DevOps/server setup playbooks** for PM2 ecosystem files, Ubuntu VPS setup, Nginx reverse proxies, environment variables/secrets, and `DEPLOY.md` runbooks.
-- **Editable bots** with name, color, persona, style, and response variation.
+- **Editable bots** with name, color, persona, style, and response variation — plus a **bot store**
+  the CLI and the agent studio drive: make, edit, clone, teach, train and delete bots, pick which
+  one is live (it answers you *and* plans your hunts), and plug in a Hugging Face bot.
 - A pluggable **coding brain** — answer with a local model (Ollama), Claude, or any OpenAI-compatible endpoint; falls back to the bundled local engine.
 - **Agent mode + the Workbench IDE** — let the brain read, edit, and (optionally) run things in a workspace folder, with a file explorer, code preview, diffs, agent steps, and verification output.
 - **BugHunter** — a static/passive security scanner, a **bug-bounty hunt** that writes reports with attack plans, and an **agent security red-team** that tests GreyIQ's own agent.
@@ -86,7 +88,7 @@ files in the repository** — download one from
 desktop libraries and `zstd`, which the on-demand Ollama download needs:
 
 ```bash
-sudo apt install ./GreyIQ-4.12.0-amd64.deb
+sudo apt install ./GreyIQ-4.13.0-amd64.deb
 greyiq-cli dashboard
 ```
 
@@ -129,7 +131,7 @@ cat /etc/debian_version     # 12.x derivatives (Parrot 6, Kali) are not the buil
 | Message | Cause | Fix |
 | --- | --- | --- |
 | `Unsupported file … given on commandline` | the filename matched nothing — most often the `GreyIQ-*-amd64.deb` glob pasted inside a fresh clone, where no release asset exists | download the asset from Releases, or use the git-clone CLI install above |
-| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-4.12.0-amd64.deb` |
+| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-4.13.0-amd64.deb` |
 | `package architecture (amd64) does not match system (arm64)` | the release package is amd64 only | use the git-clone CLI install above — it is pure Python and architecture-independent |
 | `Depends: libasound2t64 but it is not installable` | releases up to 4.12.0 require the Debian 13 package name; Debian 12 derivatives call it `libasound2` | use the git-clone CLI install or the AppImage; packages built after 4.12.0 accept either name |
 | `version 'GLIBC_2.xx' not found` from `greyiq-cli` or `greyiq` | the frozen binaries are built on Ubuntu 24.04 and need a newer glibc than Debian 12 derivatives ship | use the git-clone CLI install above, which runs on the distribution's own Python |
@@ -331,6 +333,75 @@ default. The offline coder can also scaffold a bounded authorized HTTP/C2 traffi
 for a local lab; it sends finite attributed requests and treats every response as data, never
 as commands to execute.
 
+## Your bots
+
+A bot is a record in `runtime/bots.json`: a name, a provider, a model, a persona, a style, a
+temperature, and the standing instructions you have taught it. Exactly one is **live** — it answers
+you *and* plans your hunts.
+
+```bash
+gn bot ls                      # every bot, the live one marked *
+gn bot new recon --provider anthropic --model claude-opus-5 --use
+gn bot set recon persona "a terse recon analyst; name the endpoint you probed"
+gn bot teach recon "prefer read-only probes until the scope is confirmed"
+gn bot clone recon --as recon-aggressive
+gn bot use qwen                # switch; a prefix is enough
+gn bot show                    # the live one in full, lessons included
+gn bot train                   # train what that bot actually has
+gn bot rm recon-aggressive -y
+```
+
+Each verb is one slash command inside `gn studio` (`/bots`, `/use`, `/new`, `/clone`, `/teach`,
+`/train`, `/model`, `/persona`, `/hf`), with Tab completion over commands and bot names. One store,
+one set of rules, two doors.
+
+Six bots always exist: **tinygpt** (the bundled local model — no key, nothing leaves the machine,
+and the default), **local** (Ollama or any OpenAI-compatible endpoint), **anthropic**, **openai**,
+**offline** (the deterministic template+AST coder — it edits, it does not chat) and **off**. Edit
+one and the edited copy is stored; `gn bot reset <name>` puts it back. They cannot be deleted,
+because the fallback has to exist.
+
+The store holds no **keys** (they stay in the perms-restricted `runtime/secrets.json`; `gn bot show`
+reports `configured` or `none`) and no **authorization** — a file on disk cannot assert that you are
+authorized, so `-y` stays the only source. A persona reaches **chat** prompts only: the hunt planner
+sets its own.
+
+**Picking a bot changes the hunt.** `gn hunt --brain` (or `hunt.brain on`) resolves the live bot
+over the app's runtime config, so `gn bot use anthropic` decides which brain `hunt_brain` plans
+with. A bot with no model behind it (`tinygpt`, `off`, `offline`, an inert clone) means the bounded
+**offline planner**, and `--brain` says so rather than silently doing nothing. Without `--brain`
+nothing is loaded at all. A `bots.json` that will not parse costs you your *selection*, never your
+hunt — and is never overwritten.
+
+**`gn bot train` runs the trainer that bot actually has.** There are two, and neither trains a
+hosted model's weights: the offline hunt ranker (`hunt_train`, from the trace corpus) and TinyGPT's
+own checkpoint (`gn train-coder`, which needs torch). A hosted bot trains its *ranker* and the verb
+says so — claiming "trained" about an API model would be a number nobody could reproduce. A refused
+gate is reported as the gate's own reason and leaves no trained stamp.
+
+## Plugging in Hugging Face bots
+
+`gn bot hf <ref>` (or `/hf <ref>`) plugs one in. The Hub hosts two different things, and they do not
+get the same treatment:
+
+```bash
+gn bot hf unsloth/Qwen2.5-Coder-7B-Instruct-GGUF --use   # weights -> a runnable local bot
+gn bot hf spaces/agents-course/First_agent_template      # an agent -> cloned, inert
+```
+
+- **GGUF weights** are imported into your local Ollama (its own `hf.co/` pull first, falling back to
+  the verified split-GGUF importer when the repo is sharded), **probed for chat and tool calls**,
+  and registered as a runnable `local` bot with the probe's verdict on its row. One that fails the
+  chat probe is reported as not ready rather than quietly made live; one that chats but fails the
+  tool-call probe says *chat only*, because the agent and the hunt planner need tool calls.
+- **An agent repository** is cloned at a pinned, digest-verified commit (the machinery below) and
+  registered **inert**: it can never become a brain, and nothing cloned is imported or executed.
+
+Which kind it is comes from what the Hub serves, not what you typed: `spaces/` is an agent,
+`--agent`/`--model` are explicit, and anything else is probed for GGUF weights — a models repo with
+no GGUF falls through to the clone path and says so. `--as` names it, `--use` makes it live, `--json`
+prints the result.
+
 ## Cloning Hugging Face agents
 
 The Hub hosts agents as ordinary repositories: `smolagents` writes an
@@ -505,8 +576,9 @@ after saving.
   programs that have actually paid first** instead of alphabetically, and **retrains the offline
   ranker** from the corpus it is growing (the trainer's own gate refuses a corpus too small or a
   model that doesn't beat the rules). `gn sync` does the same pass by hand.
-- **Set it up once** — `gn setup` writes the operator profile: the bot (`tinygpt`, GreyIQ's own
-  local model, by default — no key, nothing leaves the machine), learning on, the default hunt
+- **Set it up once** — `gn setup` writes the operator profile: the live bot (`tinygpt`, GreyIQ's own
+  local model, by default — no key, nothing leaves the machine; the wizard offers whatever is in
+  your bot store), learning on, the default hunt
   profile, whether active verification is armed by default, and where reports go. ENTER through
   every question is a valid way to answer it, and `gn setup --defaults` writes exactly that without
   asking (for scripts, CI and containers). `gn settings` lists every setting with its value, where
@@ -516,7 +588,9 @@ after saving.
   off. `learning off` genuinely stops the automatic writing: no hunt trace, no surface baseline, no
   negative knowledge, no auto-retrain (an explicit `gn learn` or `gn train-brain` is still yours to
   run). A stored value that cannot be honoured is named rather than silently replaced by its
-  default. **The profile cannot authorize
+  default. `bot` has one writer (`gn bot use`, which `gn settings set bot`, `gn setup` and the
+  studio's `/set bot` all route through), so a bot that does not exist is refused at every door
+  instead of being parked in the profile. **The profile cannot authorize
   anything** — there is no such setting, unknown keys are refused, and a hand-edited
   `"authorize": true` does nothing: a file on disk may not assert that a human is authorized.
   Secrets stay in the perms-restricted store, never in the profile.
@@ -545,22 +619,23 @@ after saving.
   stderr; anything narrower says so and names `--panels`. `gn fx wopr` replays the board's demo if
   you just want to check a terminal.
 - **The agent studio** — `gn studio` (also `/studio` from the board, or `gn dash --studio`) is the
-  third view of the same cockpit, in the same amber: **what your bot is set up as, what it has
-  learned, and a chat to ask it things.** BRAIN reads the profile and the app's runtime config (bot,
-  provider, model, agent skills/commands, internet; the key row says *configured* or *none*, never
-  the key). LEARNING reads the hunt-trace corpus, bounty outcomes, cooled endpoint/class pairs, the
-  offline ranker and the tiny model's corpus. AGENTS lists the local Hugging Face clones and says
-  *inert*, because they are never executed. A store that will not answer renders `--` with the
-  reason — never a zero, which would be indistinguishable from "nothing has happened yet". Type a
-  question and it answers from the **bundled playbook pack**, quoted verbatim with its source path
-  (`solin_domain`, the torch-free path the shipped app uses — nothing on it generates text, so a
-  chat window on a security tool cannot invent a security claim); when nothing matches it says so.
-  A configured external brain is shown but **never called**: opening a dashboard must not send a
-  prompt off the machine or spend an API budget. It is also where you *change* the setup —
-  `/settings` lists everything, `/set bot local` and `/unset <key>` write through the same profile
-  `gn settings set` writes (same whitelist, same refusals, no second door), and the panel updates
-  as soon as it saves. `/board`, `/panels` and `/studio` move between the three views; `/refresh`
-  re-reads every store.
+  third view of the same cockpit, in the same amber: **your bots — make them, teach them, train
+  them, pick one, talk to it.** BOTS lists every bot, the live one marked `*`, with what each could
+  do right now (`ready`, `needs a key`, `needs a model`, `inert`). BRAIN resolves that bot against
+  the app's runtime config, so the provider and model shown are the ones the **hunt** will use (the
+  key row says *configured* or *none*, never the key). LEARNING reads the hunt-trace corpus, bounty
+  outcomes, cooled endpoint/class pairs, the offline ranker and the tiny model's corpus. A store
+  that will not answer renders `--` with the reason, never a zero. Every bot verb is one slash
+  command (see [Your bots](#your-bots)); `/settings`, `/set` and `/unset` write through the same
+  profile `gn settings set` does; `/board`, `/panels` and `/studio` switch views and `/refresh`
+  re-reads every store. **Who answers a typed question is whichever bot is live**, and the line
+  under every answer says which: `tinygpt`, `offline` and cloned agents quote the bundled playbook
+  pack verbatim with its source path (`solin_domain` generates nothing, so a chat window on a
+  security tool cannot invent a security claim), while a `local`/`anthropic`/`openai` bot is
+  **called** with its persona and lessons as the system prompt and its answer is labelled as a
+  model's. Opening the studio still sends nothing — no model call happens on the repaint path, only
+  on a question you typed. A bot that sends off this machine is marked `->net` in the header, and
+  `/pack <q>` asks the offline pack regardless.
 - **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
   so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
   you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository

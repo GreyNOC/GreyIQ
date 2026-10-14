@@ -44,9 +44,14 @@ PROFILE_FILE = "operator_profile.json"
 #: readable rather than discarding settings it does not recognise.
 VERSION = 1
 
-#: The brains ``bot`` can name. ``tinygpt`` is GreyIQ's own small local model (solin_core) and the
-#: default, because it is the only one that is always present, needs no key and sends nothing off
-#: the machine — the same reason every other default here is the local-first one.
+#: The bots that are always there. ``tinygpt`` is GreyIQ's own small local model (solin_core) and
+#: the default, because it is the only one that is always present, needs no key and sends nothing
+#: off the machine — the same reason every other default here is the local-first one.
+#:
+#: ``bot`` is no longer a CHOICE between these five, because a bot is no longer a provider: it is a
+#: record in ``gn_bots``' store (a name, a provider, a model, a persona, what it was taught), and an
+#: operator may have a dozen. This module therefore validates the SHAPE of a bot name and
+#: ``gn_bots.set_active`` — the only writer — validates that the bot exists. See :data:`_BOT_NAME`.
 BOTS = ("tinygpt", "local", "anthropic", "openai", "off")
 #: Submission shapes ``report_formats.normalize_platform`` accepts.
 PLATFORMS = ("hackerone", "yeswehack", "intigriti", "hackenproof", "manual")
@@ -60,6 +65,10 @@ _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 #: A label for `gn output -s <label>`: a host, a program id, or a campaign name. Deliberately
 #: narrow — it becomes a KEY in a JSON file the operator reads, not a path on disk.
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:*-]{0,126}\Z")
+#: A bot name, identical to ``gn_bots._ID`` (repeated, not imported, so this module stays the
+#: stdlib-only table it is). Shape only: whether the bot EXISTS is ``gn_bots``' question, and the
+#: one path that can answer it — ``gn_bots.set_active`` — is the only writer of this setting.
+_BOT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}\Z")
 
 
 @dataclass(frozen=True)
@@ -72,7 +81,7 @@ class Setting:
 
     key: str
     default: Any
-    kind: str                       # "bool" | "str" | "path" | "choice"
+    kind: str                       # "bool" | "str" | "path" | "choice" | "bot"
     help: str
     choices: tuple[str, ...] = ()
     ask: str = ""
@@ -82,9 +91,9 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("operator.handle", "", "str",
             "who the reports say ran the hunt (a name, or your platform handle)",
             ask="Operator handle (blank is fine)"),
-    Setting("bot", "tinygpt", "choice",
-            "which brain answers: tinygpt (built in, local, no key), local "
-            "(Ollama/OpenAI-compatible), anthropic, openai, off",
+    Setting("bot", "tinygpt", "bot",
+            "which bot is live — it answers chat and plans the hunt. `gn bot ls` lists them; "
+            "`gn bot use <name>` is how this is set (it checks the bot exists first)",
             choices=BOTS, ask="Bot"),
     Setting("learning", True, "bool",
             "keep learning automatically from every hunt (the trace corpus, negative knowledge, "
@@ -178,11 +187,24 @@ def load(runtime_dir: str | Path) -> Profile:
         raw = path.read_text(encoding="utf-8")
     except OSError:
         return Profile(path=str(path))
+    except (ValueError, RecursionError) as exc:
+        # This function's contract is that ANYTHING unreadable comes back as the defaults, and
+        # ``read_text`` raises UnicodeDecodeError — a ValueError, not an OSError — for a file that
+        # is not UTF-8. On this project's primary platform that is the ordinary result of editing
+        # the profile with PowerShell's `Out-File` or Notepad's "Save as Unicode", both of which
+        # write UTF-16. Every verb loads the profile through ``_from_profile``, so an uncaught one
+        # did not cost the operator their settings — it stopped the hunt.
+        return Profile(path=str(path), exists=True,
+                       error=f"{path.name} is not UTF-8 text ({type(exc).__name__}); "
+                             f"using defaults")
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
         return Profile(path=str(path), exists=True,
                        error=f"{path.name} is not valid JSON ({exc.msg}); using defaults")
+    except RecursionError:
+        return Profile(path=str(path), exists=True,
+                       error=f"{path.name} is nested too deeply to read; using defaults")
     if not isinstance(doc, dict):
         return Profile(path=str(path), exists=True,
                        error=f"{path.name} is not a JSON object; using defaults")
@@ -259,6 +281,18 @@ def coerce(item: Setting, value: Any) -> tuple[Any, str]:
             return (False, "")
         return (None, f"{item.key} is on or off — got {value!r}")
     text = "" if value is None else str(value).strip()
+    if item.kind == "bot":
+        # SHAPE only — see _BOT_NAME. A name that is well-formed but names no bot is kept and
+        # reported by whoever resolves it (``gn_bots.resolve`` returns the default plus a sentence
+        # saying the configured bot is not in the store), because the alternative is a profile that
+        # silently drops the operator's custom bot the first time this file is re-read.
+        low = text.lower()
+        if not low:
+            return (None, f"{item.key} is a bot name — `gn bot ls` lists them")
+        if not _BOT_NAME.fullmatch(low):
+            return (None, f"{item.key} is a bot name: lowercase letters, digits, dot, dash or "
+                          f"underscore, up to 32 characters — got {value!r}")
+        return (low, "")
     if item.kind == "choice":
         low = text.lower()
         if low not in item.choices:

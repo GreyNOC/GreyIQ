@@ -50,7 +50,7 @@ class DefaultsTests(unittest.TestCase):
         for item in gn_profile.SETTINGS:
             with self.subTest(key=item.key):
                 self.assertTrue(item.help.strip())
-                self.assertIn(item.kind, ("bool", "str", "path", "choice"))
+                self.assertIn(item.kind, ("bool", "str", "path", "choice", "bot"))
                 if item.kind == "choice":
                     self.assertIn(item.default, item.choices)
 
@@ -83,7 +83,7 @@ class LoadTests(unittest.TestCase):
         """
         with TemporaryDirectory() as tmp:
             gn_profile.profile_path(tmp).write_text(json.dumps({
-                "settings": {"hunt.active": "maybe", "bot": "skynet", "learning": False},
+                "settings": {"hunt.active": "maybe", "bot": "Sky Net!", "learning": False},
             }), encoding="utf-8")
             profile = gn_profile.load(tmp)
         self.assertTrue(profile.error, "a stored value that could not be honoured must be named")
@@ -93,6 +93,26 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(gn_profile.first_run_hint(profile), profile.error,
                          "and the verbs that print one line print this one")
         self.assertIn(profile.error, "\n".join(gn_profile.settings_lines(profile)))
+
+    def test_a_profile_that_is_not_utf8_is_the_defaults_plus_a_reason(self) -> None:
+        """The contract is that ANYTHING unreadable is the defaults, and this file is read by
+        every verb through ``_from_profile`` - so an uncaught decode error stopped a hunt, not
+        just a settings listing. UTF-16 is what PowerShell's `Out-File` writes on this platform.
+        """
+        with TemporaryDirectory() as tmp:
+            gn_profile.profile_path(tmp).write_bytes(
+                json.dumps({"settings": {"bot": "local"}}).encode("utf-16"))
+            profile = gn_profile.load(tmp)
+        self.assertEqual(profile.get("bot"), "tinygpt")
+        self.assertIn("not UTF-8", profile.error)
+        self.assertEqual(gn_profile.first_run_hint(profile), profile.error)
+
+    def test_a_profile_nested_too_deeply_is_the_defaults_plus_a_reason(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gn_profile.profile_path(tmp).write_text("[" * 60000 + "]" * 60000, encoding="utf-8")
+            profile = gn_profile.load(tmp)
+        self.assertEqual(profile.get("bot"), "tinygpt")
+        self.assertTrue(profile.error)
 
     def test_a_long_list_of_refusals_is_summarised_rather_than_dumped(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -107,12 +127,30 @@ class LoadTests(unittest.TestCase):
     def test_a_value_of_the_wrong_type_is_dropped_not_honoured(self) -> None:
         with TemporaryDirectory() as tmp:
             gn_profile.profile_path(tmp).write_text(json.dumps({
-                "settings": {"learning": "banana", "bot": "skynet", "hunt.active": True},
+                "settings": {"learning": "banana", "bot": "Sky Net!", "hunt.active": True},
             }), encoding="utf-8")
             profile = gn_profile.load(tmp)
         self.assertIs(profile.get("learning"), True, "back to the default, not 'banana'")
         self.assertEqual(profile.get("bot"), "tinygpt")
         self.assertIs(profile.get("hunt.active"), True, "the valid one still applies")
+
+    def test_a_well_formed_bot_name_survives_even_though_this_file_cannot_check_it(self) -> None:
+        """`bot` is a NAME in the bot registry now, not a choice between five providers.
+
+        So this module validates the shape and keeps the value: an operator's own bot is a slug
+        this file has never heard of, and dropping it would lose their selection on every read.
+        Whether a name resolves is ``gn_bots``' question — ``gn_bots.resolve`` answers it with the
+        default bot plus a sentence saying the configured one is not in the store, and
+        ``gn_bots.set_active`` (the only writer) refuses an unknown name up front. Both are pinned
+        in test_gn_bots.
+        """
+        with TemporaryDirectory() as tmp:
+            gn_profile.profile_path(tmp).write_text(json.dumps({
+                "settings": {"bot": "red-team-claude"},
+            }), encoding="utf-8")
+            profile = gn_profile.load(tmp)
+        self.assertEqual(profile.get("bot"), "red-team-claude")
+        self.assertEqual(profile.error, "", "a well-formed name is not a refusal")
 
     def test_a_key_this_build_does_not_know_is_ignored_entirely(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -167,8 +205,10 @@ class SetAndSaveTests(unittest.TestCase):
 
     def test_a_bad_value_is_refused_with_the_choices_named(self) -> None:
         profile = gn_profile.Profile()
-        _p, error = gn_profile.set_value(profile, "bot", "gpt5")
-        self.assertIn("tinygpt", error)
+        _p, error = gn_profile.set_value(profile, "bot", "Sky Net!")
+        self.assertIn("bot is a bot name", error)
+        _p, error = gn_profile.set_value(profile, "bot", "x" * 40)
+        self.assertIn("32 characters", error)
         _p, error = gn_profile.set_value(profile, "hunt.profile", "everything")
         self.assertIn("full-sweep", error)
         _p, error = gn_profile.set_value(profile, "nope", "x")

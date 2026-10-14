@@ -742,7 +742,7 @@ class SettingsVerbTests(_ProfileCase):
     def test_an_unknown_key_or_value_is_refused_and_nothing_is_written(self) -> None:
         for argv, expected in ((["settings", "set", "authorize", "true"], "no setting called"),
                                (["settings", "set", "always_authorize", "1"], "no setting called"),
-                               (["settings", "set", "bot", "gpt5"], "tinygpt"),
+                               (["settings", "set", "bot", "gpt5"], "no bot called"),
                                (["settings", "set", "learning", "sometimes"], "on or off"),
                                (["settings", "get", "authorize"], "no setting called"),
                                (["settings", "unset", "authorize"], "no setting called")):
