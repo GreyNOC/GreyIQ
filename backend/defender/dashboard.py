@@ -39,6 +39,10 @@ def _count(value: Any) -> str:
     return str(value) if type(value) is int and value >= 0 else "-"
 
 
+def _flag(value: Any) -> str:
+    return "1" if value is True else "0" if value is False else "-"
+
+
 def _packet_text(packet: dict[str, Any]) -> str:
     source = f"{_safe(packet.get('source'), 48)}:{_port(packet.get('source_port'))}"
     destination = f"{_safe(packet.get('destination'), 48)}:{_port(packet.get('destination_port'))}"
@@ -105,11 +109,14 @@ class BoardState:
                           "severity": _safe(finding.get("severity") or "review", 16).lower(),
                           "cycle": self.cycle + 1, "artifact": self.artifact})
         if fresh:
+            selected_key = (self.alert_history[self.selected_alert]["key"]
+                            if self.alert_history and self.selected_alert < len(self.alert_history) else None)
             self.alert_history = deque(sorted(
                 [*self.alert_history, *fresh],
                 key=lambda row: (_SEVERITY_ORDER.get(str(row["severity"]), 5), -int(row["cycle"])),
             )[:_ALERT_HISTORY], maxlen=_ALERT_HISTORY)
-            self.selected_alert = 0
+            self.selected_alert = next(
+                (index for index, row in enumerate(self.alert_history) if row["key"] == selected_key), 0)
         self.alert_latched = bool(self.alert_history)
         self.baseline = bool(result.get("baseline_sha256"))
         self.coverage_error = bool((result.get("inventory") or {}).get("errors"))
@@ -148,10 +155,11 @@ class BoardState:
         matches = self.matching_packets()
         if matches:
             row = matches[min(self.selected_packet, len(matches) - 1)]
-            return (f"PACKET {_safe(row.get('timestamp'))} | {_safe(row.get('protocol')).upper()} "
-                    f"{_safe(row.get('source'))}:{_port(row.get('source_port'))} > "
-                    f"{_safe(row.get('destination'))}:{_port(row.get('destination_port'))} | "
-                    f"{_count(row.get('length'))} bytes | SYN {row.get('tcp_syn')} ACK {row.get('tcp_ack')}")
+            stamp = _safe(row.get("timestamp"), 25)[11:23]
+            return (f"PKT {stamp} {_safe(row.get('protocol'), 8).upper()} {_count(row.get('length'))}B "
+                    f"SYN:{_flag(row.get('tcp_syn'))} ACK:{_flag(row.get('tcp_ack'))} "
+                    f"{_safe(row.get('source'), 48)}:{_port(row.get('source_port'))} > "
+                    f"{_safe(row.get('destination'), 48)}:{_port(row.get('destination_port'))}")
         return "No packet selected. Capture metadata with --capture-interface IFACE -y."
 
 
@@ -197,8 +205,9 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     if state.coverage_error:
         coverage += " / PARTIAL COVERAGE"
     capture = "CAPTURE ON" if state.capture_enabled else "CAPTURE OFF"
-    add(f"{_safe(state.message, 55)}  |  {coverage}  |  {capture}  |  "
-        f"{state.collected_at or 'NO SNAPSHOT YET'}", "bright" if state.stopped else "mid")
+    stamp = state.collected_at[11:19] + "Z" if len(state.collected_at) >= 19 else state.collected_at or "PENDING"
+    status = (_safe(state.message, 55) if state.stopped or state.busy else f"SNAPSHOT {stamp}")
+    add(f"{status}  |  {coverage}  |  {capture}", "bright" if state.stopped else "mid")
     divider(f"PORT MATRIX // {len(state.ports)} OBSERVED")
     add("    PROTO  LOCAL ADDRESS:PORT                 STATE          PID   REMOTE", "dim")
     port_height = min(10, max(4, (height - 13) // 2))

@@ -84,6 +84,9 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertNotIn("\x1b", "\n".join(plain))
         self.assertIn("127.0.0.1 [31mBAD", "\n".join(plain))
         self.assertIn("PROTO  LOCAL ADDRESS", "\n".join(plain))
+        self.assertIn("SNAPSHOT 12:00:00Z", "\n".join(plain))
+        self.assertIn("SYN:1 ACK:0", state.selected_detail())
+        self.assertIn("SYN:1 ACK:0", "\n".join(plain))
 
     def test_retro_signal_and_bounded_alert_queue_keep_strongest_lead_visible(self) -> None:
         state = BoardState(capture_enabled=True, sweep=2)
@@ -125,6 +128,27 @@ class DefenderDashboardTests(unittest.TestCase):
         state.ingest(many)
         self.assertEqual(len(state.alert_history), 64)
         self.assertEqual(state.alert_history[0]["severity"], "critical")
+
+    def test_discarded_weak_alert_does_not_reset_operator_selection(self) -> None:
+        state = BoardState()
+        strong = _result()
+        strong["findings"] = [
+            {"finding_id": f"high-{index}", "severity": "high", "rule_id": "test.strong",
+             "title": f"Strong lead {index}"} for index in range(64)
+        ]
+        state.ingest(strong)
+        state.selected_alert = 25
+        selected_key = state.alert_history[25]["key"]
+        weak = _result()
+        weak["findings"] = [
+            {"finding_id": "weak", "severity": "low", "rule_id": "test.weak",
+             "title": "Weak lead"}
+        ]
+        state.ingest(weak)
+        self.assertEqual(len(state.alert_history), 64)
+        self.assertEqual(state.alert_history[state.selected_alert]["key"], selected_key)
+        state.ingest(weak)
+        self.assertEqual(state.alert_history[state.selected_alert]["key"], selected_key)
 
     def test_search_cancel_restores_filter_and_q_does_not_quit_while_typing(self) -> None:
         state = BoardState(query="tcp")
