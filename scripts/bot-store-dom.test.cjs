@@ -772,6 +772,29 @@ test('a capped handover keeps the unread tail pending and records no marker', as
   assert.ok(context.state.botsMigration, 'recorded once everything has landed');
 });
 
+test('a capped handover that also refused a bot does not throw', async () => {
+  // The refused sentence read state.botsMigration, which is only set when the handover FINISHED.
+  // A capped batch leaves it null, so a cap plus a refusal threw a TypeError -- before saveState(),
+  // so the unread tail never persisted and every reload retried the same first batch forever.
+  const pending = [{ id: 'a' }, { id: 'bad' }, { id: 'c' }];
+  const { api, context } = harness({
+    responses: {
+      '/api/bots/migrate': { bots: [{ id: 'a' }], active_id: 'tinygpt', configured: 'tinygpt',
+        created: 1, read: 2,
+        migrated: [{ from: 'a', id: 'a', status: 'created' },
+          { from: 'bad', id: '', status: 'refused', note: "'bad' cannot be a bot id" },
+          { from: '', id: '', status: 'deferred', note: '1 more bot(s) were not read' }] },
+    },
+  });
+  api.botStore.loaded = true;
+  Object.assign(context.state, { pendingBotMigration: pending, pendingBotSelection: '' });
+  await api.migrateBotsOnce();          // threw here before the fix
+  assert.equal(context.state.pendingBotMigration.map((b) => b.id).join(','), 'c',
+    'the unread tail must survive a refusal in the same batch');
+  assert.equal(context.state.botsMigration, null, 'and the handover is not yet done');
+  assert.match(api.botStore.lastError, /bad: 'bad' cannot be a bot id/);
+});
+
 test('a bot the store refused is named rather than swallowed', async () => {
   const { api, context } = migrationHarness();
   context.apiFetch = async () => ({

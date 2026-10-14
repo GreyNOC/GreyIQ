@@ -1711,9 +1711,13 @@ async function migrateBotsOnce() {
   }
   if (refused.length > 0) {
     // Named rather than swallowed: these bots are still in localStorage and the operator can see
-    // why the store would not take them.
+    // why the store would not take them. Read from the RESPONSE, not from state.botsMigration —
+    // that is only set when the handover finished, so a capped batch that also had a refusal threw
+    // a TypeError here. It threw before saveState(), so the unread tail was never persisted and
+    // every reload retried the same first batch forever, never reaching the deferred bots.
+    const first = refused[0];
     botStore.lastError = `${refused.length} of this browser's bots could not be added to the store `
-      + `(${state.botsMigration.refused[0]}).`;
+      + `(${first.from || "(unnamed)"}: ${first.note || "refused"}).`;
   }
   saveState();
 }

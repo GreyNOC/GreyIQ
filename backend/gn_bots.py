@@ -880,7 +880,12 @@ def coerce(item: Field, value: Any) -> tuple[Any, str]:
         if not 0.0 <= number <= 2.0:
             return (None, f"{item.key} is between 0.0 and 2.0 - got {text!r}")
         return (round(number, 3), "")
-    text = _text(value, 600 if item.kind == "text" else 200)
+    # 600 for every kind, not 200 for the non-text ones: the per-field limit below is what
+    # REFUSES an over-long value, and it can only do that if the value still is one. `notes`
+    # declares 300 — in FIELDS, in the API model and in `gn bot fields` — so a 250-character note
+    # was cut to 200 here and the 300 check could never fire, storing two thirds of what the
+    # operator typed and reporting nothing.
+    text = _text(value, 600)
     if item.kind == "choice":
         low = text.lower()
         if low not in item.choices:
@@ -1273,7 +1278,14 @@ def list_lines(registry: Registry, active_id: str = "",
             lines.append(f" {mark} {identifier.ljust(ids)}  {describe.ljust(what)}"
                          f"{('  ' + ready) if ready else ''}".rstrip())
     lines.append("")
-    note = (" * = live: it answers chat and plans the hunt."
+    # What the LIVE bot does, not what a runnable one would. This said "it answers chat and plans
+    # the hunt" whatever was marked, which is false of `off` (nothing answers), `offline` (it
+    # edits), `tinygpt` (the bundled pack, and the hunt's own offline planner) and an inert clone —
+    # the same sentence :func:`what_it_does` exists to keep honest, printed from the one place that
+    # had not been using it.
+    live = registry.get(active_id) if active_id else None
+    does = what_it_does(live) if live is not None else "it answers chat and plans the hunt"
+    note = (f" * = live: {does}."
             + ("" if compact else " `gn bot use <name>` changes it."))
     lines.append(_clip(note, width) if compact else note)
     if registry.error:
@@ -1293,9 +1305,18 @@ def show_lines(bot: Bot, runtime_dir: str | Path | None = None) -> list[str]:
     # The id, and the display name only when it differs: `gn bot show scout` printed "scout  scout".
     lines = [bot.id if bot.label == bot.id else f"{bot.id}  {bot.label}", ""]
     lines.append(f"  provider     {bot.describe()}")
-    if bot.base_url:
-        lines.append(f"  endpoint     {bot.base_url}"
-                     + ("" if not bot.off_machine else "   (off this machine)"))
+    # RESOLVED, not read off the bot. A `local` bot with no base_url of its own inherits the app's
+    # `coder.local.base_url`, so a bot made with just a provider and a model can be pointed at
+    # another host while its own field says nothing — and this row then omitted both the
+    # destination and the off-machine warning while the prompt went there. The same reason
+    # :func:`sends_off_machine` exists; this was the one surface still asking the bot instead.
+    resolved = endpoint_for(runtime_dir, bot) if runtime_dir is not None else ""
+    off = sends_off_machine(runtime_dir, bot) if runtime_dir is not None else bot.off_machine
+    shown = bot.base_url or resolved
+    if shown:
+        source = "" if bot.base_url else "  (from the app's coder config)"
+        lines.append(f"  endpoint     {shown}{source}"
+                     + ("" if not off else "   (off this machine)"))
     if bot.temperature is not None:
         lines.append(f"  temperature  {bot.temperature:g}")
     if bot.effort:

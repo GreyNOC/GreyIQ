@@ -372,6 +372,66 @@ class InvariantsSurviveThisDoorTests(BotRouteCase):
         self.assertIn("at most 200", caught.exception.detail)
         self.assertEqual(self.row(api.list_bots(), "long")["base_url"], "")
 
+    def test_a_note_within_its_declared_limit_is_stored_whole(self) -> None:
+        """FIELDS, the API model and `gn bot fields` all advertise 300 characters for notes.
+
+        ``coerce`` truncated every non-text field to 200 before the per-field limit was checked, so
+        the 300 check could never fire and a 250-character note was stored as two thirds of itself
+        with nothing said.
+        """
+        note = "n" * 250
+        payload = self.create("Noted", notes=note)
+        self.assertEqual(self.row(payload, "noted")["notes"], note)
+        # And over the real limit is refused rather than quietly cut.
+        with self.assertRaises(api.HTTPError) as caught:
+            api.update_bot(api.BotUpdateRequest(bot="noted", fields={"notes": "x" * 400}))
+        self.assertIn("at most 300", caught.exception.detail)
+
+    def test_show_lines_names_the_endpoint_a_local_bot_will_actually_use(self) -> None:
+        """`gn bot show` asked the bot's own fields, which is the one thing no surface may do.
+
+        A `local` bot with no ``base_url`` inherits the app's, so this row omitted both the
+        destination and the off-machine warning while the prompt went to another host.
+        """
+        (self.runtime / "solin_runtime_config.json").write_text(
+            json.dumps({"coder": {"local": {"base_url": "http://10.0.0.9:11434/v1"}}}),
+            encoding="utf-8")
+        self.create("Remote", provider="local", model="qwen2.5-coder:14b")
+        bot = gn_bots.load(self.runtime).get("remote")
+        self.assertEqual(bot.base_url, "", "the bot itself must carry nothing for this to bite")
+        shown = chr(10).join(gn_bots.show_lines(bot, self.runtime))
+        self.assertIn("http://10.0.0.9:11434/v1", shown)
+        self.assertIn("off this machine", shown)
+        self.assertIn("from the app's coder config", shown)
+        # A loopback inheritance is shown but not warned about.
+        (self.runtime / "solin_runtime_config.json").write_text(
+            json.dumps({"coder": {"local": {"base_url": "http://127.0.0.1:11434/v1"}}}),
+            encoding="utf-8")
+        nearby = chr(10).join(
+            gn_bots.show_lines(gn_bots.load(self.runtime).get("remote"), self.runtime))
+        self.assertIn("http://127.0.0.1:11434/v1", nearby)
+        self.assertNotIn("off this machine", nearby)
+
+    def test_the_listing_footer_describes_the_bot_that_is_actually_live(self) -> None:
+        """It said "it answers chat and plans the hunt" whatever was marked `*`.
+
+        False of `off`, `offline`, `tinygpt` and an inert clone — the sentence ``what_it_does``
+        exists to keep honest, printed from the one place that had not been using it.
+        """
+        self.create("Remote", provider="local", model="qwen2.5-coder:14b")
+        registry = gn_bots.load(self.runtime)
+        for bot_id, expected in (("off", "nothing answers"),
+                                 ("offline", "it does not chat"),
+                                 ("tinygpt", "bundled offline pack"),
+                                 ("remote", "answers chat and plans the hunt")):
+            with self.subTest(live=bot_id):
+                footer = [line for line in gn_bots.list_lines(registry, bot_id, self.runtime)
+                          if line.startswith(" * = live")]
+                self.assertEqual(len(footer), 1)
+                self.assertIn(expected, footer[0])
+                self.assertEqual(footer[0].count("answers chat and plans the hunt"),
+                                 1 if bot_id == "remote" else 0)
+
     def test_a_loopback_bot_is_not_marked(self) -> None:
         (self.runtime / "solin_runtime_config.json").write_text(
             json.dumps({"coder": {"local": {"base_url": "http://127.0.0.1:11434/v1"}}}),

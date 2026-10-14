@@ -152,6 +152,33 @@ Notable changes to GreyIQ.
   row stayed clickable while the editor was frozen, so a click before the store had answered posted
   a pre-registry id it had never heard of and painted a 422 — refused now, in the same sentence the
   frozen controls carry.
+- **Four more from an automated review on the pull request, three of them older than this work.**
+  Two surfaces were still asking a bot about itself rather than asking the store, which is the one
+  habit all of this exists to break.
+
+  *`gn bot show` omitted the endpoint a `local` bot will actually use.* It printed the row only
+  when the bot carried a `base_url` of its own — but a bot made with just a provider and a model
+  inherits the app's `coder.local.base_url`, so with Ollama moved to another host the command
+  showed neither the destination nor the off-machine warning while the prompt went there. It
+  resolves through `endpoint_for` and `sends_off_machine` now, and says when the endpoint came from
+  the app's config rather than from the bot.
+
+  *`gn bot ls`'s footer described a bot that was not live.* "`*` = live: it answers chat and plans
+  the hunt" was printed whatever was marked, which is false of `off` (nothing answers), `offline`
+  (it edits), `tinygpt` (the bundled pack, and the hunt's own offline planner) and an inert clone.
+  It is `what_it_does` of the actual live bot now — the sentence that exists for exactly this, in
+  the last place that had not been using it.
+
+  *A note inside its own declared limit was stored as two thirds of itself.* `coerce` truncated
+  every non-text field to 200 characters before checking the per-field limit, so `notes` — which
+  `FIELDS`, the API model and `gn bot fields` all advertise as 300 — could never reach its own
+  check. A 250-character note is kept whole now and a 400-character one is refused, like every
+  other field.
+
+  *And a capped handover that also refused a bot threw.* The "could not be added" sentence read
+  `state.botsMigration`, which is only set once the handover has finished — so a batch that was
+  both capped and partly refused raised a TypeError *before* `saveState()`, leaving the unread tail
+  unpersisted and every reload retrying the same first batch. It reads the response instead.
 - **Three sentences on that panel were the app's own, and one of them was false.** `gn_bots` owns
   one sentence for "what making this bot live means" (`what_it_does`) precisely because the CLI and
   the studio each had their own and one contradicted itself inside a single line. Clicking a bot in
