@@ -1565,7 +1565,10 @@ class Studio:
                 return
             self.refresh()
             ready = _readiness(self._runtime, bot)
-            extra = "" if ready in ("ready", "") else f" — {ready}"
+            # Only a BLOCKER is appended. "off is live: nothing answers ... - off" repeats itself,
+            # and "- edits only" after a sentence that already says it does not chat reads as a
+            # fault rather than the posture it is.
+            extra = f" — {ready}" if gn_bots.is_blocked(ready) else ""
             sends = (" · asking it sends off this machine"
                      if _off_machine(self._runtime, bot) else "")
             self.say("gn", f"{bot.id} is live: {gn_bots.what_it_does(bot)} "

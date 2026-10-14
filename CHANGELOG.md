@@ -4,6 +4,15 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- **A posture is not a fault.** `gn bot use off` printed "off: `gn bot show off` says what is
+  missing", and `gn bot use offline` said the same about `edits only` — nothing is missing in
+  either case, those are bots working exactly as designed. `readiness` answers are now classified
+  on purpose: `BLOCKED_READINESS` holds the two that mean the operator has to do something
+  (`needs a key`, `needs a model`), `is_blocked` is what every surface asks, and a test enumerates
+  every answer `readiness` can return so a new one has to be classified rather than silently
+  becoming a posture. Found by the work unifying the desktop app's AI Studio with this store: its
+  panel rendered every answer as "Not ready: {x}" and hit the same defect in its own words, which
+  is the second time this shape has turned up on two surfaces at once.
 - **The app's bots and the CLI's bots are one store.** v4.13.0 made a bot a record in
   `runtime/bots.json`, and the desktop/web app went on keeping its own in the browser's
   localStorage: a bot made in the AI Studio was invisible to `gn bot ls`, a bot made with `gn bot

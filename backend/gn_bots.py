@@ -846,8 +846,25 @@ def key_state(runtime_dir: str | Path, bot: Bot) -> str:
     return "configured" if str(doc.get(bot.provider) or "").strip() else "none"
 
 
+#: The :func:`readiness` answers that mean something is MISSING — the operator has to do something
+#: before this bot works. Every other answer is a posture: ``off``, ``edits only`` and ``inert``
+#: are bots working exactly as designed, and a surface that reports those as a problem ("off: `gn
+#: bot show off` says what is missing") claims a defect that does not exist. Named here so each
+#: surface asks the same question; the app's own panel had this wrong in its own words too.
+BLOCKED_READINESS = ("needs a key", "needs a model")
+
+
+def is_blocked(state: str) -> bool:
+    """Whether a :func:`readiness` answer means the operator has to fix something."""
+    return str(state or "").strip() in BLOCKED_READINESS
+
+
 def readiness(runtime_dir: str | Path, bot: Bot) -> str:
-    """One word for "could this bot answer right now", with the reason when it could not."""
+    """One word for "could this bot answer right now", with the reason when it could not.
+
+    A posture is not a fault: see :data:`BLOCKED_READINESS` for which answers mean something is
+    actually missing.
+    """
     if bot.inert:
         return "inert"
     if bot.provider == "off":
@@ -1436,7 +1453,7 @@ def _cmd_bot_use(args: Any) -> int:
     if sends_off_machine(_runtime_dir(), bot):
         print("  asking it sends the prompt off this machine")
     ready = readiness(_runtime_dir(), bot)
-    if ready not in ("ready", "inert"):
+    if is_blocked(ready):
         print(f"  {ready}: `gn bot show {bot.id}` says what is missing")
     return 0
 

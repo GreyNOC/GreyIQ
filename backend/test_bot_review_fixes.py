@@ -650,5 +650,44 @@ class RegisteredBotsGoThroughTheReadPathTests(unittest.TestCase):
         self.assertNotIn("sk-live-1", error)
 
 
+class APostureIsNotAFaultTests(unittest.TestCase):
+    """`off`, `edits only` and `inert` are bots working as designed, not bots that are broken.
+
+    Found by the session unifying the app's AI Studio with this store: its panel rendered every
+    readiness answer as "Not ready: {x}", which turned two designed postures into a claim the bot
+    was broken. The same defect was here — `gn bot use off` printed "off: `gn bot show off` says
+    what is missing", and nothing is missing.
+    """
+
+    def test_only_a_missing_key_or_model_counts_as_blocked(self) -> None:
+        for state in gn_bots.BLOCKED_READINESS:
+            self.assertTrue(gn_bots.is_blocked(state))
+        for state in ("ready", "off", "edits only", "inert", "", "something new"):
+            with self.subTest(state=state):
+                self.assertFalse(gn_bots.is_blocked(state))
+
+    def test_every_readiness_answer_is_classified_on_purpose(self) -> None:
+        """A new readiness answer must be a deliberate choice, not silently a posture."""
+        with TemporaryDirectory() as tmp:
+            registry = gn_bots.load(tmp)
+            seen = {gn_bots.readiness(tmp, bot) for bot in registry.bots}
+            registry, bare, _e = gn_bots.create(registry, "bare", provider="local")
+            seen.add(gn_bots.readiness(tmp, bare))
+            clone = gn_bots.Bot(id="c", provider="off", inert=True, source="clone")
+            seen.add(gn_bots.readiness(tmp, clone))
+        self.assertEqual(seen, {"ready", "off", "edits only", "needs a key", "needs a model",
+                                "inert"},
+                         "a readiness answer this test does not know about needs classifying in "
+                         "BLOCKED_READINESS one way or the other")
+
+    def test_neither_door_reports_a_posture_as_something_missing(self) -> None:
+        source = Path(BACKEND_DIR, "gn_bots.py").read_text(encoding="utf-8")
+        studio = Path(BACKEND_DIR, "gn_studio.py").read_text(encoding="utf-8")
+        self.assertIn("if is_blocked(ready):", source)
+        self.assertIn("is_blocked(ready)", studio)
+        self.assertNotIn('ready not in ("ready", "inert")', source,
+                         "that test treated off and edits only as faults")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
