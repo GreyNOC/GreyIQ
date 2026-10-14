@@ -15,7 +15,7 @@ gn defend inventory --hash-processes
 ```
 
 Inventory is read-only. It reports the host, processes, sockets, interfaces,
-routes, services, startup entries, installed packages, and collection coverage
+routes, proxy endpoints, services, startup entries, installed packages, and collection coverage
 where the operating system permits. An explicit `--path` adds a bounded file
 integrity map of that file or directory. Collection errors are part of the
 result. A missing field or permission-limited probe is not a clean bill of
@@ -203,7 +203,12 @@ tool pauses automatic scans and leaves its error visible. Press `r` to retry.
 
 Press `/` to filter packet metadata by a case-insensitive substring (IP, port,
 protocol, timestamp, length, or TCP flag), `Enter` to apply, and `Esc` to cancel.
-`Tab` switches between ports and packets; arrow keys inspect a row in detail.
+`Tab` or left/right cycles the port, proxy, and packet panes. Up/down selects a
+row, Page Up/Down moves through the visible list, and Home/End jumps to its
+edges. The forensic console shows details for the selected item. The proxy pane
+lists sanitized endpoints from this process's proxy environment and, on Windows,
+the current user's proxy settings; it never records credentials or fetches PAC
+scripts. An empty proxy pane does not prove that no application uses a proxy.
 Press `a` to cycle through retained alert leads, `x` to clear the packet filter,
 `r` to scan again, or `q` to quit. The dashboard
 requires an interactive terminal; use `gn defend watch --json` for a log

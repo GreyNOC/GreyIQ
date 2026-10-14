@@ -440,14 +440,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Append macOS assets to the draft release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: GreyIQ ${{ github.ref_name }}
-          draft: true
-          prerelease: false
-          fail_on_unmatched_files: true
-          files: |
-            release/GreyIQ-*-mac-${{ matrix.arch }}.dmg
-            release/GreyIQ-*-mac-${{ matrix.arch }}.zip
-            release/SHA256SUMS-mac-${{ matrix.arch }}.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          assets=(release/GreyIQ-*-mac-${{ matrix.arch }}.dmg
+                  release/GreyIQ-*-mac-${{ matrix.arch }}.zip
+                  release/SHA256SUMS-mac-${{ matrix.arch }}.txt)
+          if [ "${#assets[@]}" -ne 3 ]; then
+            echo "Expected exactly three macOS release assets, found ${#assets[@]}" >&2
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            for attempt in 1 2 3; do
+              if gh release upload "$GITHUB_REF_NAME" "$asset" --clobber; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "Upload failed after three attempts: $asset" >&2
+                exit 1
+              fi
+              sleep "$((attempt * 5))"
+            done
+          done

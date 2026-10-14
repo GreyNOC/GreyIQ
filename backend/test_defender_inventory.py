@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -18,8 +19,8 @@ if str(BACKEND_DIR) not in sys.path:
 
 from defender.baseline import _listeners, compare_baseline, load_baseline, save_baseline
 from defender.inventory import (
-    _collect_files, _collect_windows, _hash_process_executables, _linux_addr, _linux_services,
-    _linux_startup, _windows_tcp_state,
+    _collect_files, _collect_proxies, _collect_windows, _hash_process_executables, _linux_addr,
+    _linux_services, _linux_startup, _proxy_endpoint, _windows_tcp_state,
 )
 from defender.trace import trace_pid
 
@@ -53,6 +54,66 @@ def _snapshot() -> dict:
 
 
 class DefenderBaselineTests(unittest.TestCase):
+    def test_proxy_inventory_keeps_endpoints_without_credentials_or_paths(self) -> None:
+        row = _proxy_endpoint("https://alice:secret@proxy.example:8443/private?token=topsecret",
+                              kind="https", source="env:HTTPS_PROXY")
+        self.assertEqual(row, {"kind": "https", "host": "proxy.example", "port": 8443,
+                               "source": "env:HTTPS_PROXY", "scheme": "https"})
+        self.assertNotIn("secret", json.dumps(row))
+        self.assertIsNone(_proxy_endpoint("https://[invalid", kind="http", source="test"))
+        self.assertEqual(_proxy_endpoint("proxy.example:8080", kind="user:password", source="test")["kind"],
+                         "system")
+        self.assertEqual(_proxy_endpoint("https://proxy.example", kind="https", source="test")["port"],
+                         443)
+        self.assertEqual(_proxy_endpoint("proxy.example", kind="https", source="test")["port"],
+                         443)
+        self.assertEqual(_proxy_endpoint("socks5://proxy.example", kind="all", source="test")["port"],
+                         1080)
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://user:pass@proxy.example:3128",
+                                          "HTTPS_PROXY": "https://proxy.example:8443",
+                                          "ALL_PROXY": ""}, clear=True), \
+             mock.patch("defender.inventory.os.name", "posix"):
+            rows, error, partial = _collect_proxies()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(error, "")
+        self.assertFalse(partial)
+        self.assertNotIn("pass", json.dumps(rows))
+
+    def test_windows_proxy_inventory_redacts_user_and_pac_secrets(self) -> None:
+        values = {"ProxyEnable": 1,
+                  "ProxyServer": "http=alice:pw@proxy.example:8080;https=secure.example:8443",
+                  "AutoConfigURL": "https://user:secret@pac.example/config.pac?token=secret"}
+
+        class Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        registry = SimpleNamespace(HKEY_CURRENT_USER=object(), OpenKey=lambda *_args: Key(),
+                                   QueryValueEx=lambda _key, name: (values[name], 1))
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("defender.inventory.os.name", "nt"), \
+             mock.patch.dict(sys.modules, {"winreg": registry}):
+            rows, error, partial = _collect_proxies()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(error, "")
+        self.assertFalse(partial)
+        self.assertEqual({row["kind"] for row in rows}, {"http", "https", "pac"})
+        self.assertNotIn("secret", json.dumps(rows))
+        self.assertNotIn("alice", json.dumps(rows))
+        self.assertNotIn("config.pac", json.dumps(rows))
+        values["ProxyServer"] = ";".join(f"http=proxy-{index}.example:8080" for index in range(33))
+        values["AutoConfigURL"] = ""
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("defender.inventory.os.name", "nt"), \
+             mock.patch.dict(sys.modules, {"winreg": registry}):
+            rows, error, partial = _collect_proxies()
+        self.assertEqual(len(rows), 32)
+        self.assertEqual(error, "")
+        self.assertTrue(partial)
+
     def test_replacement_archives_exact_validated_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "baseline.json"

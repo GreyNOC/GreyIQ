@@ -62,6 +62,7 @@ class BoardState:
     message: str = "Waiting for the first local observation"
     collected_at: str = ""
     ports: list[dict[str, Any]] = field(default_factory=list)
+    proxies: list[dict[str, Any]] = field(default_factory=list)
     packets: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=_PACKET_HISTORY))
     findings: list[dict[str, Any]] = field(default_factory=list)
     alert_history: deque[dict[str, str | int]] = field(default_factory=lambda: deque(maxlen=_ALERT_HISTORY))
@@ -72,12 +73,21 @@ class BoardState:
     search_original: str = ""
     search_mode: bool = False
     focus: str = "packets"
+    matrix_view: str = "ports"
     selected_port: int = 0
+    selected_proxy: int = 0
     selected_packet: int = 0
     artifact: str = ""
     coverage_error: bool = False
 
     def ingest(self, result: dict[str, Any]) -> None:
+        selected_port = (self.ports[self.selected_port]
+                         if self.selected_port < len(self.ports) else None)
+        selected_proxy = (self.proxies[self.selected_proxy]
+                          if self.selected_proxy < len(self.proxies) else None)
+        previous_packets = self.matching_packets()
+        selected_packet = (previous_packets[self.selected_packet]
+                           if self.selected_packet < len(previous_packets) else None)
         observation = result.get("observation") or {}
         connections = observation.get("connections") or []
         self.ports = sorted(
@@ -87,6 +97,7 @@ class BoardState:
                              str(row.get("protocol") or ""), int(row["local_port"]),
                              str(row.get("local_address") or "")),
         )
+        self.proxies = [row for row in observation.get("proxies") or [] if isinstance(row, dict)][:32]
         capture = (result.get("tools") or {}).get("tshark") or {}
         for packet in capture.get("packets") or []:
             if isinstance(packet, dict):
@@ -123,8 +134,12 @@ class BoardState:
         self.collected_at = _safe(result.get("at"), 32)
         self.cycle += 1
         self.busy = False
-        self.selected_port = min(self.selected_port, max(0, len(self.ports) - 1))
-        self.selected_packet = 0
+        self.selected_port = (self.ports.index(selected_port) if selected_port in self.ports
+                              else min(self.selected_port, max(0, len(self.ports) - 1)))
+        self.selected_proxy = (self.proxies.index(selected_proxy) if selected_proxy in self.proxies
+                               else min(self.selected_proxy, max(0, len(self.proxies) - 1)))
+        self.selected_packet = next(
+            (index for index, row in enumerate(self.matching_packets()) if row is selected_packet), 0)
         if capture and not capture.get("ok"):
             self.stopped = True
             self.message = f"Capture stopped: {_safe(capture.get('status') or capture.get('error'))}"
@@ -146,12 +161,22 @@ class BoardState:
         ).casefold()]
 
     def selected_detail(self) -> str:
-        if self.focus == "ports" and self.ports:
+        if self.focus == "ports":
+            if not self.ports:
+                return "No local socket selected."
             row = self.ports[min(self.selected_port, len(self.ports) - 1)]
             return (f"SOCKET {_safe(row.get('protocol')).upper()} "
                     f"{_safe(row.get('local_address'))}:{_port(row.get('local_port'))} "
                     f"{_safe(row.get('state'))} PID {_count(row.get('pid'))} "
                     f"REMOTE {_safe(row.get('remote_address'))}:{_port(row.get('remote_port'))}")
+        if self.focus == "proxies":
+            if not self.proxies:
+                return "No proxy endpoint observed in process or current-user settings."
+            row = self.proxies[min(self.selected_proxy, len(self.proxies) - 1)]
+            return (f"PROXY {_safe(row.get('kind'), 16).upper()} "
+                    f"{_safe(row.get('host'), 255)}:{_port(row.get('port'))} "
+                    f"VIA {_safe(row.get('source'), 32)} "
+                    "| endpoint only; no credentials")
         matches = self.matching_packets()
         if matches:
             row = matches[min(self.selected_packet, len(matches) - 1)]
@@ -208,12 +233,23 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     stamp = state.collected_at[11:19] + "Z" if len(state.collected_at) >= 19 else state.collected_at or "PENDING"
     status = (_safe(state.message, 55) if state.stopped or state.busy else f"SNAPSHOT {stamp}")
     add(f"{status}  |  {coverage}  |  {capture}", "bright" if state.stopped else "mid")
-    divider(f"PORT MATRIX // {len(state.ports)} OBSERVED")
-    add("    PROTO  LOCAL ADDRESS:PORT                 STATE          PID   REMOTE", "dim")
+    proxy_view = state.matrix_view == "proxies"
+    divider(f"PROXY MAP // {len(state.proxies)} CONFIGURED" if proxy_view
+            else f"PORT MATRIX // {len(state.ports)} OBSERVED")
+    add("    TYPE      ENDPOINT                                  SOURCE" if proxy_view else
+        "    PROTO  LOCAL ADDRESS:PORT                 STATE          PID   REMOTE", "dim")
     port_height = min(10, max(4, (height - 13) // 2))
-    port_start = max(0, state.selected_port - port_height + 1)
+    selected_matrix = state.selected_proxy if proxy_view else state.selected_port
+    port_start = max(0, selected_matrix - port_height + 1)
     for index in range(port_start, port_start + port_height):
-        if index < len(state.ports):
+        if proxy_view and index < len(state.proxies):
+            row = state.proxies[index]
+            marker = ">" if state.focus == "proxies" and index == state.selected_proxy else " "
+            endpoint = f"{_safe(row.get('host'), 42)}:{_port(row.get('port'))}"
+            add(f"{marker}   {_safe(row.get('kind'), 8).upper():8}  "
+                f"{endpoint:42.42}  {_safe(row.get('source'), 24)}",
+                "bright" if marker == ">" else "mid")
+        elif not proxy_view and index < len(state.ports):
             row = state.ports[index]
             marker = ">" if state.focus == "ports" and index == state.selected_port else " "
             add(f"{marker}   {_safe(row.get('protocol'), 5).upper():5}  "
@@ -222,7 +258,9 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
                 f"{_count(row.get('pid')):>6}  "
                 f"{_safe(row.get('remote_address'), 26)}", "bright" if marker == ">" else "mid")
         else:
-            add("    ... no additional observed sockets ..." if index == 0 else "", "dim")
+            empty = ("    ... no configured proxy endpoint in observed sources ..." if proxy_view else
+                     "    ... no additional observed sockets ...")
+            add(empty if index == 0 else "", "dim")
     divider(f"WIRE TRAFFIC // {len(state.packets)} BUFFERED | {len(state.matching_packets())} MATCHES")
     add("    TIME         PROTO  SOURCE                       DESTINATION                    SIZE", "dim")
     packet_height = max(1, height - 13 - port_height)
@@ -246,7 +284,8 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     if state.search_mode:
         add(f"SEARCH /{_safe(state.query, width - 28)}_    ENTER apply  ESC cancel", "bright")
     else:
-        add("TAB pane  UP/DOWN inspect  / search  a next alert  x clear  r rescan  q quit", "bright")
+        hint = "TAB/L/R pane  UP/DOWN row  PGUP/DN page  HOME/END edge  / find  q quit"
+        add(f"{hint}  a alert  x clear  r scan" if width >= 102 else hint, "bright")
     rows.append((_border(" TRACE // TRIAGE // PRESERVE EVIDENCE ", width, bl, br, h), "bright"))
     palette = {"bright": bright, "mid": mid, "dim": dim}
     if not color:
@@ -254,7 +293,8 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     return [f"\033[48;5;16m\033[38;5;{palette[shade]}m{row}\033[0m" for row, shade in rows]
 
 
-def _handle_key(state: BoardState, key: str | None, editor: gn_tui.CommandLine) -> str:
+def _handle_key(state: BoardState, key: str | None, editor: gn_tui.CommandLine,
+                size: gn_tui.Size | None = None) -> str:
     """Return quit/refresh/none. Search never treats typed q as a quit key."""
     if not key:
         return ""
@@ -280,15 +320,37 @@ def _handle_key(state: BoardState, key: str | None, editor: gn_tui.CommandLine) 
         state.search_mode = True
         state.search_original = state.query
         editor.set(state.query)
-    elif key == "TAB":
-        state.focus = "ports" if state.focus == "packets" else "packets"
-    elif key in ("UP", "DOWN"):
-        direction = -1 if key == "UP" else 1
+    elif key in ("TAB", "LEFT", "RIGHT"):
+        panes = ("ports", "proxies", "packets")
+        direction = -1 if key == "LEFT" else 1
+        state.focus = panes[(panes.index(state.focus) + direction) % len(panes)]
+        if state.focus != "packets":
+            state.matrix_view = state.focus
+    elif key in ("UP", "DOWN", "PGUP", "PGDN", "HOME", "END"):
         if state.focus == "ports":
-            state.selected_port = max(0, min(len(state.ports) - 1, state.selected_port + direction))
+            count, selected = len(state.ports), state.selected_port
+        elif state.focus == "proxies":
+            count, selected = len(state.proxies), state.selected_proxy
         else:
-            state.selected_packet = max(0, min(len(state.matching_packets()) - 1,
-                                                state.selected_packet + direction))
+            count, selected = len(state.matching_packets()), state.selected_packet
+        height = size.rows if size else 25
+        page = (max(1, height - 13 - min(10, max(4, (height - 13) // 2)) - 1)
+                if state.focus == "packets" else
+                max(1, min(10, max(4, (height - 13) // 2)) - 1))
+        if key == "HOME":
+            selected = 0
+        elif key == "END":
+            selected = count - 1
+        else:
+            step = page if key in ("PGUP", "PGDN") else 1
+            selected += -step if key in ("UP", "PGUP") else step
+        selected = max(0, min(count - 1, selected))
+        if state.focus == "ports":
+            state.selected_port = selected
+        elif state.focus == "proxies":
+            state.selected_proxy = selected
+        else:
+            state.selected_packet = selected
     elif key in ("x", "X"):
         state.query = ""
         state.selected_packet = 0
@@ -332,8 +394,9 @@ def run_dashboard(args: Any, *, scan: Callable[[], dict[str, Any]]) -> int:
                         future = pool.submit(scan)
                     state.sweep = int(now * 4) % len(_SWEEP)
                     screen.take_resize()
-                    screen.frame(render(state, screen.size(), gn_tui.tier()))
-                    action = _handle_key(state, keys.read(0.08), editor)
+                    size = screen.size()
+                    screen.frame(render(state, size, gn_tui.tier()))
+                    action = _handle_key(state, keys.read(0.08), editor, size)
                     if action == "quit":
                         break
                     if action == "refresh":

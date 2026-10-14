@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.4
+
+- Add keyboard paging and edge jumps across ports, configured proxy endpoints,
+  and wire traffic in the defender dashboard. Keep row selection stable as new
+  scans arrive. Inventory proxy endpoints from the current process environment
+  and the current Windows user without storing credentials or fetching PAC
+  content. An empty proxy list is a limited observation, not proof of absence.
+- Retry individual macOS asset uploads after a transient network timeout while
+  still failing the release job if an asset cannot be delivered.
+
 ## 5.0.3
 
 - Give the defender dashboard a retro live-circuit signal display while keeping

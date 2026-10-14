@@ -271,7 +271,7 @@ def _inventory(args: argparse.Namespace) -> int:
 
 def _counts(current: dict[str, Any]) -> dict[str, int]:
     return {key: len(current.get(key) or []) for key in
-            ("processes", "connections", "interfaces", "routes", "services", "startup", "packages", "files")}
+            ("processes", "connections", "interfaces", "routes", "proxies", "services", "startup", "packages", "files")}
 
 
 def _inventory_summary(current: dict[str, Any]) -> dict[str, Any]:
