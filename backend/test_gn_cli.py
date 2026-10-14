@@ -1062,6 +1062,32 @@ class LearningOptOutTests(_ProfileCase):
         gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
         self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1")
 
+    def test_an_exported_switch_survives_a_profile_that_also_says_off(self) -> None:
+        """The case the test above missed, and the one that actually bit.
+
+        Claiming ownership on EVERY profile-off pass took a switch the operator had exported
+        themselves; a later flip back on then deleted it, and the writers resumed with nothing on
+        screen to contradict them. Ownership now belongs only to the pass that created it.
+        """
+        os.environ["GREYIQ_NO_LEARNING"] = "1"      # the operator's export, before any pass
+        self.set("learning", "off")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertFalse(gn_cli._LEARNING_OFF_BY_PROFILE, "ownership must not be claimed")
+        self.set("learning", "on")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1", "the export survives")
+
+    def test_a_second_off_pass_does_not_hand_ownership_back(self) -> None:
+        # Otherwise the second pass sees the switch IT set, reads it as the operator's, and the
+        # flip-back-on case stops working.
+        self.set("learning", "off")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertTrue(gn_cli._LEARNING_OFF_BY_PROFILE)
+        self.set("learning", "on")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
     def test_the_two_readings_of_the_switch_cannot_drift(self) -> None:
         # hunt_train stays stdlib-only at import time, so it reads the variable rather than
         # importing the canonical reading of it.

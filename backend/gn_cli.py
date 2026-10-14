@@ -181,7 +181,9 @@ def _fx(args: argparse.Namespace, title: str, *, scope: str | None = None) -> An
         return gn_fx.scanner(title, active=False)
     if scope is None:
         return gn_fx.scanner(title)
-    return gn_fx.surface(title, scope=str(scope or ""))
+    # controls=True: this is a board over a run a human is watching, which is exactly when the
+    # keyboard is worth reading. The Scanner fallback ignores it.
+    return gn_fx.surface(title, scope=str(scope or ""), controls=True)
 
 
 def _profile() -> Any:
@@ -252,8 +254,16 @@ def _apply_learning(profile: Any) -> None:
     global _LEARNING_OFF_BY_PROFILE
 
     if not bool(profile.get("learning")):
+        if not _LEARNING_OFF_BY_PROFILE:
+            # Ownership is claimed ONLY by the call that actually turns it on, and the check has to
+            # happen BEFORE the assignment below or it would always see its own write. Without
+            # this, a profile that says off claimed a switch the operator had exported themselves,
+            # and a later flip back on then deleted it — losing the one signal that outranks a
+            # saved default. Read through the canonical reading so "off" has one definition.
+            from bughunter.negative_knowledge import learning_disabled
+
+            _LEARNING_OFF_BY_PROFILE = not learning_disabled()
         os.environ["GREYIQ_NO_LEARNING"] = "1"
-        _LEARNING_OFF_BY_PROFILE = True
     elif _LEARNING_OFF_BY_PROFILE:
         os.environ.pop("GREYIQ_NO_LEARNING", None)
         _LEARNING_OFF_BY_PROFILE = False
@@ -314,7 +324,10 @@ def _authorized_scope(args: argparse.Namespace, *targets: str) -> str:
         it would be this program asserting an authorization nobody gave.
       * **Additive and exact.** The operator's own ``-s`` text is never rewritten or dropped, and
         the grant added is the target's own host (or repository root) — never a ``*.`` wildcard.
-        ``gn auto`` derives the wider apex; this does not.
+        ``gn auto`` derives the wider apex; this does not. A bare host token is
+        exact-OR-proper-subdomain at the ACTIVE gate, so ``run_bounty_hunt`` and ``campaign`` pin
+        their recon and prover to this exact host unless a ``*.`` token is present; the one verb
+        whose job IS the apex's subdomains (``gn takeover``) announces the reach instead.
       * **Only what the operator NAMED.** A host the engine discovers mid-run is not a target
         anyone attested to, and still has to be in scope on its own.
 
@@ -807,6 +820,12 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
             per_finding=args.per_finding,
             on_progress=_progress(args, fx),
+            # The board reads the keyboard during the run (l/f/r/q — see gn_fx.Board.controls), so
+            # it can both show the traffic it is watching and ask the engine to stop at the next
+            # safe point. getattr: the one-line Scanner fallback has neither, and a redirected
+            # stream has no board at all.
+            on_request=getattr(fx, "request", None),
+            should_stop=getattr(fx, "stop_requested", None),
             settings=depth_settings(args),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
@@ -890,6 +909,14 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             platform=getattr(args, "platform", "hackerone") or "hackerone",
             deep=getattr(args, "deep", False),
             on_progress=_progress(args, fx),
+            # The board over a campaign advertises the same keys as the board over a hunt, so it
+            # has to reach the same hooks: `q` asks the campaign to stop at the next safe point
+            # (between URLs, and within a URL's own fan-out), and the TRAFFIC view is fed from the
+            # layer the requests leave from. A direct campaign has no progress run id, so without
+            # these the board printed STOP REQUESTED over a campaign that kept probing. getattr:
+            # the one-line Scanner fallback has neither.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
         fx.phase("campaign complete")
@@ -979,6 +1006,11 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             max_pages=args.max_pages,
             platform=args.platform,
             on_progress=_progress(args, fx),
+            # `gn osint --hunt` runs on the one-line Scanner (``_fx`` with no scope), which reads no
+            # keys — so these are None today. Wired anyway: the span must honour whatever surface it
+            # is given, rather than depending on the surface happening to offer no controls.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
             on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
         )
         if not hunt_result.get("ok"):
@@ -1249,6 +1281,13 @@ def _operator_campaign_fn(coder_cfg: dict, fx: Any = None, *, on_auth_needed: An
             disclose_automation=bool(saved.get("disclose_automation")),
             on_auth_needed=on_auth_needed,
             on_progress=sink,
+            # The reviewed `gn auto` cycle runs on a board with the same keys as a hunt's, and a
+            # cycle is the longest-running thing the operator watches — so `q` has to reach the
+            # campaign and the TRAFFIC view has to be fed. ``progress_run_id`` above covers the
+            # DASHBOARD's Stop; nothing translates a board key into a run-registry stop, which is
+            # why the board's own predicate goes in beside it.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
         )
         _fx_report(fx, result, default=str(target))
         return result
@@ -1745,7 +1784,14 @@ def _cmd_takeover(args: argparse.Namespace) -> int:
 
     if not args.authorize:
         return _err("subdomain enumeration touches in-scope hosts only — pass -y/--authorize to confirm scope.")
-    res = tk.scan_subdomain_takeover(args.target, scope=_authorized_scope(args, args.target))
+    scope = _authorized_scope(args, args.target)
+    if scope != (args.scope or "").strip():
+        # Said out loud, the way `gn auto` announces a derived scope (hunt_dir._derive_scope):
+        # this verb enumerates the named apex's SUBDOMAINS, which is wider than the one host -y
+        # names, and an operator reading a bare apex in a SCOPE heading would read it as exact.
+        print(_c(f"  scope DERIVED from the target ({scope}) — this verb resolves and fetches its "
+                 f"subdomains; -s narrows it", "33"))
+    res = tk.scan_subdomain_takeover(args.target, scope=scope)
     if not res.get("ok"):
         return _err(res.get("error", "could not run the scan."))
     print(f"{_c('Subdomain scan', '1')} — apex {res.get('apex')}: {len(res.get('resolved') or [])} resolving in-scope host(s)")

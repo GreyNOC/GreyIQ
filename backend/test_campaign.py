@@ -1651,6 +1651,112 @@ class OobCollaboratorThreadingTests(unittest.TestCase):
         self.assertEqual(seen["base"], "https://collab.example")
         self.assertEqual(seen["secret"], "")
 
+class TheCampaignHonoursAStopFromItsCallerTests(unittest.TestCase):
+    """A campaign has two possible sources of Stop, and for a long time only honoured one.
+
+    ``progress_run_id`` is the dashboard's: the web UI registers a run and the engine checks
+    ``progress.is_stopped`` between URLs. A CLI campaign never registers one, so the threat board
+    drawn over it — which advertises ``q`` exactly as a hunt's board does, and prints STOP
+    REQUESTED when pressed — had no way to reach this engine at all, and the campaign went on
+    sending requests at someone else's host after the operator asked it to stop. A control a
+    surface offers and the engine does not honour is the defect, not the missing key.
+    """
+
+    TARGET = "https://app.example.com/"
+    SECOND = "https://app.example.com/orders/1001"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.hunted: list[str] = []
+        self.inner_stops: list = []
+        self.inner_feeds: list = []
+        self._orig = (campaign.recon.discover, campaign.run_bounty_hunt)
+        self.addCleanup(self._restore)
+        self.addCleanup(self._tmp.cleanup)
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [self.TARGET, self.SECOND], "notes": [], "sources": {}, "js_secrets": [],
+            "tech": [], "params": [], "forms": [], "host": "app.example.com", "observations": {},
+        }
+
+        def fake_hunt(url, *a, **k):
+            self.hunted.append(url)
+            self.inner_stops.append(k.get("should_stop"))
+            self.inner_feeds.append(k.get("on_request"))
+            return {"ok": True, "report_path": "", "json_path": "", "scan_errors": [],
+                    "active_authorization": {"in_scope": True, "rate_limited": False,
+                                             "skipped_reason": "", "verified_classes": [],
+                                             "target": url, "checked_classes": []}}
+        campaign.run_bounty_hunt = fake_hunt
+
+    def _restore(self) -> None:
+        (campaign.recon.discover, campaign.run_bounty_hunt) = self._orig
+
+    def _run(self, **kw):
+        # No progress_run_id ON PURPOSE: this is the direct-CLI shape, the one the dashboard's
+        # own stop check cannot see.
+        return campaign.run_campaign(
+            self.TARGET, scope="app.example.com", authorized=True, coder_cfg={},
+            default_reports_dir=self.root / "reports", runtime_dir=self.root / "runtime",
+            version="9.9.9", program="demo", active=True, **kw)
+
+    def test_without_a_stop_every_url_is_hunted(self) -> None:
+        """The control, so the test below is about Stop and not about a broken fixture."""
+        result = self._run(should_stop=lambda: False)
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertEqual(self.hunted, [self.TARGET, self.SECOND])
+
+    def test_a_stop_between_urls_halts_the_campaign_with_what_it_found(self) -> None:
+        asked = {"stop": False}
+
+        def fake_hunt_then_stop(url, *a, **k):
+            self.hunted.append(url)
+            self.inner_stops.append(k.get("should_stop"))
+            asked["stop"] = True   # the operator presses q while the first URL is in flight
+            return {"ok": True, "report_path": "", "json_path": "", "scan_errors": [],
+                    "active_authorization": {"in_scope": True, "rate_limited": False,
+                                             "skipped_reason": "", "verified_classes": [],
+                                             "target": url, "checked_classes": []}}
+        campaign.run_bounty_hunt = fake_hunt_then_stop
+        result = self._run(should_stop=lambda: asked["stop"])
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertEqual(self.hunted, [self.TARGET],
+                         "the campaign kept hunting after the operator asked it to stop")
+
+    def test_the_stop_reaches_inside_a_single_urls_own_fan_out(self) -> None:
+        """Between URLs is not enough: one URL's active fan-out, replan wave and OOB provers can
+        run for minutes, so the per-URL hunt gets the predicate too."""
+        asked = {"stop": False}
+        self._run(should_stop=lambda: asked["stop"])
+        self.assertTrue(self.inner_stops, "no hunt ran")
+        for inner in self.inner_stops:
+            self.assertTrue(callable(inner), "the per-URL hunt was given no stop predicate")
+            self.assertFalse(inner())
+        asked["stop"] = True
+        self.assertTrue(self.inner_stops[0](),
+                        "the predicate the hunt holds does not reflect the operator's key")
+
+    def test_the_request_feed_reaches_the_per_url_hunts(self) -> None:
+        """The board's TRAFFIC view is a view onto live probing, so it has to be fed from the
+        layer the requests leave from — the same journey as the stop predicate."""
+        seen: list = []
+
+        def feed(method: str, url: str, status: object) -> None:
+            seen.append((method, url, status))
+
+        self._run(on_request=feed)
+        self.assertTrue(self.inner_feeds, "no hunt ran")
+        for received in self.inner_feeds:
+            self.assertIs(received, feed, "the per-URL hunt was given no request feed")
+
+    def test_a_raising_stop_predicate_never_aborts_a_legitimate_campaign(self) -> None:
+        """Total, like the hunt's: a broken kill switch must not end a run the operator wants."""
+        def explode() -> bool:
+            raise RuntimeError("watcher exploded")
+        result = self._run(should_stop=explode)
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertEqual(self.hunted, [self.TARGET, self.SECOND])
+
 
 if __name__ == "__main__":
     unittest.main()

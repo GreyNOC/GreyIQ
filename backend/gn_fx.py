@@ -507,6 +507,11 @@ _BOARD_UNI = {
     "blip": "◆",
     "ring": "○",
     "cursor": "█",
+    #: The tracking reticle that closes around the asset being probed, and the request-rate bars
+    #: on the status line. Both are in the glyph table so the ascii board gets a version it can
+    #: encode rather than an empty cell.
+    "bracket": ("[", "]"),
+    "bars": ("▁", "▂", "▃", "▄", "▅", "▆", "▇"),
 }
 _BOARD_ASCII = {
     "edges": ("|", "|"),
@@ -519,6 +524,8 @@ _BOARD_ASCII = {
     "blip": "#",
     "ring": "o",
     "cursor": "_",
+    "bracket": ("[", "]"),
+    "bars": ("_", ".", ":", "|"),
 }
 
 _BOARD_SEV = {
@@ -764,6 +771,84 @@ class _Grid:
         return out
 
 
+#: The map, the sites and the home node are all defined on the 72x17 grid above. A terminal is
+#: usually bigger than that, and a board that sat in a 78x24 box in the corner of a 200x60 window
+#: was the thing an operator noticed first. These scale the three together, so an arc still lands
+#: on the continent its asset was placed on.
+_SCALE_CACHE: dict[tuple[int, int], tuple[tuple[str, ...], tuple[tuple[int, int], ...], tuple[int, int]]] = {}
+#: The aspect ratio the map is DRAWN at (72:17 on a cell grid that is itself about 2:1), so filling
+#: a wide terminal does not stretch the continents into a smear.
+_MAP_ASPECT = _MAP_W / _MAP_H
+
+
+#: How far the map may be stretched from its authored 72:17 before it stops reading as continents.
+#: The board FILLS the terminal between these, because a WOPR screen that leaves a margin is not
+#: taking up the screen; outside them the smaller dimension is centred instead of smeared.
+_ASPECT_MIN, _ASPECT_MAX = 2.4, 7.5
+
+
+def fit_map(cols: int, rows: int, *, reserve_rows: int = 0) -> tuple[int, int]:
+    """The map size that fills this terminal, clamped to an aspect that still looks like a map.
+
+    ``reserve_rows`` is what the caller needs outside the box (an input line). The box costs 2
+    columns and 5 rows of chrome around the map (top edge, status bar, two teletype rows, footer).
+    Never smaller than the authored 72x17: below that the map would have to be clipped, and a world
+    map with Asia cut off is not a threat board — :func:`board_fits` refuses there instead.
+
+    Fills BOTH dimensions where the result is within ``_ASPECT_MIN.._ASPECT_MAX``, which covers
+    every ordinary terminal; a very wide-and-short or tall-and-narrow window would smear the
+    continents, so there the binding dimension fills and the other is centred.
+    """
+    room_w = max(_MAP_W, int(cols) - 2)
+    room_h = max(_MAP_H, int(rows) - 5 - max(0, int(reserve_rows)))
+    aspect = room_w / room_h
+    if aspect > _ASPECT_MAX:            # very wide and short: cap the width
+        return (max(_MAP_W, int(round(room_h * _ASPECT_MAX))), room_h)
+    if aspect < _ASPECT_MIN:            # very tall and narrow: cap the height
+        return (room_w, max(_MAP_H, int(round(room_w / _ASPECT_MIN))))
+    return (room_w, room_h)
+
+
+def scaled_map(map_w: int, map_h: int) -> tuple[tuple[str, ...], tuple[tuple[int, int], ...], tuple[int, int]]:
+    """``(land rows, sites, origin)`` for a map of this size. Cached; pure; never raises.
+
+    Nearest-neighbour on the SPANS rather than on the rendered rows: a span is a pair of numbers, so
+    scaling it keeps a coastline a coastline instead of fraying it into dots. Sites are scaled and
+    de-duplicated — two sites that collapse onto one cell at a small size would otherwise stack
+    assets on top of each other, which is exactly what the curated list exists to prevent.
+    """
+    key = (max(_MAP_W, int(map_w)), max(_MAP_H, int(map_h)))
+    cached = _SCALE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    width, height = key
+    sx, sy = width / _MAP_W, height / _MAP_H
+    rows: list[str] = []
+    for y in range(height):
+        source = min(_MAP_H - 1, int(y / sy))
+        cells = [" "] * width
+        for x0, x1 in _LAND_SPANS.get(source, ()):
+            start = max(0, min(width - 1, int(round(x0 * sx))))
+            end = max(start, min(width - 1, int(round((x1 + 1) * sx)) - 1))
+            for x in range(start, end + 1):
+                cells[x] = "#"
+        rows.append("".join(cells))
+    seen: set[tuple[int, int]] = set()
+    sites: list[tuple[int, int]] = []
+    for x, y in _SITES:
+        spot = (max(0, min(width - 1, int(round(x * sx)))),
+                max(0, min(height - 1, int(round(y * sy)))))
+        if spot not in seen:
+            seen.add(spot)
+            sites.append(spot)
+    origin = (max(0, min(width - 1, int(round(_BOARD_ORIGIN[0] * sx)))),
+              max(0, min(height - 1, int(round(_BOARD_ORIGIN[1] * sy)))))
+    result = (tuple(rows), tuple(sites), origin)
+    if len(_SCALE_CACHE) < 32:          # one entry per terminal size an operator resizes through
+        _SCALE_CACHE[key] = result
+    return result
+
+
 _LAND_ROWS: tuple[str, ...] = tuple(
     "".join(
         "#" if any(x0 <= x <= x1 for x0, x1 in _LAND_SPANS.get(y, ())) else " "
@@ -815,8 +900,28 @@ class Board:
 
     def __init__(self, title: str, *, scope: str = "", stream: TextIO | None = None,
                  active: bool | None = None, footer: str = "", clock_base: float | None = None,
-                 interactive: bool = False) -> None:
+                 interactive: bool = False, controls: bool = False) -> None:
         self._stream = stream if stream is not None else sys.stderr
+        #: Read the keyboard WHILE the run goes on, so the operator can look at the log, the
+        #: findings and the traffic without waiting for the summary — and ask the hunt to stop.
+        #: The run owns the main thread here (gn_fx inverts gn_dash), so the reader is a daemon of
+        #: its own and the Board's lifecycle owns it: `fx.stop()` runs before the engine's auth
+        #: prompt reads stdin, which is what keeps the two off the same tty at once.
+        self._controls = bool(controls)
+        self._view = "board"
+        self._view_scroll = 0
+        self._requests: list[tuple[float, str, str, str]] = []
+        self._stop_asked = threading.Event()
+        #: When DEFCON last got worse, so the label can flash the moment it does. Event-driven:
+        #: nothing on this board animates that the engine did not report.
+        self._defcon = 5
+        self._defcon_at = -99.0
+        #: The host of the newest probe, for the tracking reticle. Set from :meth:`request`, so the
+        #: ring is drawn around the asset actually being hit and not a guess.
+        self._hot_host = ""
+        self._hot_at = -99.0
+        self._keys: Any = None
+        self._key_thread: threading.Thread | None = None
         #: ``gn dash`` drives the board as a RESIDENT surface with an input line under it, which a
         #: hunt's board does not have. The board is output-only by construction — the ticker thread
         #: owns the stream — so the driver cannot write that line itself without two threads racing
@@ -835,11 +940,27 @@ class Board:
         #: machine is not at would be a small lie in the one place this program cannot afford them.
         #: :func:`board_demo` passes the gallery's scripted base instead, so its frames reproduce.
         self._clock_base = clock_base
-        # The grid is as close to _BOARD_COLS as this terminal allows, never narrower than the
-        # box itself: fixed for the life of the board, so the arithmetic below cannot shift
-        # underneath a frame, and measured once rather than per frame for the same reason.
-        self._cols = min(max(_terminal_size(self._stream)[0], _BOARD_MIN_COLS), _BOARD_COLS)
-        self._grid = _Grid(self._cols, _BOARD_ROWS)
+        # The board FILLS the terminal. It used to sit in a fixed 78x24 box, which on a 200x60
+        # window is a small rectangle in the middle of a lot of nothing — the first thing an
+        # operator notices. The map, its sites and the home node are authored on a 72x17 grid and
+        # scaled together (:func:`scaled_map`) so an arc still lands on the continent its asset was
+        # placed on, at the board's own aspect ratio so the continents are not stretched.
+        #
+        # Measured ONCE and fixed for the life of the board, as before: the arithmetic in _draw
+        # must not shift underneath a frame, and a resize mid-hunt would move every arc in flight.
+        cols, rows = _terminal_size(self._stream)
+        # One column short of the terminal: writing the bottom-right cell scrolls conhost by a
+        # line, which would shift every row out from under the frame diff (gn_tui.Screen caps its
+        # last row for the same reason).
+        self._cols = max(_BOARD_MIN_COLS, int(cols) - 1)
+        self._rows = max(_BOARD_ROWS, int(rows))
+        # Measured against the GRID, not the terminal: the grid already holds back a column, and
+        # passing the terminal width made the box one wider than the grid, which `_draw` then
+        # clipped — silently cutting the map's last column.
+        self._map_w, self._map_h = fit_map(self._cols, self._rows,
+                                           reserve_rows=1 if self._interactive else 0)
+        self._land, self._sites, self._origin = scaled_map(self._map_w, self._map_h)
+        self._grid = _Grid(self._cols, self._rows)
         self._assets: list[dict[str, Any]] = []
         self._by_name: dict[str, dict[str, Any]] = {}
         self._taken: set[int] = set()
@@ -870,7 +991,7 @@ class Board:
             return self
         cols, rows = _terminal_size(self._stream)
         self._left = max(0, (cols - self._cols) // 2)
-        self._top = max(0, (rows - _BOARD_ROWS) // 2)
+        self._top = max(0, (rows - self._rows) // 2)
         _enable_vt(self._stream)
         try:
             # _TERM_ENTER hides the cursor, which is right for a board nobody types at. A resident
@@ -883,6 +1004,8 @@ class Board:
             return self
         self._entered = True
         self._started = time.monotonic()
+        if self._controls:
+            self._acquire_keys()
         self._thread = threading.Thread(target=self._run, name="gn-fx-board", daemon=True)
         self._thread.start()
         with _LIVE_LOCK:
@@ -913,14 +1036,15 @@ class Board:
                     self._overflow += 1
                     continue
                 digest = _hash_name(_place_key(name))
-                slot = digest % len(_SITES)
-                for _probe in range(len(_SITES)):
+                sites = self._sites or _SITES
+                slot = digest % len(sites)
+                for _probe in range(len(sites)):
                     if slot not in self._taken:
                         break
-                    slot = (slot + 1) % len(_SITES)
+                    slot = (slot + 1) % len(sites)
                 crowded = slot in self._taken      # more assets than sites: nudge rather than stack
                 self._taken.add(slot)
-                spot = _SITES[slot]
+                spot = sites[slot]
                 severity = str(fields.get("severity") or "").strip().lower() or None
                 label = self._clean(fields.get("label") or "")
                 asset = {
@@ -1005,6 +1129,35 @@ class Board:
         with self._lock:
             self._phase = clean
 
+    def request(self, method: str, url: str, status: Any = "") -> None:
+        """One probe the engine just sent. Shown in the TRAFFIC view; never inferred.
+
+        Pushed from ``active_verify_service._Http.fetch`` — the single chokepoint every active
+        request goes through — so the feed is what actually left the machine, not a guess from a
+        progress line. Bounded: a long hunt sends thousands, and the view shows a tail.
+        """
+        host, path = "", str(url or "")
+        if "://" in path:
+            rest = path.split("://", 1)[1]
+            host, _, tail = rest.partition("/")
+            path = "/" + tail if tail else "/"
+        now = time.monotonic() - self._started
+        row = (now, str(method or "GET").upper()[:7],
+               self._clean(host)[:60], self._clean(path)[:120] + (f"  {status}" if status != "" else ""))
+        with self._lock:
+            self._requests.append(row)
+            del self._requests[: max(0, len(self._requests) - 400)]
+            self._hot_host, self._hot_at = self._clean(host).lower(), now
+
+    def stop_requested(self) -> bool:
+        """Whether the operator pressed ``q``. Pass this as the engine's ``should_stop``.
+
+        A request to stop at the next safe point, NOT a kill: the engine checks it between checks,
+        so a probe in flight finishes and the report is still written. Ctrl-C remains the hard way
+        out, which is why this is a separate signal rather than a re-use of it.
+        """
+        return self._stop_asked.is_set()
+
     def command_line(self, text: str, caret: int) -> None:
         """Put the operator's input line under the board, with their cursor at ``caret``.
 
@@ -1057,6 +1210,9 @@ class Board:
         try:
             self._restore()
         finally:
+            # After the screen, never before: the acquisition order is console, keyboard, screen,
+            # and teardown unwinds it in reverse (the same contract gn_tui documents).
+            self._release_keys()
             if self._active:
                 line = self._clean(summary) or self._digest_line()
                 if line:
@@ -1113,6 +1269,66 @@ class Board:
             if len(on_host) == 1:
                 return on_host[0]
         return None
+
+    def _acquire_keys(self) -> None:
+        """Put stdin in cbreak and read it on a daemon. Total: no reader is a board without keys."""
+        try:
+            import gn_tui
+
+            reader = gn_tui.KeyReader(sys.stdin)
+            if not sys.stdin.isatty():
+                return
+            self._keys = reader.acquire()
+        except Exception:  # noqa: BLE001 - a tty that will not go into cbreak simply has no keys
+            self._keys = None
+            return
+        self._key_thread = threading.Thread(target=self._key_loop, name="gn-fx-keys", daemon=True)
+        self._key_thread.start()
+
+    def _release_keys(self) -> None:
+        """Hand the tty back. Idempotent, never raises — it runs in stop()'s unwind."""
+        reader, self._keys = self._keys, None
+        if reader is not None:
+            try:
+                reader.restore()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _key_loop(self) -> None:
+        while not self._stopped.is_set():
+            reader = self._keys
+            if reader is None:
+                return
+            try:
+                key = reader.read(0.08)
+            except Exception:  # noqa: BLE001 - a key that cannot be read is a key not pressed
+                return
+            if key:
+                self._handle_key(key)
+
+    def _handle_key(self, key: str) -> None:
+        """One key, while the run goes on. Total: an unknown key does nothing."""
+        pressed = str(key or "")
+        lowered = pressed.lower()
+        with self._lock:
+            if lowered in ("l", "f", "r", "t"):
+                wanted = {"l": "log", "f": "findings", "r": "traffic", "t": "traffic"}[lowered]
+                # The same key toggles back, so one finger gets in and out.
+                self._view = "board" if self._view == wanted else wanted
+                self._view_scroll = 0
+            elif lowered in ("b", "m") or pressed in ("ESC", "ENTER"):
+                self._view, self._view_scroll = "board", 0
+            elif pressed in ("PGUP", "UP"):
+                self._view_scroll += 1 if pressed == "UP" else 8
+            elif pressed in ("PGDN", "DOWN"):
+                self._view_scroll = max(0, self._view_scroll - (1 if pressed == "DOWN" else 8))
+            elif lowered == "q":
+                # Not a kill: the engine reads stop_requested() between checks.
+                self._stop_asked.set()
+            else:
+                return
+        if lowered == "q":
+            self.log("> STOP REQUESTED  ::  finishing the current check", "1;38;5;203")
 
     def _run(self) -> None:
         # Total by construction: a terminal that vanishes mid-run (a closed pipe, a killed tmux
@@ -1199,31 +1415,58 @@ class Board:
     def _draw(self, t: float) -> None:
         grid, glyphs = self._grid, self._glyphs
         chrome, dim = "38;5;178", "38;5;58"
-        box_w = min(self._cols, _MAP_W + 2)
+        box_w = min(self._cols, self._map_w + 2)
         box_x = max(0, (self._cols - box_w) // 2)
-        map_h = min(_MAP_H, max(6, _BOARD_ROWS - 6))
+        map_h = min(self._map_h, max(6, self._rows - 6))
         box_h = map_h + 5
-        box_y = max(0, (_BOARD_ROWS - box_h) // 2)
+        # Centred in whatever is left, minus the input line when there is one — so the prompt sits
+        # under the box rather than the box drifting down onto it.
+        box_y = max(0, (self._rows - box_h - (1 if self._interactive else 0)) // 2)
         self._frame_box(box_x, box_y, box_w, box_h, chrome)
 
         resolved = [a for a in self._assets
                     if a["resolve_at"] is not None and t >= a["resolve_at"] and a["severity"]]
         counts = _finding_counts(resolved)
         defcon = min((_DEFCON_FOR.get(a["severity"] or "info", 5) for a in resolved), default=5)
+        if defcon < self._defcon:       # it only ever gets worse within a run
+            self._defcon, self._defcon_at = defcon, t
 
         # --- header -------------------------------------------------------------------------------
         grid.text(box_x + 2, box_y, f" {self._title} ", "1;38;5;214")
         label = f" DEFCON {defcon} "
-        grid.text(box_x + box_w - 13 - len(label), box_y, label,
-                  "1;7;38;5;196" if defcon <= 2 else "1;38;5;214")
+        # The moment it drops, the label flashes for a beat — the one state change on this board
+        # an operator must not be able to miss.
+        fresh = (t - self._defcon_at) < 1.6
+        if fresh and int((t - self._defcon_at) * 6.0) % 2 == 0:
+            paint_defcon = "1;7;38;5;231"
+        else:
+            paint_defcon = "1;7;38;5;196" if defcon <= 2 else "1;38;5;214"
+        grid.text(box_x + box_w - 13 - len(label), box_y, label, paint_defcon)
         grid.text(box_x + box_w - 12, box_y, f" {self._clock(t)} ", chrome)
 
+        # --- an overlay instead of the map, when the operator asked for one ----------------------
+        # The header, the status bar and the footer stay: DEFCON, the scope statement and the asset
+        # tally are the context that makes a log line mean something, and a view that replaced the
+        # whole board would take them away at exactly the moment the operator is reading detail.
+        if self._view != "board":
+            self._draw_overlay(box_x, box_y, box_w, map_h)
+        else:
+            self._draw_map(t, box_x, box_y, box_w, map_h, counts, resolved)
+
+        # --- status bar ---------------------------------------------------------------------------
+        self._draw_status(t, box_x, box_y, box_w, map_h, counts, defcon)
+        return
+
+    def _draw_map(self, t: float, box_x: int, box_y: int, box_w: int, map_h: int,
+                  counts: dict[str, int], resolved: list[dict[str, Any]]) -> None:
+        grid, glyphs = self._grid, self._glyphs
+        chrome, dim = "38;5;178", "38;5;58"
         # --- map ----------------------------------------------------------------------------------
         mx, my = box_x + 1, box_y + 1
         sweep = int((t * 7.0) % (map_h + 6)) - 3      # a CRT band walking down the board
         for y in range(map_h):
             lit = y == sweep
-            for x, cell in enumerate(_LAND_ROWS[y][: box_w - 2]):
+            for x, cell in enumerate(self._land[y][: box_w - 2]):
                 if cell == "#":
                     grid.put(mx + x, my + y, glyphs["land"], "38;5;108" if lit else "38;5;23")
                 elif lit:
@@ -1241,7 +1484,7 @@ class Board:
             for offset, ch in enumerate(text):
                 plot(px + offset, py, ch, color)
 
-        origin = (float(_BOARD_ORIGIN[0]), float(_BOARD_ORIGIN[1]))
+        origin = (float(self._origin[0]), float(self._origin[1]))
         for asset in self._assets:
             launch_at = asset["launch_at"]
             ax, ay = float(asset["x"]), float(asset["y"])
@@ -1255,7 +1498,9 @@ class Board:
             resolve_at = asset["resolve_at"]
             landed = resolve_at is not None and t >= resolve_at
             paint = _BOARD_SEV.get(asset["severity"] or "", "38;5;214")
-            lift = 3.0 + abs(ax - origin[0]) / 11.0
+            # Scaled with the map: a fixed 11-column divisor on a 198-wide map made every arc a
+            # flat line across the top of the screen.
+            lift = (3.0 + abs(ax - origin[0]) / 11.0) * (self._map_h / _MAP_H)
             control = ((origin[0] + ax) / 2.0, min(origin[1], ay) - lift)
             # The trail drains once the arc has arrived, verdict or not: five permanent arcs across
             # a 72-column board bury the continents, and the board is the point.
@@ -1301,9 +1546,90 @@ class Board:
                 # Near the right limb the label would be clipped mid-word, so it flips sides.
                 at = int(ax) + 2 if int(ax) + 2 + len(tag) <= box_w - 3 else int(ax) - 1 - len(tag)
                 plot_text(at, int(ay), tag, paint)
-        plot_text(_BOARD_ORIGIN[0] - 7, _BOARD_ORIGIN[1] - 1, "GREYNOC", "38;5;51")
-        plot(_BOARD_ORIGIN[0], _BOARD_ORIGIN[1], glyphs["blip"], "1;38;5;51")
+        # --- the tracking reticle -----------------------------------------------------------------
+        # Brackets that close around the asset the prover is hitting at this instant, from the
+        # request feed rather than from a timer: when the traffic stops, so does the reticle.
+        if self._hot_host and t - self._hot_at < 2.0:
+            hot = self._match_locked(self._hot_host)
+            if hot is not None:
+                phase = (t * 6.0) % 2.0
+                reach = 3 if phase < 1.0 else 2
+                tick = "1;38;5;231" if phase < 0.5 else "38;5;214"
+                hx, hy = float(hot["x"]), float(hot["y"])
+                plot(hx - reach * 2, hy, glyphs["bracket"][0], tick)
+                plot(hx + reach * 2, hy, glyphs["bracket"][1], tick)
+                plot(hx, hy - reach + 1, glyphs["hbar"], tick)
+                plot(hx, hy + reach - 1, glyphs["hbar"], tick)
 
+        plot_text(self._origin[0] - 7, self._origin[1] - 1, "GREYNOC", "38;5;51")
+        plot(self._origin[0], self._origin[1], glyphs["blip"], "1;38;5;51")
+
+
+    #: What each in-run view is called and which key opens it. One letter each, and the same key
+    #: closes it: an operator mid-hunt has one hand on the keyboard.
+    VIEW_KEYS = (("l", "log", "LOG"), ("f", "findings", "FINDINGS"), ("r", "traffic", "TRAFFIC"))
+
+    def _view_rows(self, width: int) -> tuple[str, list[str]]:
+        """``(title, rows)`` for the open view. Newest last, like the teletype. Pure-ish.
+
+        Every row is something the engine reported: the log is its own prose, the findings are arcs
+        that RESOLVED with a severity it confirmed, and the traffic is what
+        ``active_verify_service._Http.fetch`` actually sent. Nothing here is inferred, so an empty
+        view says it is empty rather than filling itself in.
+        """
+        if self._view == "log":
+            rows = [text for _at, text, _sgr in self._lines]
+            return ("LOG", rows or ["(nothing logged yet)"])
+        if self._view == "findings":
+            rows = []
+            for asset in self._assets:
+                if asset["resolve_at"] is None or not asset["severity"]:
+                    continue
+                rows.append(f"{str(asset['severity']).upper():<9} {asset['name'][:48]:<48} "
+                            f"{asset.get('label') or ''}")
+            if not rows:
+                tracked = len(self._assets)
+                rows = [f"(nothing confirmed yet — {tracked} asset(s) tracked)"] if tracked else                        ["(no assets registered yet)"]
+            return ("FINDINGS  confirmed only", rows)
+        rows = [f"{at:7.1f}s  {method:<7} {host[:38]:<38} {path}"
+                for at, method, host, path in self._requests]
+        if not rows:
+            rows = ["(no active requests yet — the prover sends these once a proof pass starts)"]
+        return (f"TRAFFIC  {len(self._requests)} request(s)", rows)
+
+    def _draw_overlay(self, box_x: int, box_y: int, box_w: int, map_h: int) -> None:
+        """One view, in the map's own area, scrolled. Caller holds the lock."""
+        grid = self._grid
+        chrome, dim = "38;5;178", "38;5;58"
+        width = box_w - 4
+        title, rows = self._view_rows(width)
+        # Scrolled from the BOTTOM, so the default is "following" — what an operator watching a
+        # live run wants — and PgUp walks back through what already happened.
+        room = max(1, map_h - 2)
+        scroll = max(0, min(self._view_scroll, max(0, len(rows) - room)))
+        self._view_scroll = scroll
+        end = len(rows) - scroll
+        window = rows[max(0, end - room):end]
+        head = f" {title} "
+        grid.text(box_x + 2, box_y + 1, (head + "─" * max(0, width - len(head)))[:width], "1;38;5;214")
+        for index, row in enumerate(window):
+            grid.text(box_x + 2, box_y + 2 + index, self._clean(row)[:width], "38;5;223")
+        hint = " l log · f findings · r traffic · PgUp/PgDn scroll · b board · q stop "
+        if len(rows) > room:
+            hint = f" {end}/{len(rows)} ·{hint}"
+        grid.text(box_x + 2, box_y + map_h - 1, hint[:width], dim)
+
+    def _draw_status(self, t: float, box_x: int, box_y: int, box_w: int, map_h: int,
+                     counts: dict[str, int], defcon: int) -> None:
+        """The status bar, the teletype and the footer — drawn under the map OR under an overlay.
+
+        Shared on purpose: DEFCON, the confirmed tally, the scope statement and the engine's own
+        last two lines are the context that makes a log line mean anything, so a view that
+        replaced them would take the frame away at the moment the operator is reading detail.
+        """
+        grid = self._grid
+        chrome, dim = "38;5;178", "38;5;58"
+        box_h = map_h + 5
         # --- status bar ---------------------------------------------------------------------------
         bar_y = box_y + map_h + 1
         self._crossrule(box_x, bar_y, box_w, chrome)
@@ -1317,7 +1643,12 @@ class Board:
         grid.text(box_x + box_w - 2 - len(right), bar_y, right, chrome)
         # The engine's own phase, in the gap between the two tallies. The gallery has no phase
         # because no engine talks to it — this is the one thing here the prototype never had.
-        gap_from = box_x + 3 + len(left)
+        # A request-rate sparkline, left of the phase: real traffic, one cell per second, so an
+        # operator can see the prover working (and the governor throttling it) at a glance.
+        spark = self._traffic_spark(t, 18)
+        if spark:
+            grid.text(box_x + 4 + len(left), bar_y, spark, "38;5;108")
+        gap_from = box_x + 3 + len(left) + (len(spark) + 2 if spark else 0)
         gap_to = box_x + box_w - 3 - len(right)
         if self._phase and gap_to - gap_from >= 8:
             phase = self._phase[: gap_to - gap_from]
@@ -1362,6 +1693,28 @@ class Board:
             line = ("> " + text)[: self._cols]
             grid.text(0, row, line, "1;38;5;214")
             self._caret = (min(2 + caret, max(0, self._cols - 1)), row)
+
+    def _traffic_spark(self, t: float, cells: int) -> str:
+        """Requests per second over the last ``cells`` seconds, as block glyphs. ``""`` if silent.
+
+        Counted from the same feed the TRAFFIC view shows, so the bars and the list can never
+        disagree, and nothing is drawn before the first real request.
+        """
+        if not self._requests:
+            return ""
+        bars = self._glyphs.get("bars") or ()
+        if not bars:
+            return ""
+        buckets = [0] * max(1, int(cells))
+        for at, _method, _host, _path in self._requests:
+            age = t - at
+            if 0.0 <= age < len(buckets):
+                buckets[len(buckets) - 1 - int(age)] += 1
+        peak = max(buckets)
+        if peak <= 0:
+            return ""
+        return "".join(" " if n <= 0 else bars[min(len(bars) - 1, (n * len(bars) - 1) // peak)]
+                       for n in buckets)
 
     def _clock(self, t: float) -> str:
         if self._clock_base is None:
@@ -1600,13 +1953,13 @@ def report_result(fx: Any, result: Any, default: str = "") -> int:
 
 
 def board(title: str, *, scope: str = "", stream: TextIO | None = None,
-          active: bool | None = None) -> Board:
+          active: bool | None = None, controls: bool = False) -> Board:
     """A :class:`Board` for ``with`` use. Inert unless a human is watching a terminal big enough."""
-    return Board(title, scope=scope, stream=stream, active=active)
+    return Board(title, scope=scope, stream=stream, active=active, controls=controls)
 
 
 def surface(title: str, *, scope: str = "", stream: TextIO | None = None,
-            active: bool | None = None) -> Any:
+            active: bool | None = None, controls: bool = False) -> Any:
     """The richest live surface this terminal can take: the threat board, else the status line.
 
     The board needs ~78x24 and the whole screen. A narrower terminal, a split pane, ``NO_COLOR``, a
@@ -1618,7 +1971,7 @@ def surface(title: str, *, scope: str = "", stream: TextIO | None = None,
         return scanner(title, stream=stream, active=False)
     target = stream if stream is not None else sys.stderr
     if enabled(target) and board_fits(target):
-        return board(title, scope=scope, stream=target, active=active)
+        return board(title, scope=scope, stream=target, active=active, controls=controls)
     return scanner(title, stream=stream, active=active)
 
 

@@ -207,6 +207,58 @@ def _scope_hosts(scope: str) -> set[str]:
     return hosts
 
 
+def _scope_wildcard_suffixes(scope: str) -> set[str]:
+    """The domains a ``*.`` token in this scope text wildcards, with the ``*.`` stripped.
+
+    Tokenized exactly as :func:`_scope_hosts` does — a URL-shaped word contributes no host
+    authority, and a comma inside a URL path does not begin a new grant — so the two cannot
+    disagree about what a word in the operator's scope text means.
+    """
+    suffixes: set[str] = set()
+    for word in re.split(r"\s+", str(scope or "").lower()):
+        for raw in re.split(r"[,;]+", word):
+            token = raw.strip().strip("()<>[]\"'")
+            if not token:
+                continue
+            if any(ch in token for ch in "/?:#@%\\"):
+                break
+            if token.startswith("*.") and _HOST_ONLY_SCOPE_TOKEN.fullmatch(token):
+                suffixes.add(token.removeprefix("*."))
+    return suffixes
+
+
+def wildcard_admits_host(scope: str, host: str) -> bool:
+    """Whether a ``*.`` token in this scope text asks for THIS host. Asked per target, by design.
+
+    A ``*.domain`` token asks for cross-host expansion (that is what a wildcard program is), while
+    a bare host token is an attestation about ONE host — in particular one DERIVED from the target
+    by ``-y`` (``bounty.self_scope_grant``) — even though :func:`host_in_active_scope` reads either
+    as exact-OR-proper-subdomain. A caller that pins active probing to the host the operator named
+    has to tell those two apart, and the scope text cannot carry the distinction on its own.
+
+    This used to be asked GLOBALLY — "does any token in this text carry a ``*.``" — and that was
+    itself a scope-widening defect. In the scope ``acme.example *.other.example``, which is what
+    ``gn hunt https://acme.example -y -s '*.other.example'`` produces, the one wildcard lifted the
+    pin off the OTHER token, so ``admin.acme.example`` — a host whose only grant was a ``-y``
+    attestation about its parent — became eligible for active probing. A wildcard is a grant about
+    the domain it names and cannot speak for a different one, so the question now takes the host it
+    is being asked about, and the global form is no longer expressible.
+
+    Matched exact-OR-proper-dotted-suffix against the stripped token, which is what
+    ``host_in_active_scope`` already does with the same token, so a real wildcard program's reach
+    is unchanged. Both callers AND this with ``host_in_active_scope``, so it can only ever narrow:
+    a bare public suffix (``*.herokuapp.com``) is still refused there, and an ``excluded_hosts``
+    entry still wins over all of it.
+    """
+    cleaned = (host or "").strip().lower().strip("[]")
+    if not cleaned:
+        return False
+    for suffix in _scope_wildcard_suffixes(scope):
+        if cleaned == suffix or cleaned.endswith("." + suffix):
+            return True
+    return False
+
+
 def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     """Fail-closed scope binding: a host is eligible for ACTIVE probing only if the
     operator named it (its registrable domain or full host appears in the scope
@@ -380,7 +432,13 @@ class _Http:
     and a process-wide per-host token bucket (the governor)."""
 
     def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12,
-                 auth: AuthContext | None = None, scope_host: str = "") -> None:
+                 auth: AuthContext | None = None, scope_host: str = "",
+                 on_request: Any = None) -> None:
+        #: Called with ``(method, url, status)`` after every request this wrapper makes. The threat
+        #: board's TRAFFIC view is the consumer: the feed has to be what actually left the machine,
+        #: so it is taken HERE rather than inferred from a progress line. Never allowed to affect
+        #: the request — see the guard in :meth:`fetch`.
+        self.on_request = on_request
         self.settings = settings
         self.governor = governor
         self.max_requests = max(1, int(max_requests))
@@ -394,12 +452,34 @@ class _Http:
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
+        # ``sent`` is incremented in _fetch_impl immediately before the socket opens, so comparing
+        # it across the call is the one honest test of whether anything left this process. Every
+        # PREFLIGHT refusal — an exhausted request budget, a standing halt_reason, a virtual-host
+        # header on an exact-host run, an http URL under an HTTPS-only session, the SSRF guard, the
+        # governor — raises one of these three BEFORE that line, and reporting those as traffic put
+        # requests that never happened into the board's TRAFFIC view and its sparkline, which is
+        # exactly what ``on_request``'s contract says the feed must never contain. They are still
+        # counted in ``failed`` and surfaced as refusals by the callers that raise them.
+        before = self.sent
         try:
-            return self._fetch_impl(url, method=method, extra_headers=extra_headers,
-                                    read_body=read_body)
-        except (_ActiveError, _RateLimited, WebsiteFetchError):
+            result = self._fetch_impl(url, method=method, extra_headers=extra_headers,
+                                      read_body=read_body)
+        except (_ActiveError, _RateLimited, WebsiteFetchError) as exc:
             self.failed += 1
+            if self.sent > before:  # a transport failure on a request that really went out
+                self._observe(method, url, type(exc).__name__)
             raise
+        self._observe(method, url, (result or {}).get("status", ""))
+        return result
+
+    def _observe(self, method: str, url: str, status: Any) -> None:
+        """Tell the observer what was sent. Total: a watcher that raises must not cost a check."""
+        if self.on_request is None:
+            return
+        try:
+            self.on_request(str(method or "GET"), str(url or ""), status)
+        except Exception:  # noqa: BLE001 - a decoration must never break a probe
+            pass
 
     def _fetch_impl(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
                     read_body: bool = True) -> dict[str, Any]:
@@ -2984,6 +3064,7 @@ def verify_active(
     xss_params: list[str] | None = None,
     only_classes: list[str] | None = None,
     scope_host: str = "",
+    on_request: Any = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -3034,6 +3115,7 @@ def verify_active(
     )
     if http is None:
         http = _Http(settings, governor, max_requests=requests_budget, auth=auth,
+                     on_request=on_request,
                      scope_host=scope_host)
     elif scope_host:
         # A caller injecting its own transport cannot weaken a chat exact-host
