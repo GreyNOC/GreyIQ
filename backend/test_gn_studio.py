@@ -49,9 +49,10 @@ def _tier(name: str = "rich") -> dict:
 
 def _state(**kwargs: object) -> gn_studio.StudioState:
     base = dict(
-        brain=(gn_studio.Row("bot", "tinygpt", "on"),),
+        bots=(gn_studio.Row("*tinygpt", "tinygpt", "on"),
+              gn_studio.Row(" claude", "anthropic · claude-opus-5", "dim")),
+        brain=(gn_studio.Row("bot", "tinygpt · bundled local model", "on"),),
         learning=(gn_studio.Row("corpus", "2 hunts · 9 rows"),),
-        agents=(gn_studio.Row("store", "empty", "dim"),),
     )
     base.update(kwargs)
     return gn_studio.StudioState(**base)  # type: ignore[arg-type]
@@ -88,42 +89,90 @@ class PanelTests(unittest.TestCase):
         self.assertIn("hunts", rows["corpus"])
 
     def test_the_brain_panel_says_whether_a_key_exists_never_the_key(self) -> None:
+        """Presence only, and read from the store the key is actually in.
+
+        It used to read ``api_key`` out of the runtime config, which is not where a key lives: the
+        panel said ``none`` on a working hosted brain while the BOTS panel showed that same bot
+        ready, on one frame. ``gn_bots.key_state`` reads ``runtime/secrets.json`` -- the
+        perms-restricted store the desktop app writes and ``_load_coder_config`` merges from.
+        """
         with TemporaryDirectory() as tmp:
             Path(tmp, "solin_runtime_config.json").write_text(json.dumps({
                 "internet_enabled": False, "memory_learning": True,
                 "coder": {"enabled": True, "provider": "anthropic",
-                          "anthropic": {"model": "claude-x", "api_key": "sk-ant-SECRET"}},
+                          "anthropic": {"model": "claude-x"}},
             }), encoding="utf-8")
-            rows = gn_studio.brain_rows(gn_profile.load(tmp), tmp)
+            Path(tmp, "secrets.json").write_text(json.dumps({"anthropic": "sk-ant-SECRET"}),
+                                                 encoding="utf-8")
+            profile, _error = gn_profile.set_value(gn_profile.load(tmp), "bot", "anthropic")
+            rows = gn_studio.brain_rows(profile, tmp)
         text = "\n".join(f"{r.label}={r.value}" for r in rows)
         self.assertIn("key=configured", text)
         self.assertNotIn("SECRET", text)
         self.assertIn("model=claude-x", text)
+
+    def test_the_key_row_says_none_when_the_secrets_store_has_none(self) -> None:
+        with TemporaryDirectory() as tmp:
+            Path(tmp, "solin_runtime_config.json").write_text(json.dumps({
+                "coder": {"enabled": True, "provider": "anthropic",
+                          "anthropic": {"model": "claude-x", "api_key": "ignored-here"}},
+            }), encoding="utf-8")
+            profile, _error = gn_profile.set_value(gn_profile.load(tmp), "bot", "anthropic")
+            rows = gn_studio.brain_rows(profile, tmp)
+        text = ANSI.sub("", "\n".join(f"{r.label}={r.value}" for r in rows))
+        self.assertIn("key=none", text)
+        self.assertNotIn("ignored-here", text,
+                         "a key in the runtime config is not the one the brain uses, and is "
+                         "never what this row reports")
 
     def test_the_bot_comes_from_the_profile(self) -> None:
         with TemporaryDirectory() as tmp:
             profile, _error = gn_profile.set_value(gn_profile.load(tmp), "bot", "off")
             rows = gn_studio.brain_rows(profile, tmp)
         bot = next(r for r in rows if r.label == "bot")
-        self.assertEqual(bot.value, "off")
+        self.assertIn("off", bot.value)
         self.assertEqual(bot.tone, "off")
+
+    def test_a_configured_bot_that_is_not_in_the_store_says_so(self) -> None:
+        """The honesty this panel owes: a name nothing will honour must not read as a selection.
+
+        ``gn_profile`` keeps a well-formed bot name it cannot check (an operator's own bot is a slug
+        that module has never heard of), so the panel is where "that bot is gone" is reported.
+        """
+        with TemporaryDirectory() as tmp:
+            profile, error = gn_profile.set_value(gn_profile.load(tmp), "bot", "deleted-bot")
+            self.assertEqual(error, "")
+            rows = gn_studio.brain_rows(profile, tmp)
+        text = chr(10).join(f"{r.label}={r.value}" for r in rows)
+        self.assertIn("deleted-bot", text)
+        self.assertIn("not in the store", text)
+        self.assertIn("tinygpt", text, "and it names what is answering instead")
 
     def test_a_cloned_agent_is_labelled_inert(self) -> None:
         with TemporaryDirectory() as tmp:
             Path(tmp, "agents").mkdir()
             Path(tmp, "agents", "owner-name").mkdir()
-            rows = gn_studio.agent_rows(tmp)
-        self.assertIn("inert", rows[0].value, "a clone that looks runnable is the one misreading "
-                                              "an operator could make here")
+            row = gn_studio.clone_row(tmp)
+            panel = gn_studio.bot_rows(tmp)
+        self.assertIn("inert", row.value, "a clone that looks runnable is the one misreading "
+                                          "an operator could make here")
+        self.assertIn(row, panel, "and the panel carries it")
 
-    def test_an_empty_store_names_how_to_fill_it(self) -> None:
+    def test_the_clone_store_is_always_a_row_even_when_it_is_empty(self) -> None:
+        """A row that vanishes is a store nobody can see was read.
+
+        A clone made by `gn agent clone` rather than `gn bot hf` is not a registry entry either,
+        so without this row those clones would be invisible here.
+        """
         with TemporaryDirectory() as tmp:
-            rows = gn_studio.agent_rows(tmp)
-        self.assertIn("gn agent clone", rows[0].value)
+            row = gn_studio.clone_row(tmp)
+            self.assertEqual(row.label, "clones")
+            self.assertIn("gn agent clone", row.value)
+            self.assertIn(row, gn_studio.bot_rows(tmp))
 
     def test_collect_returns_all_three_panels_and_never_raises(self) -> None:
         panels = gn_studio.collect("/nonexistent/path/at/all", SEED, None)
-        self.assertEqual(set(panels), {"brain", "learning", "agents"})
+        self.assertEqual(set(panels), {"bots", "brain", "learning"})
         for rows in panels.values():
             self.assertTrue(rows)
 
@@ -226,7 +275,7 @@ class RenderTests(unittest.TestCase):
 
     def test_every_panel_is_titled_so_a_number_is_never_unlabelled(self) -> None:
         frame = "\n".join(gn_studio.render(_state(), gn_tui.Size(100, 26), _tier()))
-        for title in ("BRAIN", "LEARNING", "AGENTS", "CHAT"):
+        for title in ("BOTS", "BRAIN", "LEARNING", "CHAT"):
             self.assertIn(title, frame)
 
     def test_a_long_value_is_elided_not_wrapped_into_the_chat(self) -> None:
@@ -254,8 +303,15 @@ class RenderTests(unittest.TestCase):
 
     def test_an_empty_chat_explains_what_the_window_is_for(self) -> None:
         frame = "\n".join(gn_studio.render(_state(), gn_tui.Size(100, 26), _tier()))
-        self.assertIn("ask a question", frame)
-        self.assertIn("generates", frame, "it states that nothing here generates text")
+        self.assertIn("a question", frame)
+        self.assertIn("/bots", frame, "the empty state is where the bot verbs are learned")
+        self.assertIn("/use <bot>", frame)
+        # It used to claim that nothing here generates text. That is now true of the LOCAL bots
+        # only, so the empty state has to say which is which — an operator reading an answer must
+        # be able to tell a quoted card from a model's sentence before they ask the question, not
+        # only from the label underneath it.
+        self.assertIn("quoted from the offline pack", frame)
+        self.assertIn("labelled as a model", frame)
 
     def test_the_ascii_tier_draws_a_frame_its_codec_can_write(self) -> None:
         frame = gn_studio.render(_state(), gn_tui.Size(100, 24), _tier("ascii"))
@@ -304,6 +360,16 @@ class ColorTests(unittest.TestCase):
         self.assertEqual(len(plain), len(painted))
         for before, after in zip(plain, painted):
             self.assertEqual(ANSI.sub("", after), before)
+
+    def test_the_live_bots_row_is_painted_as_on(self) -> None:
+        """The one row an operator came to find should stand out — and still read without colour."""
+        frame = gn_studio.render(_state(), gn_tui.Size(100, 26), _tier())
+        painted = gn_studio.colorize(frame, _tier())
+        live = next(row for row in painted if "*tinygpt" in row)
+        other = next(row for row in painted if " claude" in row and "*" not in row)
+        self.assertIn(gn_studio._SGR["on"], live)
+        self.assertNotIn(gn_studio._SGR["on"], other)
+        self.assertIn("*tinygpt", ANSI.sub("", live), "the marker is a character, not a hue")
 
     def test_disabled_colour_is_the_plain_frame(self) -> None:
         tier = _tier()
@@ -478,12 +544,27 @@ class SetupFromTheStudioTests(unittest.TestCase):
                                        stream=io.StringIO(), size=(100, 26))
 
     def test_set_saves_and_the_panel_shows_it_immediately(self) -> None:
+        self.studio.submit("/set learning off")
+        self.assertIs(gn_profile.load(self.tmp).get("learning"), False)
+        self.assertIn("saved", self.studio.snapshot().message)
+        self.assertFalse(self.studio.snapshot().learning_on,
+                         "a studio that reports a saved setting while showing the old one is "
+                         "worse than one that reports nothing")
+
+    def test_setting_the_bot_goes_through_the_bot_store_like_use_does(self) -> None:
+        """`/set bot x` and `/use x` are one operation, so they take one path.
+
+        The store is the authority on which bots exist; a settings door that skipped it could park
+        a name in the profile that nothing will honour.
+        """
         self.studio.submit("/set bot local")
         self.assertEqual(gn_profile.load(self.tmp).get("bot"), "local")
-        self.assertIn("saved", self.studio.snapshot().message)
-        self.assertIn("local", [r.value for r in self.studio.snapshot().brain if r.label == "bot"],
-                      "a studio that reports a saved setting while showing the old one is worse "
-                      "than one that reports nothing")
+        said = chr(10).join(text for _who, text in self.studio.snapshot().chat)
+        self.assertIn("local is live", said)
+        shown = [r.value for r in self.studio.snapshot().brain if r.label == "bot"]
+        self.assertTrue(any("local" in value for value in shown),
+                        "a studio that reports a saved setting while showing the old one is worse "
+                        "than one that reports nothing")
 
     def test_unset_returns_it_to_the_default(self) -> None:
         self.studio.submit("/set bot off")
@@ -491,8 +572,13 @@ class SetupFromTheStudioTests(unittest.TestCase):
         self.assertEqual(gn_profile.load(self.tmp).get("bot"), "tinygpt")
 
     def test_a_bad_value_is_refused_with_the_choices_named(self) -> None:
+        self.studio.submit("/set hunt.profile everything")
+        self.assertIn("full-sweep", self.studio.snapshot().message)
+        self.assertFalse(gn_profile.profile_path(self.tmp).exists(), "nothing was written")
+
+    def test_a_bot_that_does_not_exist_is_refused_and_nothing_is_written(self) -> None:
         self.studio.submit("/set bot skynet")
-        self.assertIn("tinygpt", self.studio.snapshot().message)
+        self.assertIn("no bot called", self.studio.snapshot().message)
         self.assertFalse(gn_profile.profile_path(self.tmp).exists(), "nothing was written")
 
     def test_no_setting_that_looks_like_authorization_can_be_set_from_here(self) -> None:

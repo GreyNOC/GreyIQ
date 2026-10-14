@@ -4,6 +4,28 @@ const TRAINING_SOURCE_REVISION = 1;
 const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
+// What a bot with no temperature of its own gets on the paths that need a number. A bot's
+// temperature now lives in the shared store in the provider's own units (0.0-2.0, the same number
+// `gn bot show` prints) and may be unset, meaning "the provider's default" — this mirrors
+// ChatRequest.temperature's default in greyiq_api.py so the browser's local paths and the backend
+// agree on what unset means.
+const DEFAULT_SAMPLING_TEMPERATURE = 0.32;
+// gn_bots.DEFAULT_ID — the bot every unresolvable name falls back to, and the one a profile that
+// has never been set names. Used only to tell "the operator has not chosen a bot" from "they have".
+const DEFAULT_BOT_ID = "tinygpt";
+// How the store's provider ids read in the Brain picker. The ids themselves are gn_bots.PROVIDERS
+// and come from /api/bots, so a provider added there appears here even without a label.
+const PROVIDER_LABELS = {
+  tinygpt: "TinyGPT (bundled, local)",
+  local: "Local / OpenAI-compatible",
+  anthropic: "Claude (hosted)",
+  openai: "OpenAI (hosted)",
+  offline: "Offline coder (edits, no chat)",
+  off: "Off (nothing answers)"
+};
+// The highest temperature the chat route will act on. Kept so a bot set to 2.0 for a local model
+// is not quietly sent as a request the brain refuses.
+const MAX_CHAT_TEMPERATURE = 2;
 const COLORS = ["#ff6633", "#8ec7d8", "#4bb377", "#d9a441", "#9aa1a8", "#c98a6b"];
 
 // The readable ink for text sitting ON a bot colour. Bot colours are persisted, so pre-v4
@@ -113,6 +135,10 @@ const MODEL_SIZE_LABELS = {
   }
 };
 
+// The bots a browser shows before it has ever reached the local service, and — for an install from
+// before the app and the CLI shared one store — the bots that get handed over to it on first load
+// (see migrateBotsOnce). They are NOT the app's bot list any more: that comes from /api/bots, which
+// serves runtime/bots.json and ships its own six built-ins.
 const DEFAULT_BOTS = [
   {
     id: "astra",
@@ -191,7 +217,12 @@ const els = {
   botName: document.querySelector("#botName"),
   botPersona: document.querySelector("#botPersona"),
   botStyle: document.querySelector("#botStyle"),
+  botProvider: document.querySelector("#botProvider"),
+  botModel: document.querySelector("#botModel"),
   botTemperature: document.querySelector("#botTemperature"),
+  botTemperatureValue: document.querySelector("#botTemperatureValue"),
+  botReadiness: document.querySelector("#botReadiness"),
+  botStoreNote: document.querySelector("#botStoreNote"),
   swatchRow: document.querySelector("#swatchRow"),
   activeBotMark: document.querySelector("#activeBotMark"),
   activeBotName: document.querySelector("#activeBotName"),
@@ -200,6 +231,7 @@ const els = {
   gpuButton: document.querySelector("#gpuButton"),
   clearChatButton: document.querySelector("#clearChatButton"),
   newBotButton: document.querySelector("#newBotButton"),
+  cloneBotButton: document.querySelector("#cloneBotButton"),
   deleteBotButton: document.querySelector("#deleteBotButton"),
   messageStream: document.querySelector("#messageStream"),
   messageTemplate: document.querySelector("#messageTemplate"),
@@ -535,8 +567,28 @@ class AccelerationBackend {
 
 function loadState() {
   const fallback = {
+    // A CACHE of the shared bot store (runtime/bots.json, via /api/bots), not a store of its own:
+    // the same records `gn bot ls` lists and `gn studio`'s BOTS panel shows. It is kept here so the
+    // roster still renders when the local service is down — in which case nothing in it can be
+    // edited and the note under the list says so. DEFAULT_BOTS is what a browser that has never
+    // reached the service shows, and what a pre-registry install migrates (see migrateBotsOnce).
     bots: structuredClone(DEFAULT_BOTS),
+    // The cached live id. The real answer is always the store's `active_id`; selecting a bot posts
+    // to /api/bots/active (gn_bots.set_active, the one writer of the profile's `bot` setting) and
+    // then re-reads, so this is never the app's own opinion of which bot is live.
     activeBotId: DEFAULT_BOTS[0].id,
+    // --- the three per-viewer fields the registry deliberately has no home for ----------------
+    // Keyed by the registry's bot id. A bot's COLOUR is how this browser draws it: no CLI surface
+    // can use a hex triple, so a shared store would carry a field every other surface must ignore.
+    botPresentation: {},
+    // The in-browser preference FIT (weights + the stamp of when they were last fitted). It is
+    // learned from this browser's own chat ratings and memories, which never leave it, so a copy in
+    // the shared store would be a number nobody else could reproduce from the store — and it is not
+    // a training run, which is why it is not the registry's `trained_at` (gn_bots.mark_trained is
+    // written only with a real trainer's result).
+    botFit: {},
+    // The once-only localStorage -> registry handover: {at, map: {oldId: registryId}}.
+    botsMigration: null,
     chats: {},
     memories: {},
     backendPreference: "cpu",
@@ -591,6 +643,11 @@ function loadState() {
       return fallback;
     }
 
+    const savedBots = migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
+      ...bot,
+      weights: normalizeWeights(bot.weights)
+    }));
+
     return {
       ...fallback,
       ...saved,
@@ -600,16 +657,51 @@ function loadState() {
       // Merge over the defaults so a settings object saved by an older build (missing the newer
       // fields) still yields a complete, valid form rather than undefined inputs.
       trainSettings: { ...DEFAULT_TRAIN_SETTINGS, ...(saved.trainSettings || {}) },
-      bots: migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
-        ...bot,
-        weights: normalizeWeights(bot.weights)
-      }))
+      bots: savedBots,
+      // A build before the one store kept the colour and the preference fit ON each bot object.
+      // Lift them into the per-viewer maps, under the ids they had; migrateBotsOnce re-keys them to
+      // the registry's ids afterwards. What was saved later wins, so this runs only once in effect.
+      botPresentation: { ...harvestedPresentation(savedBots), ...(saved.botPresentation || {}) },
+      botFit: { ...harvestedFit(savedBots), ...(saved.botFit || {}) },
+      // What is left to hand over to the registry: bots this browser saved BEFORE the two became
+      // one store. A registry record always names a provider and a browser-only bot never did, so
+      // that is the discriminator — without it, a browser whose cache is simply the store's own
+      // bots would "migrate" them back to it on every load. Derived, never persisted; the marker is
+      // what records that the handover happened.
+      // A handover still in flight from an earlier session wins over the derivation below. It has
+      // to be PERSISTED: after the first successful read, state.bots is the store's records and
+      // saveState writes those, so a failed handover followed by a reload used to derive an empty
+      // pending list from a cache that no longer held the browser's own bots — one service hiccup
+      // during the one-shot handover, and they were gone from localStorage for good.
+      pendingBotMigration: Array.isArray(saved.pendingBotMigration) && saved.pendingBotMigration.length > 0
+        ? saved.pendingBotMigration
+        : (saved.botsMigration ? null : savedBots.filter((bot) => !bot.provider)),
+      // The bot this browser had selected, captured HERE because the store's answer overwrites
+      // state.activeBotId long before the handover runs. Persisted with the pending list.
+      pendingBotSelection: Array.isArray(saved.pendingBotMigration) && saved.pendingBotMigration.length > 0
+        ? String(saved.pendingBotSelection || "")
+        : (saved.botsMigration ? "" : String(saved.activeBotId || ""))
     };
   } catch {
     return fallback;
   }
 }
 
+function harvestedPresentation(bots) {
+  return Object.fromEntries(bots
+    .filter((bot) => bot && bot.id && bot.color)
+    .map((bot) => [bot.id, { color: bot.color }]));
+}
+
+function harvestedFit(bots) {
+  return Object.fromEntries(bots
+    .filter((bot) => bot && bot.id && (bot.trainedAt || (bot.weights || []).some(Boolean)))
+    .map((bot) => [bot.id, { weights: normalizeWeights(bot.weights), trainedAt: bot.trainedAt || 0 }]));
+}
+
+// Brings a SAVED payload's shipped bots up to the current default personas. It runs on what
+// localStorage held, which since the one store is only the pre-registry copy on its way to
+// /api/bots/migrate — so a bot that is still carrying a v1 persona is handed over with the v2 one.
 function migrateDefaultBots(bots, revision) {
   if (Number(revision || 0) >= BOT_DEFAULT_REVISION) {
     return bots;
@@ -674,6 +766,17 @@ function saveState() {
   } = state;
   // MCP arguments and server replies can contain engagement data. Keep them
   // visible for this session without writing either side to localStorage.
+  // The four facts the BACKEND computes because the browser cannot see the files they depend on —
+  // the key store for `key_state`, the app's own coder.local.base_url for the endpoint a `local`
+  // bot will really use. They are this session's answer and nothing else's, so they are not
+  // written to the cache: a stale "Ready. Stays on this machine." read back next session is a
+  // claim with nothing behind it. `endpoint` is dropped for a second reason — it is whatever
+  // coder.local.base_url holds, which is not validated the way a bot's own base_url is, so it is
+  // not something to park in localStorage.
+  persist.bots = (persist.bots || []).map((bot) => {
+    const { readiness: _r, key_state: _k, off_machine: _o, endpoint: _e, ...rest } = bot;
+    return rest;
+  });
   persist.chats = Object.fromEntries(Object.entries(state.chats || {}).map(([botId, messages]) => [
     botId,
     (Array.isArray(messages) ? messages : []).filter((message) =>
@@ -801,6 +904,10 @@ async function refreshServiceStatus({ silent = false } = {}) {
     if (state.panelMode === "security") ensureSecurityData();
     if (state.panelMode === "ops") void loadBrainOpsStatus({ force: true });
     if (state.panelMode === "train") ensureTrainData();
+    // A late backend is how the bot store first becomes readable, and the shell is the other door
+    // onto it while this page stays open — so this both loads it and revalidates it. botsAreStale
+    // rate-limits to one read every 30s and never fires while the operator is editing.
+    if (botsAreStale()) void refreshBots({ auto: true });
     if (!silent) {
       render();
     } else {
@@ -1067,6 +1174,10 @@ liveOn("poe_dialog", appendBrainLive);
 liveOn("finding_confirmed", appendBrainLive);
 els.brainOpsRefresh?.addEventListener("click", () => { void loadBrainOpsStatus({ force: true }); });
 
+// One bot as the backend's /api/chat, /api/cores and /api/preferences read it, and as
+// /api/bots/migrate reads a pre-registry one. `corpus` is the store's `lessons` under the name
+// those three routes already take; `color` rides along for the AI core's own display and is the
+// one field here that is this browser's rather than the store's.
 function serializableBot(bot) {
   return {
     id: bot.id,
@@ -1186,8 +1297,464 @@ async function recordPreference(payload) {
   }
 }
 
+// ---- the shared bot store ------------------------------------------------------------------
+// One store, two doors. These bots are records in runtime/bots.json (backend/gn_bots.py) — the
+// same ones `gn bot ls` lists, `gn studio`'s BOTS panel shows and the hunt planner resolves
+// through `_load_coder_config`. The app does not keep bots of its own and does not decide which
+// one is live: it reads /api/bots, writes through the routes, and re-reads. Before this, a bot made
+// here lived in localStorage and no other surface could see it.
+//
+// What stays in this browser is listed on state.botPresentation / state.botFit: the colour, and the
+// in-browser preference weights with their stamp. Everything else on a bot object below comes from
+// the store, including `corpus`, which IS the registry's `lessons` under the name the browser's
+// ranker and n-gram paths already read (gn_bots.system_extra carries them into chat prompts).
+// Said by every control the panel freezes AND by a roster click refused for the same reason, so
+// the operator gets one sentence for one situation rather than two wordings of it.
+const FROZEN_EDITOR_TITLE =
+  "The bot store is served by the local GreyIQ service — start it to edit bots.";
+
+const botStore = {
+  // Whether /api/bots has answered at least once in this session. Until it has, the roster is the
+  // last state localStorage saw, and a write would have nowhere to go.
+  loaded: false,
+  error: "",        // the store's own complaint: an unparseable file, a refused entry
+  note: "",         // "the bot your profile names is gone, so this one is live instead"
+  lastError: "",    // this app's own failure to reach the route
+  path: "",
+  providers: [],
+  efforts: [],
+  fields: [],
+  //: The raw records from the last successful read, for revertToStore.
+  records: null,
+  //: False when that read was the store's fallback (unparseable file, refused entry): the bots in
+  //: it are not the whole story, and nothing may be pruned against it.
+  healthy: false
+};
+
+function presentationFor(botId) {
+  return state.botPresentation?.[botId] || {};
+}
+
+function fitFor(botId) {
+  return state.botFit?.[botId] || {};
+}
+
+function colorForBot(botId, index) {
+  // A bot the CLI made has no colour here, so one is assigned from the palette by position and
+  // kept. Deterministic per id rather than per render, or the roster would reshuffle its colours.
+  const stored = presentationFor(botId).color;
+  if (stored) return stored;
+  const color = COLORS[index % COLORS.length];
+  // `auto` marks a colour nobody picked — assigned from the palette by position. The handover may
+  // replace one of those with a colour the operator actually chose; it may never replace a chosen
+  // one. The swatch handler writes no `auto`, which is what makes a choice a choice.
+  state.botPresentation = {
+    ...(state.botPresentation || {}),
+    [botId]: { ...presentationFor(botId), color, auto: true }
+  };
+  return color;
+}
+
+function botView(record, index) {
+  // The registry's record plus this viewer's own two additions. `corpus` is an alias of the
+  // store's `lessons` (same prose, same purpose) so the browser's ranker, candidate builder and
+  // n-gram paths keep reading the field they always read.
+  const fit = fitFor(record.id);
+  return {
+    ...record,
+    corpus: Array.isArray(record.lessons) ? record.lessons : [],
+    color: colorForBot(record.id, index),
+    weights: normalizeWeights(fit.weights),
+    trainedAt: fit.trainedAt || 0
+  };
+}
+
+function applyBotStore(payload) {
+  const records = Array.isArray(payload?.bots) ? payload.bots : [];
+  if (records.length === 0) {
+    // gn_bots.load synthesizes the six built-ins even for a missing or broken store, so an empty
+    // list means the response itself was not a store listing. Keep the cache rather than blanking
+    // a roster the operator is looking at.
+    botStore.lastError = "The bot store answered with no bots.";
+    return;
+  }
+  botStore.loaded = true;
+  botStore.lastError = "";
+  // The last records the store actually served. A write that is refused leaves the operator's
+  // optimistic edit in the cache and on screen; this is what it reverts to.
+  botStore.records = records;
+  // Whether this listing is the store's real contents or its fallback: an unparseable file is
+  // answered with the built-ins, a refused entry is left out, and both come with `error` set.
+  botStore.healthy = !payload.error && payload.readable !== false;
+  botStore.error = String(payload.error || "");
+  botStore.note = String(payload.note || "");
+  botStore.path = String(payload.path || "");
+  botStore.providers = Array.isArray(payload.providers) ? payload.providers : [];
+  botStore.efforts = Array.isArray(payload.efforts) ? payload.efforts : [];
+  botStore.fields = Array.isArray(payload.fields) ? payload.fields : [];
+  state.bots = records.map(botView);
+  // The live bot is the store's answer, never a local guess: this is the same id `gn bot ls`
+  // marks with a `*`, because both read the profile setting gn_bots.set_active alone writes.
+  if (payload.active_id) state.activeBotId = payload.active_id;
+  if (!state.bots.some((bot) => bot.id === state.activeBotId)) state.activeBotId = state.bots[0].id;
+}
+
+function mergeViewerData(bucket, incoming, existing) {
+  if (existing === undefined) return incoming;
+  // Chat history and memories are lists of the operator's own turns: both sides are theirs, so
+  // both survive, oldest first.
+  if (bucket === "chats" || bucket === "memories") {
+    return [...(Array.isArray(incoming) ? incoming : []), ...(Array.isArray(existing) ? existing : [])];
+  }
+  // A colour the destination was ASSIGNED from the palette gives way to one this browser's
+  // operator actually picked; a colour they picked themselves is never overwritten.
+  if (bucket === "botPresentation") return existing?.auto ? incoming : existing;
+  // The fit: whichever side has actually been trained. The destination wins a tie, because it is
+  // the bot the store kept.
+  if (!existing?.trainedAt) return incoming;
+  return existing;
+}
+
+function pruneViewerData(live) {
+  // A bot removed with `gn bot rm` leaves this browser's colour, fit, chat history and memories
+  // behind. The app's own delete button clears all four; the shell's door had no way to, so they
+  // accumulated forever under ids nothing could select. Called only from refreshBots, and only for
+  // a listing botStore.healthy vouches for — see there.
+  if (Array.isArray(state.pendingBotMigration) && state.pendingBotMigration.length > 0) {
+    // NOT before the handover. On the first load of a pre-registry browser the store's listing is
+    // the six built-ins, and this browser's own bots are exactly the ids that are not in it — so
+    // pruning here would delete the chat history and memories the handover is about to re-key.
+    return;
+  }
+  for (const bucket of ["chats", "memories", "botPresentation", "botFit"]) {
+    const store = state[bucket];
+    if (!store) continue;
+    for (const botId of Object.keys(store)) {
+      if (!live.has(botId)) delete store[botId];
+    }
+  }
+}
+
+let botsInFlight = null;
+// Bumped by every write. A revalidation read captures it when it starts, and a response that comes
+// back after a write began is DROPPED: the write's own response already carried the fresh listing,
+// and applying the older read on top of it snapped the roster highlight and the "Live:" line back
+// to the previous bot for up to 30 s while the store — and `gn bot ls` — said otherwise. The exact
+// two-answers defect this work exists to remove, reachable with one click inside a slow read.
+let botWriteSeq = 0;
+// When an automatic retry may next ask. A store that keeps failing (the registry module will not
+// import, say) is still a service that is UP, so without this the two-second status poll would
+// re-ask forever and fill the operator's own server log with it.
+let botsRetryAfter = 0;
+const BOTS_RETRY_MS = 30000;
+//: When the store last answered. The shell is the other door onto it, so `gn bot use`, `gn bot rm`
+//: and a key appearing in the secrets store all change what this panel should say while the app is
+//: open. Without a re-read, "the app's selection and the `*` in `gn bot ls` are the same bot" was
+//: only true at page load, and a bot deleted in the shell stayed in the roster, selectable, with a
+//: full editor and a "Ready." line.
+let botsCheckedAt = 0;
+const BOTS_REVALIDATE_MS = 30000;
+
+function botsAreStale() {
+  if (!botStore.loaded) return true;
+  // Never while the operator is mid-edit: a re-read re-renders, and renderEditor writes the
+  // store's values back into the inputs they are typing in.
+  if (botSaveTarget || botsInFlight) return false;
+  const editor = els.botEditor;
+  if (editor && document.activeElement && editor.contains(document.activeElement)) return false;
+  return Date.now() - botsCheckedAt > BOTS_REVALIDATE_MS;
+}
+
+async function refreshBots({ render: shouldRender = true, auto = false } = {}) {
+  // Single-flight. Boot asks for the store, and the status poll asks for it too the moment the
+  // service answers — two fetches of the same file, and two handover attempts racing each other.
+  if (botsInFlight) return botsInFlight;
+  if (auto && Date.now() < botsRetryAfter) return false;
+  botsInFlight = (async () => {
+    if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+      botStore.lastError = "";
+      return false;
+    }
+    try {
+      const seqAtStart = botWriteSeq;
+      const payload = await apiFetch("/api/bots", { timeoutMs: 8000 });
+      botsCheckedAt = Date.now();
+      if (botWriteSeq !== seqAtStart) return botStore.loaded;   // see botWriteSeq
+      applyBotStore(payload);
+      // Only HERE, never on a write's response, and ONLY against a listing the store vouches for.
+      // The backend answers a bots.json it could not parse with the six built-ins, and a file
+      // holding an entry it refuses with that entry left out — and goes to real lengths never to
+      // overwrite either, so the operator's bots come back once the file is fixed. Pruning against
+      // one of those deleted their chat history, memories, colour and fit the moment it landed,
+      // turning a recoverable file problem into permanent, silent loss. `healthy` is the store's
+      // own answer to "is this listing my real contents", and nothing is deleted without it.
+      if (botStore.healthy) pruneViewerData(new Set(state.bots.map((bot) => bot.id)));
+    } catch (error) {
+      botStore.lastError = error.message || "The bot store could not be read.";
+      botsRetryAfter = Date.now() + BOTS_RETRY_MS;
+      return false;
+    }
+    await migrateBotsOnce();
+    if (shouldRender) render();
+    return botStore.loaded;
+  })();
+  try {
+    return await botsInFlight;
+  } finally {
+    botsInFlight = null;
+  }
+}
+
+// Every write goes through here, so a store that cannot be reached refuses in one sentence instead
+// of letting the app keep a second copy of the bot — which is the thing this work removed.
+async function botWrite(path, body, { verb = "that" } = {}) {
+  botWriteSeq += 1;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    botStore.lastError = `The bot store is served by the local GreyIQ service — start it to ${verb}.`;
+    render();
+    return null;
+  }
+  try {
+    const payload = await apiFetch(path, { method: "POST", timeoutMs: 10000, body: JSON.stringify(body) });
+    applyBotStore(payload);
+    render();
+    return payload;
+  } catch (error) {
+    botStore.lastError = error.message || `The bot store refused to ${verb}.`;
+    // The edit is OFF the screen as well as off the disk. updateBotFromEditor applies the
+    // operator's typing to the cached record before the write so the panel stays responsive; if
+    // the store then refuses it — a name the store rejects, a bot the CLI deleted a moment ago, a
+    // timeout — leaving it there shows, and persists, a bot the store has never held. The roster,
+    // the chat byline and the editor all read from this cache.
+    revertToStore();
+    if (els.botEditor && document.activeElement && els.botEditor.contains(document.activeElement)) {
+      // The operator is still typing. The roster and the note under it must tell the truth now,
+      // but renderEditor would write the store's values back into the field under their cursor
+      // and take what they typed since the debounce fired. The editor catches up on the next
+      // render, which the next keystroke, blur or click brings.
+      renderBots();
+      return null;
+    }
+    render();
+    return null;
+  }
+}
+
+function revertToStore() {
+  if (!Array.isArray(botStore.records)) return;
+  state.bots = botStore.records.map(botView);
+  if (!state.bots.some((bot) => bot.id === state.activeBotId) && state.bots.length > 0) {
+    state.activeBotId = state.bots[0].id;
+  }
+}
+
+async function selectBot(botId) {
+  // Selecting a bot in the app is `gn bot use` — the profile setting, written by the one writer of
+  // it. Without this the app's selection and the `*` in `gn bot ls` were two unrelated answers.
+  if (botId === state.activeBotId) return;
+  if (!botStore.loaded) {
+    // The roster rows are not controls applyEditorAvailability owns, so they stay clickable while
+    // the editor is frozen — and the id under them is this browser's cache, which before the
+    // handover is a pre-registry id the store has never heard of. Clicking one posted it and
+    // painted a 422. Refused here, in the same sentence the frozen controls carry, rather than by
+    // adding a second writer of the roster's own disabled state.
+    botStore.lastError = FROZEN_EDITOR_TITLE;
+    render();
+    return;
+  }
+  // Anything still sitting in the debounce belongs to the bot being left, so it goes first.
+  flushBotSave();
+  const previous = state.activeBotId;
+  const payload = await botWrite("/api/bots/active", { bot: botId }, { verb: "switch bots" });
+  if (!payload) {
+    state.activeBotId = previous;
+    render();
+    return;
+  }
+  queueCoreSync();
+}
+
+let botSaveTimer = null;
+let botSavePending = {};
+// WHICH bot the pending edit belongs to. Not state.activeBotId read when the timer fires: an
+// operator who types a persona and clicks another bot inside the debounce window would have had
+// their words written onto whichever bot they clicked.
+let botSaveTarget = "";
+
+function queueBotSave(fields) {
+  // The persona editor fires on every keystroke. Coalesce, then send the fields TOGETHER: one
+  // /api/bots/update applies all of them or none of them, so a refused temperature cannot leave a
+  // half-written bot behind.
+  if (botSaveTarget && botSaveTarget !== state.activeBotId) flushBotSave();
+  botSaveTarget = state.activeBotId;
+  botSavePending = { ...botSavePending, ...fields };
+  window.clearTimeout(botSaveTimer);
+  botSaveTimer = window.setTimeout(flushBotSave, 600);
+}
+
+function cancelBotSave(botId) {
+  if (botSaveTarget !== botId) return;
+  window.clearTimeout(botSaveTimer);
+  botSavePending = {};
+  botSaveTarget = "";
+}
+
+function flushBotSave() {
+  window.clearTimeout(botSaveTimer);
+  const fields = botSavePending;
+  const target = botSaveTarget;
+  botSavePending = {};
+  botSaveTarget = "";
+  if (!target || Object.keys(fields).length === 0) return;
+  void botWrite("/api/bots/update", { bot: target, fields }, { verb: "edit this bot" });
+}
+
+async function migrateBotsOnce() {
+  // The once-only handover of this browser's localStorage bots into the shared store. Nothing is
+  // deleted here: the browser's copy stays where it is (a rolled-back build still has it), and the
+  // route itself skips any id the store already holds, so a marker that fails to persist cannot
+  // duplicate anybody's bots. loadState only offers bots that came from a SAVED payload, so a
+  // fresh browser migrates nothing.
+  const pending = state.pendingBotMigration;
+  if (!botStore.loaded || !Array.isArray(pending) || pending.length === 0) return;
+  state.pendingBotMigration = null;
+  // Captured in loadState: by now applyBotStore has already replaced state.activeBotId with the
+  // store's own answer, so this is the only surviving record of what this browser had selected.
+  const selected = state.pendingBotSelection || "";
+  state.pendingBotSelection = "";
+  let payload;
+  try {
+    payload = await apiFetch("/api/bots/migrate", {
+      method: "POST",
+      timeoutMs: 15000,
+      body: JSON.stringify({ bots: pending.map(serializableBot) })
+    });
+  } catch (error) {
+    // Left pending on purpose: a service that went down mid-handover gets another chance on the
+    // next load, and the route is idempotent, so retrying cannot double anything.
+    state.pendingBotMigration = pending;
+    // The SELECTION too. It was cleared before the POST and only the bot list was being restored,
+    // so a handover that timed out lost the bot the operator had live — and the retry could not
+    // re-derive it, because applyBotStore had already overwritten state.activeBotId with the
+    // store's answer and saveState had persisted that.
+    state.pendingBotSelection = selected;
+    botStore.lastError = error.message || "This browser's bots could not be handed over to the store.";
+    return;
+  }
+  if (!Array.isArray(payload?.bots) || payload.bots.length === 0
+      || !Array.isArray(payload.migrated)) {
+    // A 200 that is not a store listing. applyBotStore would refuse it two lines below, so marking
+    // the handover done here would permanently record one that never happened. Treated exactly
+    // like a failed POST: left pending, retried next load, no marker.
+    state.pendingBotMigration = pending;
+    state.pendingBotSelection = selected;
+    botStore.lastError = "The bot store's answer to the handover could not be read; nothing was "
+      + "recorded. It will be tried again.";
+    return;
+  }
+  // A capped handover. The route reads MIGRATE_LIMIT entries per call and says how many it
+  // took; the rest stay pending — persisted — and go on the next load. No marker until the last
+  // of them has landed, or "the rest will be added on the next load" would be a sentence about a
+  // retry that could never run.
+  const read = Number.isInteger(payload.read) ? payload.read : pending.length;
+  const tail = read < pending.length ? pending.slice(read) : null;
+  const map = {};
+  for (const row of payload.migrated) {
+    if (row && row.from && row.id) map[row.from] = row.id;
+  }
+  // Re-key everything this browser keeps per bot. An id can change in the handover — `Forge` slugs
+  // to `forge`, and a `bot-<uuid>` is longer than an id may be — and chat history, memories, the
+  // colour and the preference fit would all be orphaned if they kept pointing at the old one.
+  for (const [from, to] of Object.entries(map)) {
+    if (from === to) continue;
+    for (const bucket of ["chats", "memories", "botPresentation", "botFit"]) {
+      const store = state[bucket] || {};
+      if (store[from] === undefined) continue;
+      // CARRIED, never discarded. The `delete` used to run unconditionally, so whenever the
+      // destination key already existed the source's data was thrown away — and for colours the
+      // destination ALWAYS exists, because the listing that arrived moments earlier assigned every
+      // id a palette colour. Each bucket is merged on its own terms instead.
+      store[to] = mergeViewerData(bucket, store[from], store[to]);
+      delete store[from];
+      state[bucket] = store;
+    }
+  }
+  const refused = (payload.migrated || []).filter((row) => row && row.status === "refused");
+  if (tail) {
+    state.pendingBotMigration = tail;
+    // The selection, if it was among the bots just placed, has been honoured below; if it is in
+    // the tail it is still pending with it.
+    state.pendingBotSelection = tail.some((bot) => bot && bot.id === selected) ? selected : "";
+  } else {
+    state.botsMigration = {
+      at: Date.now(),
+      map,
+      created: Number(payload.created || 0),
+      refused: refused.map((row) => `${row.from || "(unnamed)"}: ${row.note || "refused"}`)
+    };
+  }
+  applyBotStore(payload);
+  // The selection is part of what this browser had, so it comes across too — but only onto a
+  // profile still sitting at its default, and only for a bot this handover actually created. An
+  // operator who already ran `gn bot use` keeps that choice: the store is shared, and a browser
+  // that has just arrived does not get to overrule the shell.
+  const carried = map[selected];
+  const createdHere = (payload.migrated || [])
+    .some((row) => row && row.id === carried && row.status === "created");
+  if (carried && createdHere && (payload.configured || "") === DEFAULT_BOT_ID) {
+    await botWrite("/api/bots/active", { bot: carried }, { verb: "keep your selected bot" });
+  }
+  if (refused.length > 0) {
+    // Named rather than swallowed: these bots are still in localStorage and the operator can see
+    // why the store would not take them. Read from the RESPONSE, not from state.botsMigration —
+    // that is only set when the handover finished, so a capped batch that also had a refusal threw
+    // a TypeError here. It threw before saveState(), so the unread tail was never persisted and
+    // every reload retried the same first batch forever, never reaching the deferred bots.
+    const first = refused[0];
+    botStore.lastError = `${refused.length} of this browser's bots could not be added to the store `
+      + `(${first.from || "(unnamed)"}: ${first.note || "refused"}).`;
+  }
+  saveState();
+}
+
 function activeBot() {
   return state.bots.find((bot) => bot.id === state.activeBotId) || state.bots[0];
+}
+
+function botGreeting(bot) {
+  // The roster used to be this browser's own three local personas, so "is loaded and running
+  // locally" was true of every one of them. It is the store's roster now, and gn_bots ships
+  // `anthropic` and `openai` — so clicking Claude opened a chat whose first line said it was
+  // running locally, directly under a readiness line saying prompts leave the machine. The store's
+  // own sentence cannot contradict the store.
+  const label = botLabel(bot);
+  return bot?.what_it_does ? `${label}: ${bot.what_it_does}.` : `${label} is selected.`;
+}
+
+function botLabel(bot) {
+  // What to call a bot on screen. The store's own `label` is its name or, for a bot made with
+  // `gn bot new scout` and never named, its id — so a nameless bot reads as `scout` rather than as
+  // an empty string where its name should be.
+  return bot?.label || bot?.name || bot?.id || "GreyIQ";
+}
+
+function storedTemperature(bot) {
+  // The store's temperature, or null for "the provider's own default" — which is a real state a
+  // bot can be in, and not the same thing as 0. Written out rather than `Number(x)` because
+  // `Number(null)` is 0 and `Number.isFinite(0)` is true, so an unset temperature read back as a
+  // temperature of zero: the editor showed 0.00 for it, and the next keystroke would have SAVED
+  // that, turning "whatever the provider does" into an explicit value the operator never chose.
+  const raw = bot?.temperature;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function samplingTemperature(bot) {
+  // The browser's own paths need a number, so an unset bot gets the same default the API model
+  // declares rather than a magic one of their own.
+  const value = storedTemperature(bot);
+  return value === null ? DEFAULT_SAMPLING_TEMPERATURE : value;
 }
 
 function activeChat() {
@@ -1195,7 +1762,7 @@ function activeChat() {
     {
       id: crypto.randomUUID(),
       role: "bot",
-      text: `${activeBot().name} is loaded and running locally.`,
+      text: botGreeting(activeBot()),
       createdAt: Date.now()
     }
   ];
@@ -1306,7 +1873,19 @@ function trainBot(bot) {
 
   bot.weights = Array.from(weights, (value) => Number(value.toFixed(5)));
   bot.trainedAt = Date.now();
+  saveBotFit(bot);
   return examples.length;
+}
+
+function saveBotFit(bot) {
+  // The fit belongs to THIS browser, so it is kept beside the store's records rather than in them:
+  // it is learned from chat ratings and memories that never leave here, and a weights vector in a
+  // shared store would be a number no other surface could reproduce. It is also not a training
+  // run — the registry's `trained_at` is written only by a real trainer, through mark_trained.
+  state.botFit = {
+    ...(state.botFit || {}),
+    [bot.id]: { weights: bot.weights, trainedAt: bot.trainedAt }
+  };
 }
 
 function collectTrainingExamples(bot) {
@@ -1387,7 +1966,7 @@ function generatePhrase(bot, userText, memories) {
     keys.find((key) => promptTokens.some((token) => key.includes(token))) ||
     keys[Math.floor(rng() * keys.length)];
   const words = matchingKey.split(" ");
-  const targetLength = 16 + Math.floor(rng() * 18 * (bot.temperature / 100 + 0.4));
+  const targetLength = 16 + Math.floor(rng() * 18 * (samplingTemperature(bot) + 0.4));
 
   while (words.length < targetLength) {
     const key = `${words[words.length - 2]} ${words[words.length - 1]}`;
@@ -1507,7 +2086,7 @@ function makeCandidates(bot, userText, memories) {
   const topic = topicFrom(userText);
   const intent = inferIntent(userText);
   const generated = generatePhrase(bot, userText, memories);
-  const personaNeedle = bot.persona.split(/[.!?]/).map((part) => part.trim()).filter(Boolean)[0] || bot.name;
+  const personaNeedle = (bot.persona || "").split(/[.!?]/).map((part) => part.trim()).filter(Boolean)[0] || botLabel(bot);
   const memory = memorySentence(memories);
 
   return [
@@ -1554,7 +2133,10 @@ async function replyFor(userText) {
           memories: activeMemories(),
           history,
           max_new_tokens: 160,
-          temperature: Math.max(0.05, Math.min(1.2, bot.temperature / 100)),
+          // No 0.05 floor: an explicit 0 is a real temperature the store keeps and both surfaces
+          // print, and ChatRequest accepts it (ge=0.0). The floor was this browser's own invention,
+          // and it sent 0.05 for a bot whose panel said 0.00.
+          temperature: Math.max(0, Math.min(MAX_CHAT_TEMPERATURE, samplingTemperature(bot))),
           auto_capture: true
         })
       });
@@ -1599,7 +2181,7 @@ async function browserReplyFor(userText) {
   const adjusted = scores.map((score, index) => {
     const overlapBonus = overlap(userText, candidates[index]) * 0.08;
     const brevityPenalty = candidates[index].length > 420 ? -0.1 : 0;
-    const variety = (bot.temperature / 100) * seededRandom(`${userText}:${index}`)() * 0.12;
+    const variety = samplingTemperature(bot) * seededRandom(`${userText}:${index}`)() * 0.12;
     return score + overlapBonus + brevityPenalty + variety;
   });
   const bestIndex = adjusted.indexOf(Math.max(...adjusted));
@@ -1666,21 +2248,54 @@ function renderBots() {
     avatar.className = "bot-avatar";
     avatar.style.background = String(bot.color || "");
     avatar.style.color = inkOn(bot.color);
-    avatar.textContent = initials(bot.name);
+    avatar.textContent = initials(botLabel(bot));
     const meta = document.createElement("span");
     const strong = document.createElement("strong");
-    strong.textContent = bot.name;
+    strong.textContent = botLabel(bot);
     const sub = document.createElement("span");
-    sub.textContent = bot.style;
+    // What the bot IS, the way `gn bot ls` says it: provider · model, with the readiness in
+    // brackets when it is anything other than ready. The style used to be here, which told the
+    // operator nothing about which brain this row would ask.
+    sub.textContent = botRowSummary(bot);
     meta.append(strong, sub);
     button.replaceChildren(avatar, meta);
+    button.title = bot.off_machine
+      ? `${bot.describe || ""} — asking this bot sends your prompt off this machine`
+      : (bot.describe || "");
     button.addEventListener("click", () => {
-      state.activeBotId = bot.id;
-      queueCoreSync();
-      render();
+      void selectBot(bot.id);
     });
     els.botList.append(button);
   }
+  renderBotStoreNote();
+}
+
+function botRowSummary(bot) {
+  // `describe` is the store's own sentence. A bot shown before the store has ever answered has
+  // none, and an empty sub-line reads as missing information rather than as "not loaded yet", so
+  // it falls back to the style — which is what this row showed before there was a store.
+  const describe = bot.describe || bot.provider || bot.style || "";
+  // Readiness and the ->net marker are only shown when the store has answered IN THIS SESSION.
+  // From a cache they are last session's answer: a row with no `[needs a key]` bracket reads as
+  // ready, and a stale `->net` (or a missing one) is the worst thing this list can get wrong.
+  if (!botStore.loaded) return describe;
+  const ready = bot.readiness && bot.readiness !== "ready" ? ` [${bot.readiness}]` : "";
+  const net = bot.off_machine ? " ->net" : "";
+  return `${describe}${ready}${net}`;
+}
+
+function renderBotStoreNote() {
+  if (!els.botStoreNote) return;
+  // Three different sentences, in the order that matters to an operator looking at the roster:
+  // this app could not reach or write the store, the store itself refused something, or the
+  // profile names a bot that is not there. An empty note hides the element rather than leaving a
+  // bordered strip with nothing in it.
+  const offline = !botStore.loaded && service.available === false
+    ? "Bots shown from this browser's last copy — start the local GreyIQ service to edit them."
+    : "";
+  const text = botStore.lastError || botStore.error || botStore.note || offline;
+  els.botStoreNote.textContent = text;
+  els.botStoreNote.hidden = !text;
 }
 
 function labelFromIdentifier(value) {
@@ -1772,12 +2387,24 @@ function renderMessageEvidence(article, message) {
 
 function renderEditor() {
   const bot = activeBot();
+  const label = botLabel(bot);
   els.botName.value = bot.name;
   els.botPersona.value = bot.persona;
-  els.botStyle.value = bot.style;
-  els.botTemperature.value = bot.temperature;
-  els.activeBotName.textContent = bot.name;
-  els.activeBotMark.textContent = initials(bot.name);
+  setSelectValue(els.botStyle, bot.style);
+  const temperature = storedTemperature(bot);
+  els.botTemperature.value = temperature === null ? DEFAULT_SAMPLING_TEMPERATURE : temperature;
+  if (els.botTemperatureValue) {
+    // The truth about a field that can be unset: the thumb has to sit somewhere, so the readout
+    // says which of the two states this is.
+    els.botTemperatureValue.textContent = temperature === null
+      ? "provider default"
+      : temperature.toFixed(2);
+  }
+  renderBotProviderOptions(bot);
+  if (els.botModel) els.botModel.value = bot.model || "";
+  renderBotReadiness(bot);
+  els.activeBotName.textContent = label;
+  els.activeBotMark.textContent = initials(label);
   els.activeBotMark.style.background = bot.color;
   els.activeBotMark.style.color = inkOn(bot.color);
   els.swatchRow.replaceChildren();
@@ -1790,13 +2417,151 @@ function renderEditor() {
     button.title = "Bot color";
     button.ariaLabel = "Bot color";
     button.addEventListener("click", () => {
-      bot.color = color;
+      // Presentation only, and the one bot field that never leaves this browser: the store has no
+      // colour because no other surface could draw one. Kept per bot id beside the cache.
+      // `auto` is explicitly dropped rather than spread through — this IS the operator choosing,
+      // and a chosen colour that still claimed to be auto-assigned could be overwritten by a
+      // handover (see migrateBotsOnce).
+      state.botPresentation = {
+        ...(state.botPresentation || {}),
+        [bot.id]: { ...presentationFor(bot.id), color, auto: false }
+      };
       queueCoreSync();
       render();
     });
     els.swatchRow.append(button);
   }
-  if (els.deleteBotButton) els.deleteBotButton.disabled = state.bots.length <= 1;
+  applyEditorAvailability(bot);
+}
+
+function applyEditorAvailability(bot) {
+  // THE ONE PLACE that decides whether each control in this panel is usable, and why. It assigns
+  // every control on every call and reads no control's current state, so it cannot depend on what
+  // ran before it.
+  //
+  // It replaced a split where this function only ever SET `disabled = true` and three controls
+  // were enabled elsewhere: one render with the service down — the ordinary case of opening the
+  // app before the backend is up — left Name, Persona, Style, Variation and both buttons
+  // permanently dead, with the tooltip explaining why cleared on the next render, and nothing but
+  // a reload to recover.
+  const frozen = !botStore.loaded;
+  // With no store there is nothing to save to, so the panel does not take edits it cannot keep.
+  // Accepting them into the cache would show, and persist, a bot the store has never held.
+  const reasons = new Map([
+    [els.botName, ""],
+    [els.botPersona, ""],
+    [els.botStyle, ""],
+    [els.botTemperature, ""],
+    [els.newBotButton, ""],
+    [els.cloneBotButton, ""],
+    // An inert clone's provider is the field that keeps a stranger's agent out of the brain path,
+    // so the store refuses to change it (gn_bots.update). Disabled rather than letting the
+    // operator pick a value that comes back as an error, with the reason on the control itself.
+    [els.botProvider, bot.inert
+      ? `${bot.id} was cloned from a repository and is inert by design: it cannot become a brain.`
+      : ""],
+    // A provider that does not take a model name has nothing to type here.
+    [els.botModel, bot.inert || !["local", "anthropic", "openai"].includes(bot.provider)
+      ? `${bot.provider} takes no model name.` : ""],
+    // A built-in cannot be deleted, for the reason `gn bot rm` gives: the fallback has to exist.
+    [els.deleteBotButton, bot.builtin
+      ? `${bot.id} ships with GreyIQ and cannot be deleted — edit it, or make a new bot.`
+      : (state.bots.length <= 1 ? "This is the only bot." : "")],
+  ]);
+  for (const [control, reason] of reasons) {
+    if (!control) continue;
+    control.disabled = frozen || Boolean(reason);
+    control.title = frozen ? FROZEN_EDITOR_TITLE : reason;
+  }
+}
+
+
+function setSelectValue(select, value) {
+  // A bot's style and provider can be set from the CLI to something this <select> has no option
+  // for (`gn bot set scout style teaching`). Showing the first option instead would misreport the
+  // bot AND overwrite the value on the next keystroke, so the real value is added as an option.
+  if (!select) return;
+  const wanted = String(value || "");
+  if (!wanted && ![...select.options].some((option) => option.value === "")) {
+    // "No style set" is a real state (a bot made by `gn bot new` has none) and it has to be
+    // NAMED: a select showing an empty box reads as a broken control rather than as a bot that
+    // has not been given a voice yet.
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "(not set)";
+    select.prepend(none);
+  }
+  if (wanted && ![...select.options].some((option) => option.value === wanted)) {
+    const option = document.createElement("option");
+    option.value = wanted;
+    option.textContent = wanted;
+    select.append(option);
+  }
+  select.value = wanted;
+}
+
+function renderBotProviderOptions(bot) {
+  if (!els.botProvider) return;
+  const providers = botStore.providers.length > 0 ? botStore.providers : [bot.provider].filter(Boolean);
+  els.botProvider.replaceChildren();
+  for (const provider of providers) {
+    const option = document.createElement("option");
+    option.value = provider;
+    option.textContent = Object.hasOwn(PROVIDER_LABELS, provider)
+      ? PROVIDER_LABELS[provider] : provider;
+    els.botProvider.append(option);
+  }
+  setSelectValue(els.botProvider, bot.provider);
+}
+
+function renderBotReadiness(bot) {
+  if (!els.botReadiness) return;
+  // Every clause here comes from the backend, which can see the files the browser cannot: the key
+  // store for `key_state`, and the app's own coder.local.base_url for the endpoint a `local` bot
+  // will really use (gn_bots.sends_off_machine). The browser must not compute any of it.
+  if (!botStore.loaded || !bot.readiness) {
+    // The store has not answered in this session, so every clause below would be an assertion with
+    // nothing behind it. The gate is `botStore.loaded` and NOT "does this object carry a
+    // readiness" — a cache written by an earlier session carries one, so the field test passed
+    // while the panel confidently said "Ready. Key configured. Stays on this machine." about a
+    // backend that was not running. That is precisely the sentence _bot_payload computes
+    // server-side to prevent.
+    els.botReadiness.textContent = "Start the local GreyIQ service to see whether this bot is "
+      + "ready and where its answers come from.";
+    els.botReadiness.classList.add("is-warn");
+    return;
+  }
+  const parts = [];
+  // The store's own sentence for what making this bot live means, verbatim — the same one
+  // `gn bot use` prints and `gn studio`'s /use shows. Clicking a bot in the roster IS that
+  // operation, so composing an equivalent here would be a third copy of a claim that only has to
+  // be wrong once (gn_bots.what_it_does exists because two of them already disagreed).
+  if (bot.what_it_does) {
+    parts.push(bot.id === state.activeBotId
+      ? `Live: ${bot.what_it_does}.`
+      : `When live: ${bot.what_it_does}.`);
+  }
+  // Only a readiness that means the bot CANNOT do what the sentence above just said is reported as
+  // not ready. `off`, `edits only` and `inert` are postures, not failures — and the sentence has
+  // already described each of them, so "Not ready: edits only" was both redundant and false about
+  // a deterministic coder working exactly as designed. WHICH answers are faults is the store's
+  // judgement (`gn_bots.is_blocked`, carried as `blocked`), not a list kept here: the CLI had this
+  // same bug in its own words, and two copies of one judgement is how they drifted apart.
+  if (bot.readiness === "ready") parts.push("Ready.");
+  else if (bot.blocked) parts.push(`Not ready: ${bot.readiness}.`);
+  if (bot.key_state === "configured") parts.push("Key configured.");
+  if (bot.key_state === "none") parts.push("No key for this provider yet.");
+  if (bot.off_machine) {
+    parts.push(`Asking this bot sends your prompt off this machine${bot.endpoint ? ` (${bot.endpoint})` : ""}.`);
+  } else if (bot.provider !== "off") {
+    // Not said of `off`: nothing is asked of it, so where the asking would go is not a fact about
+    // it, and a reassurance nobody needed reads as one that was computed.
+    parts.push("Stays on this machine.");
+  }
+  if (bot.trained_at) parts.push(`Trained ${bot.train_note || "by a local run"}.`);
+  els.botReadiness.textContent = parts.join(" ");
+  els.botReadiness.classList.toggle("is-warn",
+    Boolean(bot.off_machine) || Boolean(bot.blocked));
 }
 
 const activeChatPolls = new Set();
@@ -1844,7 +2609,7 @@ function renderChat() {
     const dislike = fragment.querySelector(".dislike");
 
     article.classList.add(message.role === "user" ? "is-user" : "is-bot");
-    meta.textContent = message.role === "user" ? "You" : activeBot().name;
+    meta.textContent = message.role === "user" ? "You" : botLabel(activeBot());
     body.textContent = message.text;
     renderMessageEvidence(article, message);
 
@@ -2257,12 +3022,31 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function updateBotFromEditor() {
+function updateBotFromEditor(event) {
   const bot = activeBot();
-  bot.name = els.botName.value.trim() || "GreyIQ";
-  bot.persona = els.botPersona.value.trim() || "A local AI bot that adapts to the user.";
-  bot.style = els.botStyle.value;
-  bot.temperature = Number(els.botTemperature.value);
+  // Applied to the cached record so the panel stays responsive as the operator types, then sent to
+  // the store as one atomic update (queueBotSave). The store's answer is what the next render
+  // reads, so a field it refuses snaps back to what the store actually holds.
+  const fields = {
+    // NOT `|| bot.id`: a bot made with `gn bot new scout` has no display name (label falls back to
+    // the id), and defaulting the empty field to the id meant one keystroke anywhere in the panel
+    // wrote a name the operator never typed. Clearing it stays an explicit, supported choice.
+    name: els.botName.value.trim(),
+    persona: els.botPersona.value.trim(),
+    style: els.botStyle.value
+  };
+  // ONLY when the operator moved the slider. It is the one control here that cannot hold its
+  // field exactly — it has to sit somewhere for a bot whose temperature is unset, and it snaps to
+  // its own step — so sending its position on every keystroke would both turn "the provider's
+  // default" into a number nobody picked and quietly re-quantize a temperature set from the CLI
+  // (0.46 became 0.45 the first time anything else in the panel was typed).
+  if (event?.target?.id === "botTemperature") {
+    fields.temperature = Number(els.botTemperature.value);
+  }
+  if (els.botProvider && !els.botProvider.disabled) fields.provider = els.botProvider.value;
+  if (els.botModel && !els.botModel.disabled) fields.model = els.botModel.value.trim();
+  Object.assign(bot, fields);
+  queueBotSave(fields);
   trainBot(bot);
   queueCoreSync();
   render();
@@ -5412,37 +6196,88 @@ els.clearChatButton.addEventListener("click", () => {
   render();
 });
 
-els.newBotButton.addEventListener("click", () => {
-  const id = `bot-${crypto.randomUUID()}`;
-  const bot = {
-    id,
-    name: "New Bot",
-    color: COLORS[state.bots.length % COLORS.length],
-    style: "direct",
-    temperature: 45,
-    persona: "A local AI bot shaped by the user's ratings, examples, and personal preferences.",
-    corpus: [
-      "Adapt to the user's preferred style and keep the answer useful.",
-      "Ask for less only when a practical assumption would be risky."
-    ],
-    weights: []
-  };
-  state.bots.push(bot);
-  state.activeBotId = id;
-  trainBot(bot);
-  queueCoreSync();
+els.newBotButton.addEventListener("click", async () => {
+  // A bot made here is a bot in the shared store: `gn bot ls` lists it, `gn bot use` can make it
+  // live, and the hunt planner can resolve it. It defaults to the store's own default provider
+  // (the bundled local model — no key, nothing leaves the machine), exactly as `gn bot new` does.
+  // The name is unique-by-number because the store derives the id from it and refuses a duplicate.
+  const taken = new Set(state.bots.map((bot) => bot.id));
+  let name = "New Bot";
+  for (let index = 2; taken.has(botSlug(name)); index += 1) name = `New Bot ${index}`;
+  const payload = await botWrite("/api/bots", {
+    name,
+    persona: "A local AI bot shaped by the user's ratings, examples, and personal preferences."
+  }, { verb: "make a bot" });
+  if (!payload?.bot) return;
+  // Taught rather than written into a field of its own: the two opening instructions are operator
+  // prose, which is what a lesson is, and they ride into chat prompts through system_extra.
+  for (const lesson of ["Adapt to the user's preferred style and keep the answer useful.",
+                        "Ask for less only when a practical assumption would be risky."]) {
+    await botWrite("/api/bots/teach", { bot: payload.bot, lesson }, { verb: "teach a new bot" });
+  }
+  await selectBot(payload.bot);
+  trainBot(activeBot());
   render();
 });
 
-els.deleteBotButton?.addEventListener("click", () => {
+function botSlug(value) {
+  // gn_bots.slugify, in the browser, used only to pick a name the store will accept. The store is
+  // still the authority: it answers with the id it actually assigned.
+  return String(value || "").trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-._]+|[-._]+$/g, "")
+    .slice(0, 32);
+}
+
+els.cloneBotButton?.addEventListener("click", async () => {
+  // `gn bot clone`, from the panel. The copy carries the persona, the style and the lessons — and
+  // NOT the trained stamp, because a copy has not been trained (the store decides that, not this
+  // button). The store also numbers the name if it collides, so this is safe to click twice.
+  const bot = activeBot();
+  const payload = await botWrite("/api/bots/clone", { bot: bot.id }, { verb: "duplicate this bot" });
+  if (!payload?.bot) return;
+  // The copy's own colour, so two bots that are not the same bot do not look like one. NOT "the
+  // first unused colour": the palette has six entries and the store ships six built-ins, each of
+  // which is assigned one on the first listing, so there is never a free one and this did nothing.
+  // The least-used colour that is not the original's is always available.
+  const counts = new Map(COLORS.map((color) => [color, 0]));
+  for (const item of Object.values(state.botPresentation || {})) {
+    if (counts.has(item?.color)) counts.set(item.color, counts.get(item.color) + 1);
+  }
+  const [pick] = [...counts.entries()]
+    .filter(([color]) => color !== bot.color)
+    .sort((left, right) => left[1] - right[1])[0] || [];
+  if (pick) {
+    state.botPresentation = {
+      ...(state.botPresentation || {}),
+      [payload.bot]: { ...presentationFor(payload.bot), color: pick, auto: true }
+    };
+  }
+  await selectBot(payload.bot);
+  trainBot(activeBot());
+  render();
+});
+
+els.deleteBotButton?.addEventListener("click", async () => {
   if (state.bots.length <= 1) return; // always keep at least one personality
   const bot = activeBot();
-  if (!window.confirm(`Delete "${bot.name}"? This removes its chat history and learned memory on this device.`)) return;
+  if (bot.builtin) return;            // the store refuses it too; the button is disabled
+  if (!window.confirm(`Delete "${botLabel(bot)}"? This removes it from the bot store `
+    + `(\`gn bot ls\` too), with its chat history and learned memory on this device.`)) return;
   const removedId = bot.id;
-  state.bots = state.bots.filter((b) => b.id !== removedId);
+  // Drop any edit still sitting in the debounce for THIS bot. Without it, typing a persona and
+  // then deleting the bot posted an update for the id a moment after the delete succeeded, and
+  // painted that 422 under the roster — reading as if the delete had failed.
+  cancelBotSave(removedId);
+  const payload = await botWrite("/api/bots/delete", { bot: removedId }, { verb: "delete this bot" });
+  if (!payload) return;
+  // Only once the store has actually dropped it: a refused delete must not take this browser's
+  // history with it.
   delete state.chats[removedId];
   delete state.memories[removedId];
-  state.activeBotId = state.bots[0].id;
+  if (state.botPresentation) delete state.botPresentation[removedId];
+  if (state.botFit) delete state.botFit[removedId];
   // Best-effort: drop the matching AI core on the backend too (ignore failures).
   if (service.available) {
     void apiFetch("/api/cores/delete", {
@@ -14335,13 +15170,18 @@ async function boot() {
   backend = new AccelerationBackend();
   await backend.setMode(state.backendPreference || "cpu");
 
+  await refreshServiceStatus({ silent: true });
+  // The roster comes from the shared store before anything fits weights to it: the bots that exist
+  // are the store's, their ids are the store's, and this browser's bots (if this is the first load
+  // after the two became one) are handed over here. Only then is there something to fit.
+  await refreshBots({ render: false });
+
   for (const bot of state.bots) {
     if (!bot.trainedAt) {
       trainBot(bot);
     }
   }
 
-  await refreshServiceStatus({ silent: true });
   if (service.available) {
     void syncActiveCore();
   }

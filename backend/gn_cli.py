@@ -102,7 +102,7 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # inside the command function, exactly like the _cmd_* handlers below.
 _VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
                                   "bughunter.wardrive.cli", "hf_agent_clone", "edit_mine",
-                                  "defender.cli")
+                                  "gn_bots", "defender.cli")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -468,19 +468,40 @@ def _reports_dir(*labels: str) -> Path:
 
 
 def _load_coder_config(use_brain: bool) -> dict:
-    """Deterministic by default. With --brain, load the configured brain from the
-    runtime config (merging the perms-restricted secrets store), mirroring the API."""
+    """Deterministic by default. With --brain, the config for the bot the operator picked.
+
+    Two layers, in this order:
+
+      1. ``solin_runtime_config.json``'s ``coder`` block, with the perms-restricted secrets store
+         merged over it — the same config the desktop app writes and the API reads.
+      2. The LIVE BOT (``gn_bots.active``), which says which provider and model that config is
+         actually for.
+
+    Layer 2 is why ``gn bot use claude`` changes the hunt. Without it the ``bot`` setting was
+    display-only: the studio's BRAIN panel named a bot while the planner used whatever the desktop
+    app had last saved — the same shape of defect the ``learning`` switch had, and the reason
+    ``_apply_learning`` exists two functions up.
+
+    A bot that is on-machine-only (``tinygpt``) or off, and any inert clone, resolves to ``{}``:
+    the hunt then runs its bounded offline planner, which is a real posture rather than a failure
+    (``gn bot show`` says so in those words). A bot store that cannot be read leaves layer 1 alone,
+    so an unreadable bots.json costs the operator their SELECTION, never their hunt.
+
+    Both file reads tolerate a non-UTF-8 or absurdly nested file (``ValueError`` covers
+    ``UnicodeDecodeError`` as well as ``JSONDecodeError``), because a config saved by PowerShell's
+    ``Out-File`` is UTF-16 on this platform and a hunt must not die on an encoding.
+    """
     if not use_brain:
         return {}
     try:
         payload = json.loads((RUNTIME_DIR / "solin_runtime_config.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         payload = {}
     coder_cfg = payload.get("coder") if isinstance(payload, dict) else {}
     coder_cfg = dict(coder_cfg) if isinstance(coder_cfg, dict) else {}
     try:
         secrets = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         secrets = {}
     if isinstance(secrets, dict):
         for provider in ("anthropic", "openai", "local"):
@@ -492,7 +513,53 @@ def _load_coder_config(use_brain: bool) -> dict:
                 block["api_key"] = key
             else:
                 coder_cfg[provider] = {"api_key": key}
-    return coder_cfg
+    try:
+        import gn_bots
+
+        bot, note = gn_bots.active(RUNTIME_DIR)
+        overlay = gn_bots.coder_overlay(bot, coder_cfg)
+        _say_which_brain(bot, note, overlay)
+        return overlay
+    except Exception:  # noqa: BLE001 - an unreadable bot store must not cost a hunt its brain
+        return coder_cfg
+
+
+#: True once this process has said which brain a `--brain` run is actually getting.
+_BRAIN_REPORTED = False
+
+
+def _say_which_brain(bot: Any, note: str, overlay: dict) -> None:
+    """One line, when the operator asked for a brain and the live bot is not one.
+
+    ``--brain`` (and ``hunt.brain on``) is a request, and a request that quietly does nothing is
+    the defect this whole wiring exists to fix. ``tinygpt``, ``off``, ``offline`` and an inert
+    clone all resolve to no reasoning brain, which is a real posture — the hunt runs its bounded
+    offline planner — but an operator who typed ``--brain`` and gets it without a word has been
+    told nothing. Printed to stderr so it cannot land in a report or a ``--json`` payload, and at
+    most once per process because the studio runs verbs in-process.
+    """
+    global _BRAIN_REPORTED
+
+    if _BRAIN_REPORTED:
+        return
+    _BRAIN_REPORTED = True
+    if note:
+        print(_c(f"gn: {note}", "33"), file=sys.stderr)
+    # The predicate is "can this answer a free-form prompt", which is exactly what
+    # ``hunt_brain.plan_hunt`` gates on — not "is the overlay empty". The deterministic coder
+    # produces a non-empty config and still cannot plan: ``coder.generate`` refuses it by design.
+    # Falling back to emptiness if ``coder`` will not import keeps this off the stdlib-only path.
+    try:
+        import coder
+
+        has_brain = coder.reasoning_brain_enabled(overlay)
+    except Exception:  # noqa: BLE001
+        has_brain = bool(overlay)
+    if has_brain:
+        return
+    print(_c(f"gn: --brain asked for a reasoning brain and the live bot is {bot.id} "
+             f"({bot.describe()}), so the hunt uses its bounded offline planner. "
+             f"`gn bot use <name>` picks another; `gn bot ls` lists them.", "33"), file=sys.stderr)
 
 
 def _oob_config() -> tuple[str, str]:
@@ -2140,6 +2207,36 @@ def _dash_source(args: argparse.Namespace) -> Any:
                                   token=token, label=str(chosen.get("target") or ""))
 
 
+def _bot_names() -> tuple[str, ...]:
+    """Every bot in the store, for a prompt that offers them. ``()`` if the store will not load."""
+    try:
+        import gn_bots
+
+        return gn_bots.load(RUNTIME_DIR).ids()
+    except Exception:  # noqa: BLE001 - a listing is not worth a traceback
+        return ()
+
+
+def _resolve_bot(name: str) -> tuple[str, str]:
+    """``(the bot's id, "")`` for a name the operator typed, or ``("", the refusal)``.
+
+    The ID, not the text. ``gn_bots.find`` resolves a display name and a unique PREFIX, so storing
+    what was typed put ``bot: anth`` in the profile — a value nothing honours, written by the one
+    path that had just checked the bot existed. Every hunt after that silently ran the offline
+    planner while `gn settings` showed the operator's choice back to them.
+
+    An unreadable store cannot refuse a name, so it accepts what was typed rather than blocking
+    setup on a file the operator may be about to fix.
+    """
+    try:
+        import gn_bots
+
+        bot, why = gn_bots.find(gn_bots.load(RUNTIME_DIR), name)
+    except Exception:  # noqa: BLE001
+        return (str(name or "").strip().lower(), "")
+    return (bot.id, "") if bot is not None else ("", why)
+
+
 def _cmd_setup(args: argparse.Namespace) -> int:
     """`gn setup` — the first-run questions, and the only place a profile gets written from prose.
 
@@ -2182,6 +2279,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         shown = gn_profile.show(current)
         if item.kind == "choice":
             shown = f"{shown}  (one of: {', '.join(item.choices)})"
+        elif item.kind == "bot":
+            shown = f"{shown}  (one of: {', '.join(_bot_names())})"
         elif item.kind == "bool":
             shown = f"{shown}  (on/off)"
         if not interactive:
@@ -2194,6 +2293,14 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             print()
             return _err("setup was interrupted; nothing was written.")
         if typed:
+            if item.kind == "bot":
+                # The shape check in gn_profile cannot tell a bot that exists from one that does
+                # not, and a wizard that accepted "skynet" would write a selection nothing honours.
+                # What is stored is the RESOLVED id, so "anth" becomes "anthropic" here exactly as
+                # it does through `gn bot use`.
+                typed, error = _resolve_bot(typed)
+                if error:
+                    return _err(error + "  (nothing was written)")
             profile, error = gn_profile.set_value(profile, item.key, typed)
             if error:
                 return _err(error + "  (nothing was written)")
@@ -2246,6 +2353,17 @@ def _cmd_settings(args: argparse.Namespace) -> int:
         print(f"{item.key} is back to its default: {gn_profile.show(item.default)}")
         return 0
     if action == "set":
+        if str(args.key or "").strip().lower() == "bot":
+            # The bot store is the authority on which bots exist, so this one setting is written by
+            # ``gn_bots.set_active`` — the single writer — rather than straight into the profile.
+            # It is the same refusal `gn bot use` gives, in the same words, from both doors.
+            import gn_bots
+
+            bot, error = gn_bots.set_active(RUNTIME_DIR, args.value)
+            if bot is None:
+                return _err(error)
+            print(f"bot = {bot.id}   ({bot.describe()})")
+            return 0
         profile, error = gn_profile.set_value(profile, args.key, args.value)
         if error:
             return _err(error)
@@ -3047,8 +3165,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="the threat board in standby — what bare `gn dash` opens; drive it with "
                            "/hunt <url> -y, /attach, /panels, /quit")
     dash.add_argument("--studio", action="store_true",
-                      help="the AGENT STUDIO instead of the board: bot setup, learning, and a chat "
-                           "(same as `gn studio`)")
+                      help="the AGENT STUDIO instead of the board: your bots, what they have "
+                           "learned, and a chat (same as `gn studio`)")
     dash.add_argument("--panels", action="store_true",
                       help="the idle PANEL cockpit instead of the board: TARGETS/FINDINGS/RATE/LOG, "
                            "an OUTPUT pane, and every `gn` verb (this is what `GreyNOC Start` runs)")
@@ -3069,7 +3187,9 @@ def build_parser() -> argparse.ArgumentParser:
     _register_depth_flags(dash)
     dash.set_defaults(func=_cmd_dash)
 
-    studio = sub.add_parser("studio", help="the AGENT STUDIO: your bot's setup, what it has learned, and a chat")
+    studio = sub.add_parser(
+        "studio",
+        help="the AGENT STUDIO: your bots - make, teach, train, pick one, talk to it")
     studio.add_argument("-s", "--scope", default="", help="scope to carry into a view opened from here")
     studio.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     studio.set_defaults(func=_cmd_studio)
