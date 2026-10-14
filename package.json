@@ -1,11 +1,12 @@
 {
   "name": "greyiq",
-  "version": "5.0.5",
+  "version": "5.0.6",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
   "author": "GreyNOC",
   "homepage": "https://github.com/GreyNOC/GreyIQ",
+  "license": "Apache-2.0",
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node server.mjs",
@@ -38,12 +39,22 @@
     },
     "files": [
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "LICENSE",
+      "NOTICE"
     ],
     "extraResources": [
       {
         "from": "dist/greyiq-backend",
         "to": "backend"
+      },
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "NOTICE",
+        "to": "NOTICE"
       }
     ],
     "win": {

@@ -544,9 +544,88 @@
           <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
         </div>
 
-        <!-- SECURITY: bug bounty, agent red-team, pentest toolkit -->
+        <!-- SECURITY: defensive log monitoring, bug bounty, agent red-team, pentest toolkit -->
         <div class="panel-mode" id="panelSecurity" data-mode="security" role="tabpanel" aria-labelledby="pmode-security" tabindex="0" hidden>
-          <p class="mode-intro">Find bugs in authorized targets, red-team GreyIQ's own agent, and look up the right tool for a bug class.</p>
+          <p class="mode-intro">Monitor local logs for defensive signals, find bugs in authorized targets, and test GreyIQ's own agent.</p>
+
+          <details class="mode-fold" id="defenseMonitorFold" open>
+            <summary><span>Defense · Log monitoring</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <div class="choice-form defense-monitor">
+              <p class="folder-status">Point GreyIQ at a log file, SQL database, MongoDB collection, or Elasticsearch index. Monitoring continues while the local engine is running. Use read-only source credentials.</p>
+              <form class="choice-form" id="defenseSourceForm">
+                <label>
+                  <span>Source type</span>
+                  <select id="defenseSourceKind" name="kind">
+                    <option value="file">Log file</option>
+                    <option value="database">SQL database</option>
+                    <option value="mongodb">MongoDB collection</option>
+                    <option value="elasticsearch">Elasticsearch index</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Source name</span>
+                  <input id="defenseSourceName" name="name" type="text" maxlength="80" autocomplete="off" required placeholder="e.g. Web server access log">
+                </label>
+                <label data-defense-kind="file">
+                  <span>Absolute log file path</span>
+                  <input id="defenseSourcePath" name="path" type="text" autocomplete="off" spellcheck="false" placeholder="C:\logs\access.log or /var/log/app.log">
+                </label>
+                <div class="defense-db-fields" data-defense-kind="database" hidden>
+                  <label>
+                    <span id="defenseUrlLabel">Database URL</span>
+                    <input id="defenseSourceUrl" name="url" type="password" autocomplete="off" spellcheck="false" placeholder="sqlite:///… or postgresql+psycopg://…">
+                  </label>
+                  <p class="folder-status" id="defenseUrlHint">SQLAlchemy-compatible URL: sqlite:///…, postgresql+psycopg://…, or mysql+pymysql://…. The matching database driver must be installed.</p>
+                  <label id="defenseApiKeyRow" hidden>
+                    <span>Elasticsearch API key (optional)</span>
+                    <input id="defenseApiKey" name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="API key">
+                  </label>
+                  <label>
+                    <span id="defenseTableLabel">Table</span>
+                    <input id="defenseSourceTable" name="table" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="logs">
+                  </label>
+                  <label>
+                    <span id="defenseCursorLabel">Cursor column</span>
+                    <input id="defenseCursorColumn" name="cursor_column" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="id">
+                  </label>
+                  <p class="folder-status" id="defenseCursorHint">Choose a unique, increasing column for each new log row, usually a primary-key integer ID.</p>
+                  <label>
+                    <span id="defenseMessageLabel">Message column</span>
+                    <input id="defenseMessageColumn" name="message_column" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="message">
+                  </label>
+                  <label>
+                    <span id="defenseSeverityLabel">Severity column (optional)</span>
+                    <input id="defenseSeverityColumn" name="severity_column" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="level">
+                  </label>
+                </div>
+                <label class="bounty-auth" for="defenseBackfill">
+                  <input id="defenseBackfill" name="backfill" type="checkbox">
+                  <span>Include existing entries when this source is added. Off watches new entries only.</span>
+                </label>
+                <label class="bounty-auth" for="defenseAuthorized">
+                  <input id="defenseAuthorized" name="authorized" type="checkbox" required>
+                  <span>I confirm I am authorized to read this log source.</span>
+                </label>
+                <div class="folder-actions">
+                  <button class="text-button" type="submit" id="defenseSourceAdd">Add and monitor</button>
+                </div>
+              </form>
+              <p class="folder-status" id="defenseMonitorStatus" role="status" aria-live="polite"></p>
+              <div class="ops-section-heading">
+                <div><span class="eyebrow">Sources</span><strong>Monitoring status</strong></div>
+                <button class="text-button" type="button" id="defenseRefresh">Refresh</button>
+              </div>
+              <div class="defense-source-list" id="defenseSourceList" aria-live="polite">
+                <p class="ops-empty">No log sources configured.</p>
+              </div>
+              <div class="ops-section-heading">
+                <div><span class="eyebrow">Signals</span><strong>Recent alerts</strong></div>
+              </div>
+              <div class="defense-alert-list" id="defenseAlertList" aria-live="polite">
+                <p class="ops-empty">Alerts from monitored logs will appear here.</p>
+              </div>
+            </div>
+          </details>
 
           <details class="mode-fold" open>
             <summary><span>Bug bounty hunt</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>

@@ -2,12 +2,16 @@
 # `scripts/install-cli.sh --extras` into the checkout's `.venv`.
 #
 # The CLI boot path is stdlib-only, so nothing here is required to run `gn` —
-# each line unlocks one engine capability that degrades silently without it:
+# each line unlocks an engine capability:
 #
 #   PyYAML       YAML OpenAPI/Swagger specs during recon (api_discovery_service
 #                skips /openapi.yaml and still handles every JSON spec without it)
 #   cryptography RS256 signing that proves a leaked GCP service-account key is
 #                live (AWS key liveness uses stdlib hmac and needs no dependency)
+#   SQLAlchemy   read-only relational log sources
+#   SQL drivers  PostgreSQL, MySQL/MariaDB, Oracle, and SQL Server connections
+#   pymongo      read-only MongoDB log sources
+#   elasticsearch read-only Elasticsearch log sources
 #
 # Deliberately NOT here: torch (the CLI is torch-free by design — see
 # backend/test_boot_no_torch.py), and the desktop/report stack (playwright,
@@ -18,3 +22,10 @@
 # than the frozen release build audits.
 PyYAML>=6.0,<7.0
 cryptography>=50.0,<51.0
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0
+PyMySQL>=1.1,<2.0
+oracledb>=3.0,<4.0
+pyodbc>=5.0,<6.0; platform_system == 'Windows'
+pymongo>=4.9,<5.0
+elasticsearch>=8.12,<9.0

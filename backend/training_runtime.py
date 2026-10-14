@@ -30,9 +30,8 @@ SOURCE_TEXT_FILES = {
     "src_preferred_examples": ["greyiq_preferred_examples.txt", "greyiq_verified_replay.txt"],
     "src_local_notes": ["greyiq_local_notes.txt"],
     "src_imported_docs": ["greyiq_imported_docs.txt"],
-    # The bundled manual/PDF extract ensure_runtime already copies into data/. It is the largest
-    # corpus that ships (~6.3 MB) and had no source id, so no Studio-initiated run could select it —
-    # the one thing a bigger model most needs was unreachable from the UI that asks you to pick sources.
+    # Keep the source id for a manual extract already in runtime data/, including files
+    # retained from an earlier installation. New document imports use src_imported_docs.
     "src_manuals": ["greyiq_manual_pdfs.txt"],
 }
 GENERATED_TEXT_FILES = {

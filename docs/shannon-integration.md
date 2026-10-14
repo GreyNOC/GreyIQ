@@ -48,9 +48,9 @@ it; `--json` emits the finding dicts. Verified against Shannon's real
 `benchmark/photoview-opus-5.sarif`: 24 candidates, correct abstentions, no `rce` inflation.
 
 `backend/bughunter/shannon/` is first-party code that talks to Shannon across a process
-boundary. **No Shannon file is vendored.** Shannon is AGPL-3.0 and GreyIQ's `package.json`
-declares no license, so vendoring would either relicense GreyIQ or misrepresent both. The
-clone lives outside the repo; point `GREYIQ_SHANNON_DIR` at it.
+boundary. **No Shannon file is vendored.** Shannon is AGPL-3.0 while GreyIQ's
+original source is Apache-2.0; the clone lives outside the repo so its
+license remains separate. Point `GREYIQ_SHANNON_DIR` at it.
 
 ## The output split (load-bearing)
 
@@ -349,8 +349,9 @@ on Windows; credential-bearing output there is protected only by the user-profil
 
 ## Rejected
 
-- **Vendoring Shannon into `backend/`.** AGPL-3.0 into an unlicensed tree. The arm's-length
-  subprocess is both the correct architecture and the only license-safe one.
+- **Vendoring Shannon into `backend/`.** This would place AGPL-3.0 material
+  inside GreyIQ's Apache-2.0 source distribution. Keep the separate process
+  integration and review any proposed distribution change on its own terms.
 - **Importing `report.json`'s `exploitation_steps` / `proof_of_impact` as GreyIQ evidence.**
   It is the single largest exposure in the output — raw HTTP transcripts, cookies, bearer
   headers, exfiltrated rows, password hashes — and Shannon's redaction rule explicitly keeps

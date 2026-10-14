@@ -14,5 +14,5 @@ fi
 
 chmod +x "$launcher"
 mkdir -p "$root/release"
-tar -czf "$archive" -C "$root/build/portable-cli" greyiq-cli INSTALL.txt -C "$root/dist" greyiq-backend
+tar -czf "$archive" -C "$root" LICENSE NOTICE -C "$root/build/portable-cli" greyiq-cli INSTALL.txt -C "$root/dist" greyiq-backend
 printf 'CLI tarball: %s (%s)\n' "$archive" "$(du -h "$archive" | cut -f1)"

@@ -95,6 +95,11 @@ MAX_REQUEST_BYTES = int(os.getenv("GREYIQ_MAX_REQUEST_BYTES", str(16 * 1024 * 10
 SESSION_TOKEN = secrets.token_urlsafe(32)
 SESSION_TOKEN_PLACEHOLDER = "__GREYIQ_SESSION_TOKEN__"
 SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
+# Unlike SESSION_TOKEN, this key is never embedded in HTML or returned by an
+# API route. It authenticates the headless CLI's loopback peer before the CLI
+# sends either its session token or an optional access key.
+DEFENSE_IDENTITY_SECRET = secrets.token_urlsafe(32)
+DEFENSE_IDENTITY_PATH = RUNTIME_DIR / "defense.identity"
 
 # Optional operator-configured shared secret for deployments reachable beyond
 # 127.0.0.1/localhost (e.g. behind a reverse proxy on a public domain — see
@@ -173,6 +178,14 @@ def _write_session_token() -> None:
     try:
         _atomic_write(SESSION_TOKEN_PATH, SESSION_TOKEN, private=True)
     except OSError:
+        pass
+
+
+def _write_defense_identity_secret() -> None:
+    try:
+        _atomic_write(DEFENSE_IDENTITY_PATH, DEFENSE_IDENTITY_SECRET, private=True)
+    except OSError:
+        # A CLI that cannot read this file will fail closed and never attach.
         pass
 
 
@@ -403,6 +416,9 @@ from bughunter.chat_commands import (  # noqa: E402
 # nothing heavier than re/difflib/math/pathlib.
 import solin_domain  # noqa: E402
 from mcp_servers import MCPServerManager  # noqa: E402
+from defense_log_monitor import DefenseLogMonitor, defense_credentials_path  # noqa: E402
+from defense_monitor_lease import MonitorLeaseBusy  # noqa: E402
+DEFENSE_CREDENTIALS_PATH = defense_credentials_path(RUNTIME_DIR)
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, owasp_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
@@ -479,9 +495,6 @@ SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
     "greyiq_coding_knowledge.txt",
     "greyiq_bug_bounty_knowledge.txt",
-    # Native-text extract of the Manual_pdfs library, bundled so the local model
-    # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
-    "greyiq_manual_pdfs.txt",
 )
 TRAINING_SOURCE_FILES = {
     "src_starter_knowledge": "greyiq_starter_knowledge.txt",
@@ -492,7 +505,8 @@ TRAINING_SOURCE_FILES = {
     "src_local_notes": "greyiq_local_notes.txt",
     "src_imported_docs": "greyiq_imported_docs.txt",
     # Mirrors training_runtime.SOURCE_TEXT_FILES — normalize_source_ids allowlists against this dict,
-    # so an id missing here is silently dropped from every request.
+    # so an id missing here is silently dropped from every request. Preserve the manuals id
+    # for existing runtime data; no manual corpus is copied from the seed directory.
     "src_manuals": "greyiq_manual_pdfs.txt",
 }
 
@@ -1614,6 +1628,11 @@ class GreyIQRuntime:
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self.mcp_servers = MCPServerManager(RUNTIME_DIR / "mcp_servers.json")
+        # Importing this module also happens in short-lived tools and tests. Start
+        # collection only when the ASGI application enters its lifespan, so an
+        # import alone never leaves a worker holding the runtime's file lease.
+        self.defense_monitor = DefenseLogMonitor(
+            RUNTIME_DIR, credentials_path=DEFENSE_CREDENTIALS_PATH, autostart=False)
         self._rewrite_core_defaults()
         self._ensure_bughunter_core()
         # The operator's researcher UA marker is install-wide, so it must be live BEFORE the first
@@ -6069,6 +6088,7 @@ def ensure_runtime() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     (RUNTIME_DIR / "data").mkdir(parents=True, exist_ok=True)
     _write_session_token()
+    _write_defense_identity_secret()
     _migrate_coder_secrets()
     _migrate_code_router_secret()
     for name in SEED_FILES:
@@ -7194,6 +7214,41 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await send_empty(send)
         return
 
+    # The headless CLI must identify a same-runtime listener before disclosing
+    # either its session token or GREYIQ_ACCESS_KEY. This challenge is the only
+    # pre-auth API route besides health. It reveals a nonce HMAC, not the token.
+    # Bind the proof to ASGI's actual local socket address, never the Host header
+    # or a caller-supplied port, so another loopback listener cannot relay it.
+    if path == "/api/internal/defense-identity":
+        client = scope.get("client")
+        server = scope.get("server")
+        if (method != "GET" or _header(scope, "origin") or
+                not isinstance(client, (tuple, list)) or not client or
+                str(client[0]) != "127.0.0.1" or
+                not isinstance(server, (tuple, list)) or len(server) < 2 or
+                str(server[0]) != "127.0.0.1" or
+                isinstance(server[1], bool) or not isinstance(server[1], int) or
+                not 1 <= server[1] <= 65535):
+            await send_json(send, {"error": "not found"}, 404)
+            return
+        raw_query = scope.get("query_string", b"")
+        if not isinstance(raw_query, bytes) or len(raw_query) != 70:
+            await send_json(send, {"error": "invalid challenge"}, 400)
+            return
+        try:
+            query = raw_query.decode("ascii")
+        except UnicodeError:
+            await send_json(send, {"error": "invalid challenge"}, 400)
+            return
+        nonce = query[6:] if query.startswith("nonce=") else ""
+        if not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            await send_json(send, {"error": "invalid challenge"}, 400)
+            return
+        message = f"GreyIQ defense identity v1\n127.0.0.1:{server[1]}\n{nonce}".encode("ascii")
+        proof = hmac.new(DEFENSE_IDENTITY_SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
+        await send_json(send, {"version": 1, "proof": proof})
+        return
+
     # Access-key gate runs before EVERYTHING else, including the unauthenticated index
     # page and static-file fallback that embed/precede SESSION_TOKEN — a no-op when
     # GREYIQ_ACCESS_KEY isn't set (the default local/Electron case).
@@ -7703,6 +7758,56 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
                 return
             await send_json(send, {"error": "method not allowed"}, 405)
             return
+        if path == "/api/defense/status":
+            if method != "GET":
+                await send_json(send, {"error": "method not allowed"}, 405)
+                return
+            await send_json(send, await asyncio.to_thread(runtime.defense_monitor.status))
+            return
+        if path == "/api/defense/sources":
+            if method != "POST":
+                await send_json(send, {"error": "method not allowed"}, 405)
+                return
+            body = await read_json_body(receive)
+            try:
+                result = await asyncio.to_thread(runtime.defense_monitor.add_source, body)
+            except MonitorLeaseBusy as exc:
+                raise HTTPError(409, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPError(422, str(exc)) from exc
+            await send_json(send, result)
+            return
+        if path.startswith("/api/defense/sources/"):
+            tail = unquote(path[len("/api/defense/sources/"):])
+            parts = tail.split("/")
+            if not parts[0] or len(parts) > 2 or any(not part for part in parts):
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            source_id = parts[0]
+            if len(parts) == 1 and method == "DELETE":
+                try:
+                    result = await asyncio.to_thread(runtime.defense_monitor.remove_source, source_id)
+                except MonitorLeaseBusy as exc:
+                    raise HTTPError(409, str(exc)) from exc
+                except ValueError as exc:
+                    raise HTTPError(404, "Unknown log source.") from exc
+                await send_json(send, result)
+                return
+            if len(parts) == 2 and method == "POST" and parts[1] in {"start", "stop"}:
+                try:
+                    result = await asyncio.to_thread(
+                        runtime.defense_monitor.set_enabled, source_id, parts[1] == "start")
+                except MonitorLeaseBusy as exc:
+                    raise HTTPError(409, str(exc)) from exc
+                except ValueError as exc:
+                    raise HTTPError(404, "Unknown log source.") from exc
+                await send_json(send, result)
+                return
+            if len(parts) == 2 and parts[1] not in {"start", "stop"}:
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
         if path == "/api/mcp/servers":
             if method == "GET":
                 await send_json(send, await asyncio.to_thread(runtime.mcp_servers.list_servers))
@@ -7855,8 +7960,10 @@ async def route_lifespan(receive: Any, send: Any) -> None:
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
+            await asyncio.to_thread(runtime.defense_monitor.start)
             await send({"type": "lifespan.startup.complete"})
         elif message["type"] == "lifespan.shutdown":
+            await asyncio.to_thread(runtime.defense_monitor.close)
             await send({"type": "lifespan.shutdown.complete"})
             return
 

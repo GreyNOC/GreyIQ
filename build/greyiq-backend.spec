@@ -149,6 +149,25 @@ hiddenimports += collect_submodules("bughunter")
 # The defender verb imports its collectors, rules, and journal only when run.
 # Keep the entire stdlib-only package in the frozen CLI as well as source installs.
 hiddenimports += collect_submodules("defender")
+
+# The separate defense log-monitor modules are also imported on demand.
+hiddenimports += ["defense_cli", "defense_log_monitor", "defense_elasticsearch", "defense_monitor_lease"]
+# Defense log monitoring selects SQLAlchemy dialects from the operator's database URL.
+# PyInstaller cannot infer those dynamic imports from the source code. Bundle the
+# installed dialects and DBAPI drivers so a packaged app behaves like a source run.
+if importlib.util.find_spec("sqlalchemy") is not None:
+    sa_datas, sa_binaries, sa_hidden = collect_all("sqlalchemy")
+    datas += sa_datas
+    binaries += sa_binaries
+    hiddenimports += sa_hidden
+    hiddenimports += collect_submodules("sqlalchemy.dialects")
+for dbapi_package in ("psycopg", "psycopg_binary", "pymysql", "oracledb", "pyodbc",
+                      "pymongo", "bson", "elasticsearch", "elastic_transport"):
+    if importlib.util.find_spec(dbapi_package) is not None:
+        db_datas, db_binaries, db_hidden = collect_all(dbapi_package)
+        datas += db_datas
+        binaries += db_binaries
+        hiddenimports += db_hidden
 # Bundle the MCP SDK modules GreyIQ uses. collect_all("mcp") also imports the
 # optional mcp.cli package, whose Typer extra is intentionally not installed
 # and aborts PyInstaller's isolated module scan.

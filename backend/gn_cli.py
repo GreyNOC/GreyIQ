@@ -1,4 +1,4 @@
-"""GreyIQ ``gn`` — drive the bug-bounty engine from the terminal.
+"""GreyIQ ``gn`` — run security and intelligence workflows from the terminal.
 
 Short, scriptable commands over the same engine the desktop app uses:
 
@@ -102,7 +102,7 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # inside the command function, exactly like the _cmd_* handlers below.
 _VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
                                   "bughunter.wardrive.cli", "hf_agent_clone", "edit_mine",
-                                  "gn_bots", "defender.cli")
+                                  "gn_bots", "defender.cli", "defense_cli")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -2860,7 +2860,7 @@ def _cmd_path(_args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gn",
-        description="GreyIQ bug-bounty CLI — hunt, scan, and prove findings from the terminal.",
+        description="GreyIQ security CLI — monitor logs, hunt, scan, and prove findings from the terminal.",
     )
     parser.add_argument("-V", "--version", action="version", version=f"GreyIQ gn {VERSION}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")

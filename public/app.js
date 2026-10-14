@@ -94,8 +94,8 @@ const TRAINING_SOURCES = [
   },
   {
     id: "src_manuals",
-    name: "Bundled Manuals",
-    description: "The shipped manual/PDF extract — the largest corpus available (~6 MB)."
+    name: "Existing Manual Text",
+    description: "Manual text already stored locally by an earlier version, if present. New imports appear under Imported Documents."
   }
 ];
 
@@ -396,6 +396,31 @@ const els = {
   redteamReport: document.querySelector("#redteamReport"),
   redteamReportActions: document.querySelector("#redteamReportActions"),
   redteamCopyReport: document.querySelector("#redteamCopyReport"),
+  defenseSourceForm: document.querySelector("#defenseSourceForm"),
+  defenseSourceKind: document.querySelector("#defenseSourceKind"),
+  defenseSourceName: document.querySelector("#defenseSourceName"),
+  defenseSourcePath: document.querySelector("#defenseSourcePath"),
+  defenseSourceUrl: document.querySelector("#defenseSourceUrl"),
+  defenseUrlLabel: document.querySelector("#defenseUrlLabel"),
+  defenseUrlHint: document.querySelector("#defenseUrlHint"),
+  defenseApiKeyRow: document.querySelector("#defenseApiKeyRow"),
+  defenseApiKey: document.querySelector("#defenseApiKey"),
+  defenseSourceTable: document.querySelector("#defenseSourceTable"),
+  defenseTableLabel: document.querySelector("#defenseTableLabel"),
+  defenseCursorColumn: document.querySelector("#defenseCursorColumn"),
+  defenseCursorLabel: document.querySelector("#defenseCursorLabel"),
+  defenseCursorHint: document.querySelector("#defenseCursorHint"),
+  defenseMessageColumn: document.querySelector("#defenseMessageColumn"),
+  defenseMessageLabel: document.querySelector("#defenseMessageLabel"),
+  defenseSeverityColumn: document.querySelector("#defenseSeverityColumn"),
+  defenseSeverityLabel: document.querySelector("#defenseSeverityLabel"),
+  defenseBackfill: document.querySelector("#defenseBackfill"),
+  defenseAuthorized: document.querySelector("#defenseAuthorized"),
+  defenseSourceAdd: document.querySelector("#defenseSourceAdd"),
+  defenseMonitorStatus: document.querySelector("#defenseMonitorStatus"),
+  defenseRefresh: document.querySelector("#defenseRefresh"),
+  defenseSourceList: document.querySelector("#defenseSourceList"),
+  defenseAlertList: document.querySelector("#defenseAlertList"),
   toolkitForm: document.querySelector("#toolkitForm"),
   toolkitCategory: document.querySelector("#toolkitCategory"),
   toolkitClass: document.querySelector("#toolkitClass"),
@@ -4501,7 +4526,7 @@ const PANEL_MODE_LABELS = {
   brain: { eyebrow: "Setup", title: "Coding Brain" },
   ops: { eyebrow: "Live system", title: "Brain Operations" },
   train: { eyebrow: "Local model", title: "Training" },
-  security: { eyebrow: "Offense", title: "Security" }
+  security: { eyebrow: "Defense and offense", title: "Security" }
 };
 
 function setPanelMode(mode, focusTab = false) {
@@ -4525,7 +4550,12 @@ function setPanelMode(mode, focusTab = false) {
   // and self-gate on the local service. (Re)load them whenever the panel is shown
   // and they're still empty — otherwise a backend that comes up after boot leaves
   // the dropdowns blank with no retry.
-  if (mode === "security") ensureSecurityData();
+  if (mode === "security") {
+    ensureSecurityData();
+    startDefensePolling();
+  } else {
+    stopDefensePolling();
+  }
   if (mode === "ops") void loadBrainOpsStatus();
   if (mode === "train") ensureTrainData();
 }
@@ -4549,6 +4579,324 @@ function ensureSecurityData() {
   if (els.bountyProfile && !bountyProfilesData.length) void loadBountyProfiles();
   if (els.toolkitForm && !toolkitData.tools.length) void loadToolkit();
 }
+
+// ---- Defense: local log sources and recent signals ----
+// The backend owns ingestion and durable cursors. The renderer only configures sources
+// and polls a bounded status view while the Security panel is active. Never persist a
+// database URL in app state or render it back into the DOM after submit.
+let defensePollTimer = null;
+let defenseRefreshPending = false;
+let defenseSourceSignature = "";
+let defenseAlertSignature = "";
+let lastDefenseKind = null;
+const DEFENSE_SOURCE_SETTINGS = {
+  database: {
+    label: "SQL database", urlLabel: "Database URL",
+    urlHint: "SQLAlchemy-compatible URL: sqlite:///…, postgresql+psycopg://…, or mysql+pymysql://…. The matching database driver must be installed.",
+    urlPlaceholder: "sqlite:///… or postgresql+psycopg://…",
+    tableLabel: "Table", tablePlaceholder: "logs", defaultTable: "logs",
+    cursorLabel: "Cursor column", cursorPlaceholder: "id", defaultCursor: "id",
+    cursorHint: "Choose a unique, increasing column for each new log row, usually a primary-key integer ID.",
+    messageLabel: "Message column", severityLabel: "Severity column (optional)",
+  },
+  mongodb: {
+    label: "MongoDB", urlLabel: "MongoDB URI",
+    urlHint: "Include the database name in the URI, for example mongodb://127.0.0.1:27017/logs. Use a read-only account.",
+    urlPlaceholder: "mongodb://127.0.0.1:27017/logs",
+    tableLabel: "Collection", tablePlaceholder: "logs", defaultTable: "logs",
+    cursorLabel: "Cursor field", cursorPlaceholder: "_id", defaultCursor: "_id",
+    cursorHint: "Use a unique, increasing field. MongoDB ObjectId _id is the usual choice; a custom field needs a single-field unique ascending index.",
+    messageLabel: "Message field", severityLabel: "Severity field (optional)",
+  },
+  elasticsearch: {
+    label: "Elasticsearch", urlLabel: "Elasticsearch URL",
+    urlHint: "For example https://search.example.com:9200. Use read-only credentials; the index is entered below.",
+    urlPlaceholder: "https://search.example.com:9200",
+    tableLabel: "Index", tablePlaceholder: "logs", defaultTable: "logs",
+    cursorLabel: "Cursor field", cursorPlaceholder: "event.sequence", defaultCursor: "",
+    cursorHint: "Choose a unique, increasing field across the index, such as event.sequence. A timestamp alone can tie and skip events.",
+    messageLabel: "Message field", severityLabel: "Severity field (optional)",
+  },
+};
+
+function selectedDefenseKind() {
+  const kind = els.defenseSourceKind?.value || "file";
+  return kind === "file" || Object.hasOwn(DEFENSE_SOURCE_SETTINGS, kind) ? kind : "file";
+}
+
+function defenseElement(tag, className, value) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (value !== undefined) node.textContent = String(value);
+  return node;
+}
+
+function updateDefenseSourceKind() {
+  const kind = selectedDefenseKind();
+  if (lastDefenseKind !== null && kind !== lastDefenseKind) {
+    // Avoid carrying a credential or SQL field mapping into another connector.
+    for (const input of [els.defenseSourceUrl, els.defenseApiKey, els.defenseSourceTable, els.defenseCursorColumn,
+      els.defenseMessageColumn, els.defenseSeverityColumn]) {
+      if (input) input.value = "";
+    }
+  }
+  lastDefenseKind = kind;
+  for (const field of document.querySelectorAll("[data-defense-kind]")) {
+    field.hidden = field.dataset.defenseKind === "file" ? kind !== "file" : kind === "file";
+  }
+  const settings = DEFENSE_SOURCE_SETTINGS[kind];
+  if (settings) {
+    for (const [element, value] of [
+      [els.defenseUrlLabel, settings.urlLabel], [els.defenseUrlHint, settings.urlHint],
+      [els.defenseTableLabel, settings.tableLabel], [els.defenseCursorLabel, settings.cursorLabel],
+      [els.defenseCursorHint, settings.cursorHint], [els.defenseMessageLabel, settings.messageLabel],
+      [els.defenseSeverityLabel, settings.severityLabel],
+    ]) {
+      if (element) element.textContent = value;
+    }
+    if (els.defenseSourceUrl) els.defenseSourceUrl.placeholder = settings.urlPlaceholder;
+    if (els.defenseSourceTable) els.defenseSourceTable.placeholder = settings.tablePlaceholder;
+    if (els.defenseCursorColumn) els.defenseCursorColumn.placeholder = settings.cursorPlaceholder;
+  }
+  if (els.defenseSourcePath) els.defenseSourcePath.required = kind === "file";
+  if (els.defenseSourceUrl) els.defenseSourceUrl.required = kind !== "file";
+  if (els.defenseCursorColumn) els.defenseCursorColumn.required = kind === "elasticsearch";
+  if (els.defenseApiKeyRow) els.defenseApiKeyRow.hidden = kind !== "elasticsearch";
+}
+
+function defenseTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value).slice(0, 40) : date.toLocaleString();
+}
+
+function defenseStatusText(message) {
+  if (els.defenseMonitorStatus) els.defenseMonitorStatus.textContent = message;
+}
+
+function clearDefenseSecrets() {
+  if (els.defenseSourceUrl) els.defenseSourceUrl.value = "";
+  if (els.defenseApiKey) els.defenseApiKey.value = "";
+}
+
+function renderDefenseSources(rawSources) {
+  if (!els.defenseSourceList) return;
+  const sources = (Array.isArray(rawSources) ? rawSources : []).map((source) => ({
+    id: String(source?.id ?? ""),
+    name: String(source?.name || "Unnamed source").slice(0, 120),
+    kind: ["database", "mongodb", "elasticsearch"].includes(source?.kind) ? source.kind : "file",
+    enabled: Boolean(source?.enabled),
+    state: String(source?.state || source?.status || "").slice(0, 40),
+    error: String(source?.error || "").slice(0, 500),
+    display_target: String(source?.display_target || source?.location || "").slice(0, 240),
+    watch_mode: String(source?.watch_mode || (source?.backfill ? "backfill then new events" : "new events only")).slice(0, 80),
+    events_seen: Number(source?.events_seen) || 0,
+    last_checked_at: source?.last_checked_at || "",
+  }));
+  const signature = JSON.stringify(sources);
+  if (signature === defenseSourceSignature) return;
+  defenseSourceSignature = signature;
+  const active = document.activeElement;
+  const focusedSourceId = active && els.defenseSourceList.contains(active)
+    ? active.dataset?.defenseSourceId : "";
+  const focusedAction = focusedSourceId ? active.dataset.defenseAction : "";
+  if (!sources.length) {
+    els.defenseSourceList.replaceChildren(defenseElement("p", "ops-empty", "No log sources configured."));
+    if (focusedSourceId) els.defenseRefresh?.focus({ preventScroll: true });
+    return;
+  }
+  const cards = sources.map((source) => {
+    const card = defenseElement("article", "defense-source-card");
+    const heading = defenseElement("div", "defense-card-heading");
+    heading.append(defenseElement("strong", "", source.name));
+    const state = source.state || (source.enabled ? "running" : "stopped");
+    const normalizedState = state.toLowerCase();
+    heading.append(defenseElement("span", `defense-state${["running", "monitoring"].includes(normalizedState) ? " is-running" : normalizedState === "error" ? " is-error" : ""}`, state));
+    card.append(heading);
+    // A connection URL can contain credentials. Show only a backend display label,
+    // and decline strings that still look like a full URL or credential authority.
+    if (source.display_target && !source.display_target.includes("://") && !source.display_target.includes("@")) {
+      card.append(defenseElement("p", "defense-source-location", source.display_target));
+    }
+    card.append(defenseElement("p", "defense-source-meta", `${DEFENSE_SOURCE_SETTINGS[source.kind]?.label || "File"} · ${source.watch_mode} · ${source.events_seen} events seen${source.last_checked_at ? ` · checked ${defenseTime(source.last_checked_at)}` : ""}`));
+    if (source.error) card.append(defenseElement("p", "defense-source-error", source.error));
+    const actions = defenseElement("div", "defense-source-actions");
+    for (const [action, label] of [[source.enabled ? "stop" : "start", source.enabled ? "Pause" : "Start"], ["delete", "Remove"]]) {
+      const button = defenseElement("button", `text-button${action === "delete" ? " danger" : ""}`, label);
+      button.type = "button";
+      button.dataset.defenseAction = action;
+      button.dataset.defenseSourceId = source.id;
+      actions.append(button);
+    }
+    card.append(actions);
+    return card;
+  });
+  els.defenseSourceList.replaceChildren(...cards);
+  if (focusedSourceId) {
+    const buttons = [...els.defenseSourceList.querySelectorAll("button[data-defense-action]")];
+    const replacement = buttons.find((button) => button.dataset.defenseSourceId === focusedSourceId
+      && button.dataset.defenseAction === focusedAction)
+      || buttons.find((button) => button.dataset.defenseSourceId === focusedSourceId)
+      || els.defenseRefresh;
+    replacement?.focus({ preventScroll: true });
+  }
+}
+
+function renderDefenseAlerts(rawAlerts) {
+  if (!els.defenseAlertList) return;
+  const alerts = (Array.isArray(rawAlerts) ? rawAlerts : []).slice(0, 50).map((alert) => ({
+    id: String(alert?.id ?? ""),
+    source_name: String(alert?.source_name || "Log source").slice(0, 120),
+    severity: String(alert?.severity || "info").toLowerCase().slice(0, 30),
+    title: String(alert?.title || "").slice(0, 240),
+    message: String(alert?.message || "").slice(0, 1200),
+    timestamp: alert?.timestamp || alert?.created_at || "",
+  }));
+  const signature = JSON.stringify(alerts);
+  if (signature === defenseAlertSignature) return;
+  defenseAlertSignature = signature;
+  if (!alerts.length) {
+    els.defenseAlertList.replaceChildren(defenseElement("p", "ops-empty", "No alerts yet. New log entries will be evaluated as they arrive."));
+    return;
+  }
+  const cards = alerts.map((alert) => {
+    const card = defenseElement("article", "defense-alert-card");
+    const heading = defenseElement("div", "defense-card-heading");
+    const severity = ["critical", "high", "medium", "low", "info"].includes(alert.severity) ? alert.severity : "info";
+    heading.append(defenseElement("span", `defense-alert-severity is-${severity}`, severity));
+    heading.append(defenseElement("span", "defense-alert-time", defenseTime(alert.timestamp)));
+    card.append(heading);
+    if (alert.title) card.append(defenseElement("strong", "defense-alert-title", alert.title));
+    if (alert.message && alert.message !== alert.title) card.append(defenseElement("p", "defense-alert-message", alert.message));
+    card.append(defenseElement("p", "defense-source-meta", alert.source_name));
+    return card;
+  });
+  els.defenseAlertList.replaceChildren(...cards);
+}
+
+async function refreshDefenseStatus({ clearMessage = true } = {}) {
+  if (!els.defenseSourceList || defenseRefreshPending) return;
+  defenseRefreshPending = true;
+  try {
+    const status = await apiFetch("/api/defense/status", { timeoutMs: 8000 });
+    if (status?.ok === false) throw new Error(status.error || "Could not load log monitoring status.");
+    renderDefenseSources(status?.sources);
+    renderDefenseAlerts(status?.alerts);
+    if (status?.warning) defenseStatusText(String(status.warning).slice(0, 500));
+    else if (clearMessage) defenseStatusText("");
+  } catch (error) {
+    defenseStatusText(`Log monitoring unavailable: ${error.message || "local engine not ready"}`);
+  } finally {
+    defenseRefreshPending = false;
+  }
+}
+
+function startDefensePolling() {
+  if (!els.defenseSourceList || defensePollTimer || state.appMode !== "studio") return;
+  void refreshDefenseStatus();
+  defensePollTimer = window.setInterval(() => {
+    if (state.panelMode === "security" && state.appMode === "studio") void refreshDefenseStatus();
+  }, 5000);
+}
+
+function stopDefensePolling() {
+  if (!defensePollTimer) return;
+  window.clearInterval(defensePollTimer);
+  defensePollTimer = null;
+}
+
+els.defenseSourceKind?.addEventListener("change", updateDefenseSourceKind);
+updateDefenseSourceKind();
+els.defenseSourceForm?.addEventListener("invalid", () => {
+  // Native form validation may prevent a submit event entirely.
+  clearDefenseSecrets();
+}, true);
+
+els.defenseSourceForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const kind = selectedDefenseKind();
+  const name = els.defenseSourceName?.value.trim() || "";
+  const settings = DEFENSE_SOURCE_SETTINGS[kind];
+  const apiKey = kind === "elasticsearch" ? els.defenseApiKey?.value.trim() || "" : "";
+  const config = kind === "file"
+    ? { kind, name, path: els.defenseSourcePath?.value.trim() || "", backfill: Boolean(els.defenseBackfill?.checked) }
+    : {
+        kind,
+        name,
+        url: els.defenseSourceUrl?.value.trim() || "",
+        table: els.defenseSourceTable?.value.trim() || settings.defaultTable,
+        cursor_column: els.defenseCursorColumn?.value.trim() || settings.defaultCursor,
+        message_column: els.defenseMessageColumn?.value.trim() || "message",
+        severity_column: els.defenseSeverityColumn?.value.trim() || "",
+        backfill: Boolean(els.defenseBackfill?.checked),
+      };
+  // Keep connection credentials only in this request's local config, including
+  // when authorization or other client-side validation stops the request.
+  clearDefenseSecrets();
+  if (kind === "elasticsearch" && apiKey) config.api_key = apiKey;
+  if (!els.defenseAuthorized?.checked) {
+    defenseStatusText("Confirm you are authorized to read this log source.");
+    return;
+  }
+  config.authorized = true;
+  if (!name || (kind === "file" ? !config.path : !config.url)) {
+    defenseStatusText("Enter a source name and an absolute file path or database URL.");
+    return;
+  }
+  if (kind === "elasticsearch" && !config.cursor_column) {
+    defenseStatusText("Enter a unique, increasing cursor field for the Elasticsearch index.");
+    return;
+  }
+  if (kind === "elasticsearch" && apiKey) {
+    let url;
+    try { url = new URL(config.url); }
+    catch (_) {
+      defenseStatusText("Enter a valid Elasticsearch URL.");
+      return;
+    }
+    if (url.username || url.password) {
+      defenseStatusText("Choose one Elasticsearch authentication method: URL username/password or API key.");
+      return;
+    }
+  }
+  if (els.defenseSourceAdd) els.defenseSourceAdd.disabled = true;
+  defenseStatusText("Adding log source…");
+  try {
+    const result = await apiFetch("/api/defense/sources", { method: "POST", timeoutMs: 12000, body: JSON.stringify(config) });
+    if (result?.ok === false) throw new Error(result.error || "Could not add log source.");
+    els.defenseSourceForm.reset();
+    updateDefenseSourceKind();
+    defenseStatusText("Log source added. Checking the source now.");
+    await refreshDefenseStatus({ clearMessage: false });
+  } catch (error) {
+    defenseStatusText(error.message || "Could not add log source.");
+  } finally {
+    clearDefenseSecrets();
+    if (els.defenseSourceAdd) els.defenseSourceAdd.disabled = false;
+  }
+});
+
+els.defenseRefresh?.addEventListener("click", () => { void refreshDefenseStatus(); });
+els.defenseSourceList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-defense-action]");
+  if (!button || !els.defenseSourceList.contains(button)) return;
+  const action = button.dataset.defenseAction;
+  const sourceId = button.dataset.defenseSourceId;
+  if (!sourceId || !["start", "stop", "delete"].includes(action)) return;
+  button.disabled = true;
+  defenseStatusText(`${action === "delete" ? "Removing" : action === "start" ? "Starting" : "Pausing"} source…`);
+  try {
+    const path = `/api/defense/sources/${encodeURIComponent(sourceId)}${action === "delete" ? "" : `/${action}`}`;
+    const result = await apiFetch(path, { method: action === "delete" ? "DELETE" : "POST", timeoutMs: 10000 });
+    if (result?.ok === false) throw new Error(result.error || `Could not ${action} source.`);
+    defenseStatusText(action === "delete" ? "Log source removed." : action === "start" ? "Source resumed. Checking the source now." : "Monitoring paused.");
+    await refreshDefenseStatus({ clearMessage: false });
+  } catch (error) {
+    defenseStatusText(error.message || `Could not ${action} source.`);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 for (const button of els.panelModeButtons) {
   button.addEventListener("click", () => setPanelMode(button.dataset.panelMode));
@@ -7049,6 +7397,8 @@ function setAppMode(mode) {
   document.body.dataset.appMode = state.appMode;
   saveState();
   if (state.appMode === "hunt") ckSyncService();
+  if (state.appMode === "studio" && state.panelMode === "security") startDefensePolling();
+  else stopDefensePolling();
 }
 
 async function ckLaunchTacnoc() {
