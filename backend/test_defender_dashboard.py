@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import sys
 import tempfile
@@ -41,6 +42,68 @@ def _result(*, finding: bool = False) -> dict:
 
 
 class DefenderDashboardTests(unittest.TestCase):
+    def test_port_proxy_packet_navigation_and_selection_survive_rescan(self) -> None:
+        state = BoardState(capture_enabled=True)
+        result = _result()
+        result["observation"]["connections"] = [
+            {"protocol": "tcp", "local_address": "127.0.0.1", "local_port": port,
+             "state": "LISTEN", "pid": port, "remote_address": ""}
+            for port in range(8000, 8015)
+        ]
+        result["observation"]["proxies"] = [
+            {"kind": "http", "host": f"proxy-{index}.example", "port": 3128 + index,
+             "source": "env:HTTP_PROXY", "scheme": "http"} for index in range(8)
+        ]
+        result["tools"]["tshark"]["packets"] = [
+            {"timestamp": f"2026-10-14T12:00:{index:02d}Z", "source": "192.0.2.1",
+             "source_port": 50000 + index, "destination": "10.0.0.2",
+             "destination_port": 443, "protocol": "tcp", "length": 80 + index,
+             "tcp_syn": True, "tcp_ack": False} for index in range(15)
+        ]
+        state.ingest(result)
+        editor = gn_tui.CommandLine()
+        size = gn_tui.Size(100, 25)
+        _handle_key(state, "TAB", editor, size)
+        self.assertEqual(state.focus, "ports")
+        _handle_key(state, "PGDN", editor, size)
+        self.assertGreater(state.selected_port, 0)
+        _handle_key(state, "END", editor, size)
+        self.assertEqual(state.selected_port, 14)
+        self.assertIn("PID 8014", state.selected_detail())
+        self.assertIn("8014", "\n".join(render(state, size, color=False)))
+        changed = copy.deepcopy(result)
+        changed["observation"]["connections"].append(
+            {"protocol": "tcp", "local_address": "127.0.0.1", "local_port": 7999,
+             "state": "LISTEN", "pid": 7999, "remote_address": ""})
+        state.ingest(changed)
+        self.assertEqual(state.ports[state.selected_port]["local_port"], 8014)
+        _handle_key(state, "RIGHT", editor, size)
+        self.assertEqual(state.focus, "proxies")
+        _handle_key(state, "END", editor, size)
+        self.assertEqual(state.selected_proxy, 7)
+        frame = "\n".join(render(state, size, color=False))
+        self.assertIn("PROXY MAP // 8 CONFIGURED", frame)
+        self.assertIn("proxy-7.example", state.selected_detail())
+        self.assertIn("proxy-7.example", frame)
+        narrow = render(state, gn_tui.Size(78, 22), color=False)
+        self.assertEqual(len(narrow), 22)
+        self.assertTrue(all(gn_tui.visible_len(row) <= 78 for row in narrow))
+        self.assertIn("q quit", "\n".join(narrow))
+        _handle_key(state, "RIGHT", editor, size)
+        self.assertEqual(state.focus, "packets")
+        _handle_key(state, "END", editor, size)
+        self.assertEqual(state.selected_packet, len(state.matching_packets()) - 1)
+        _handle_key(state, "PGUP", editor, size)
+        self.assertLess(state.selected_packet, len(state.matching_packets()) - 1)
+        _handle_key(state, "HOME", editor, size)
+        selected = state.selected_detail()
+        self.assertIn("12:00:14Z", selected)
+        state.ingest(copy.deepcopy(result))
+        self.assertEqual(state.selected_detail(), selected)
+        _handle_key(state, "LEFT", editor, size)
+        self.assertEqual(state.focus, "proxies")
+        self.assertEqual(state.selected_proxy, 7)
+
     def test_green_to_red_is_evidence_driven_and_latched(self) -> None:
         state = BoardState(capture_enabled=True)
         state.ingest(_result())

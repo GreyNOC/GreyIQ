@@ -24,6 +24,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 SCHEMA_VERSION = 1
 LIMITS = {
@@ -31,6 +32,7 @@ LIMITS = {
     "connections": 8192,
     "interfaces": 256,
     "routes": 2048,
+    "proxies": 32,
     "services": 4096,
     "startup": 1024,
     "packages": 8192,
@@ -246,6 +248,85 @@ def _record(snapshot: dict[str, Any], section: str, rows: list[dict[str, Any]],
     snapshot["coverage"][section] = (
         "unavailable" if error and not rows else "partial" if error or partial or len(rows) > cap else "ok"
     )
+
+
+def _proxy_endpoint(raw: Any, *, kind: str, source: str) -> dict[str, Any] | None:
+    """Keep only the endpoint; proxy URLs can carry user names and passwords."""
+    value = str(raw or "").strip()
+    if not value or len(value) > 4096:
+        return None
+    try:
+        parsed = urlsplit(value if "://" in value else f"//{value}")
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if not host or len(host) > 255:
+        return None
+    normalized_kind = kind.strip().lower()
+    if normalized_kind not in {"http", "https", "ftp", "socks", "socks5", "all", "pac", "system"}:
+        normalized_kind = "system"
+    scheme = parsed.scheme or (normalized_kind if normalized_kind.startswith("socks") else "http")
+    return {"kind": normalized_kind, "host": _clean(host, 255), "port": port,
+            "source": source, "scheme": _clean(scheme, 24).lower()}
+
+
+def _collect_proxies() -> tuple[list[dict[str, Any]], str, bool]:
+    """Observe this process's proxy environment and the current Windows user's settings.
+
+    This is local configuration inventory, not a test of reachability or a claim
+    that every process uses these settings. PAC scripts are never fetched.
+    """
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    truncated = False
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        value = os.environ.get(name) or os.environ.get(name.lower())
+        if value:
+            row = _proxy_endpoint(value, kind=name.removesuffix("_PROXY").lower(),
+                                  source=f"env:{name}")
+            if row:
+                rows.append(row)
+            else:
+                errors.append(f"invalid {name} endpoint")
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+                def setting(name: str) -> Any:
+                    try:
+                        return winreg.QueryValueEx(key, name)[0]
+                    except FileNotFoundError:
+                        return None
+
+                if setting("ProxyEnable"):
+                    raw = str(setting("ProxyServer") or "")
+                    entries = raw.split(";")
+                    truncated = len(entries) > LIMITS["proxies"]
+                    for entry in entries[:LIMITS["proxies"]]:
+                        if not entry.strip():
+                            continue
+                        kind, sep, endpoint = entry.partition("=")
+                        row = _proxy_endpoint(endpoint if sep else kind,
+                                              kind=kind.lower() if sep else "system",
+                                              source="windows:user")
+                        if row:
+                            rows.append(row)
+                        else:
+                            errors.append("invalid Windows user proxy endpoint")
+                pac = setting("AutoConfigURL")
+                if pac:
+                    row = _proxy_endpoint(pac, kind="pac", source="windows:user")
+                    if row:
+                        rows.append(row)
+                    else:
+                        errors.append("invalid Windows user PAC endpoint")
+        except (OSError, ValueError) as exc:
+            errors.append(f"Windows user proxy settings unavailable: {type(exc).__name__}")
+    deduped = list({(row["kind"], row["host"], row["port"], row["source"]): row
+                    for row in rows}.values())
+    return deduped, "; ".join(errors), truncated or len(deduped) > LIMITS["proxies"]
 
 
 def _host() -> dict[str, Any]:
@@ -808,7 +889,7 @@ def _collect_other(snapshot: dict[str, Any]) -> None:
     # The CLI remains honest on a platform with no collector: callers can still
     # inspect the host header and the explicit coverage gaps.
     for section in LIMITS:
-        if section == "files":
+        if section in ("files", "proxies"):
             continue
         _record(snapshot, section, [], f"{sys.platform} collector unavailable")
 
@@ -1002,6 +1083,8 @@ def collect_inventory(paths: tuple[str, ...] | list[str] = (), *, max_files: int
         _collect_windows(snapshot)
     else:
         _collect_other(snapshot)
+    proxies, proxy_error, proxy_partial = _collect_proxies()
+    _record(snapshot, "proxies", proxies, proxy_error, partial=proxy_partial)
     if hash_processes:
         _hash_process_executables(snapshot, max_hashes=max_process_hashes,
                                   max_file_bytes=max_process_file_bytes,
