@@ -81,6 +81,7 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertTrue(all(gn_tui.visible_len(row) <= 100 for row in plain))
         self.assertNotIn("\x1b", "\n".join(plain))
         self.assertIn("127.0.0.1 [31mBAD", "\n".join(plain))
+        self.assertIn("PROTO  LOCAL ADDRESS", "\n".join(plain))
 
     def test_search_cancel_restores_filter_and_q_does_not_quit_while_typing(self) -> None:
         state = BoardState(query="tcp")

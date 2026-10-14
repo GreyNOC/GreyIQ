@@ -25,7 +25,7 @@ _PACKET_HISTORY = 2000
 def _safe(value: Any, limit: int = 160) -> str:
     """Remove terminal controls and wide/untrusted characters before sizing rows."""
     plain = _CONTROL.sub(" ", str(value if value is not None else ""))
-    return " ".join(plain.encode("ascii", "replace").decode("ascii").split())[:limit]
+    return plain.encode("ascii", "replace").decode("ascii")[:limit]
 
 
 def _port(value: Any) -> str:
@@ -168,7 +168,8 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     if state.coverage_error:
         coverage += " / PARTIAL COVERAGE"
     capture = "CAPTURE ON" if state.capture_enabled else "CAPTURE OFF"
-    add(f"{coverage}  |  {capture}  |  {state.collected_at or 'NO SNAPSHOT YET'}  |  {_safe(state.message, 90)}")
+    add(f"{_safe(state.message, 55)}  |  {coverage}  |  {capture}  |  "
+        f"{state.collected_at or 'NO SNAPSHOT YET'}", "bright" if state.stopped else "mid")
     divider(f"LOCAL PORTS [{len(state.ports)}]")
     add("    PROTO  LOCAL ADDRESS:PORT                 STATE          PID   REMOTE", "dim")
     port_height = min(10, max(4, (height - 13) // 2))
