@@ -8,6 +8,7 @@ import functools
 import hashlib
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
@@ -698,7 +699,10 @@ class BotCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     provider: str = Field(default="", max_length=20)
     model: str = Field(default="", max_length=120)
-    base_url: str = Field(default="", max_length=400)
+    # 200, not 400: gn_bots.coerce stores the first 200 characters of an endpoint and reports
+    # nothing, so a model advertising 400 invited a value the store would quietly cut in half
+    # and the app would then show and use an endpoint the operator never typed.
+    base_url: str = Field(default="", max_length=200)
     persona: str = Field(default="", max_length=600)
     style: str = Field(default="", max_length=80)
     # The registry's own units (0.0-2.0), which is what the Studio's slider now speaks. It was a
@@ -757,7 +761,10 @@ class HuggingFaceImportRequest(BaseModel):
 
 class ModelSetupRequest(BaseModel):
     model: str = Field(min_length=1, max_length=350)
-    base_url: str = Field(default="", max_length=400)
+    # 200, not 400: gn_bots.coerce stores the first 200 characters of an endpoint and reports
+    # nothing, so a model advertising 400 invited a value the store would quietly cut in half
+    # and the app would then show and use an endpoint the operator never typed.
+    base_url: str = Field(default="", max_length=200)
 
 
 class ScanCodeRequest(BaseModel):
@@ -6513,11 +6520,20 @@ def delete_bot(request: BotSelectRequest) -> dict[str, Any]:
     if error:
         raise HTTPError(422, error)
     payload = _bots_saved(gn_bots, registry)
+    payload["repointed"] = not was_live
     if was_live:
         # Re-pointed AFTER the save, so the profile never names a bot the store no longer has.
         live, error = gn_bots.set_active(RUNTIME_DIR, gn_bots.DEFAULT_ID)
-        note = error if error else f"{bot.id} was live; {live.id} is now."
+        if error or live is None:
+            # The bot IS gone -- that part succeeded and the store says so -- but the profile still
+            # names it, which is `gn settings` advertising a bot that does not exist. Said plainly
+            # rather than left to read as a clean success.
+            note = (f"{bot.id} was deleted, but it was the live bot and the operator profile could "
+                    f"not be re-pointed, so it still names it: {error}")
+        else:
+            note = f"{bot.id} was live; {live.id} is now."
         payload = _bots_response(gn_bots, gn_bots.load(RUNTIME_DIR), note)
+        payload["repointed"] = not (error or live is None)
     payload["bot"] = bot.id
     payload["deleted"] = bot.id
     return payload
@@ -6538,11 +6554,21 @@ def teach_bot(request: BotTeachRequest) -> dict[str, Any]:
     """One operator-authored lesson onto one bot -- the browser's ``corpus``, in its real home."""
     gn_bots = _bots_module()
     registry = gn_bots.load(RUNTIME_DIR)
-    registry, bot, error = gn_bots.teach(registry, request.bot, request.lesson)
+    updated, bot, error = gn_bots.teach(registry, request.bot, request.lesson)
     if bot is None:
         raise HTTPError(422, error)
+    if updated is registry:
+        # NOTHING CHANGED -- the bot already knew that lesson. Do not write. `gn bot teach` prints
+        # the note and returns without saving, and this door must match it: a save here rewrites
+        # the whole file from a snapshot that is already stale, so an operation that changes
+        # nothing could delete a bot another shell created inside the load->save window. That is
+        # worse than the module's admitted last-write-wins, which at least only loses to a writer
+        # that actually wrote something.
+        payload = _bots_response(gn_bots, registry, error)
+        payload["bot"] = bot.id
+        return payload
     # "already knows that one" comes back WITH the bot: it is a note, not a failure.
-    payload = _bots_saved(gn_bots, registry, error)
+    payload = _bots_saved(gn_bots, updated, error)
     payload["bot"] = bot.id
     return payload
 
@@ -6569,16 +6595,67 @@ def _browser_temperature(value: Any) -> Any:
     Not an invented number. The browser's only consumers of that field divided it by 100 -- on its
     way to ``/api/chat``'s ``temperature`` and into its own ranker's variety term -- so 46 always
     meant a sampling temperature of 0.46. The slider now speaks the registry's units directly, and
-    this is the one-time conversion of what it used to store. Out of range or not a number comes
-    back ``None`` (the provider's own default) rather than a clamped guess.
+    this is the one-time conversion of what it used to store. Anything that is not a number the
+    browser could have stored comes back ``None`` (the provider's own default) rather than a
+    clamped or derived guess.
+
+    THREE refusals that are not obvious, each reproduced:
+
+    * **A bool is not a number.** ``float(True)`` is 1.0, so a tampered ``"temperature": true``
+      became a stored 0.01 -- a value nobody chose, which is the fabrication this program forbids.
+    * **``float()`` on a raw object can RAISE.** A JSON integer literal of 400 digits parses to a
+      Python ``int`` and ``float(10**400)`` raises ``OverflowError``, which is an ``ArithmeticError``
+      and not caught by a ``(TypeError, ValueError)`` clause. One such entry took the whole handover
+      down with a 500 -- and because the app leaves the migration pending on failure and retries it
+      every load, that was permanent. Stringifying first is what ``gn_bots.coerce`` does, and it
+      turns the same value into ``inf``, which the finiteness check then refuses.
+    * **Python's underscore literals.** ``float("1_0")`` is 10.0; no browser ever stored ``"1_0"``.
     """
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
         return None
-    if not 0.0 <= number <= 100.0:
+    text = str(value if value is not None else "").strip()
+    if not text or "_" in text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # `not (0 <= n <= 100)` also refuses NaN, which compares False against everything.
+    if not math.isfinite(number) or not 0.0 <= number <= 100.0:
         return None
     return round(number / 100.0, 3)
+
+
+#: How many bots one handover reads. A browser roster is a handful; this is a bound on a body that
+#: may have been hand-edited, not a product limit — and whatever it cuts is REPORTED, because the
+#: app records its one-shot marker on success.
+MIGRATE_LIMIT = 200
+
+
+def _migrated_field(gn_bots: Any, item: Any, raw: Any) -> tuple[Any, str, str]:
+    """One migrated field as ``(value, error, what was shortened)``.
+
+    ``gn_bots.coerce`` truncates a long ``persona`` to its limit and reports nothing, which is the
+    right call for ``gn bot set`` (the operator is watching the field they just typed) and the wrong
+    one inside a route that promises to lose nothing. A name over 60 characters is worse: coerce
+    REFUSES it, so a bot would be dropped whole over a long display name. So a value that is too
+    long is cut to fit and the cut is reported on the row, rather than silently losing text or
+    loudly losing the bot.
+    """
+    if not isinstance(raw, str):
+        value, error = gn_bots.coerce(item, raw)
+        return (value, error, "")
+    value, error = gn_bots.coerce(item, raw)
+    if error and "at most" in error:
+        # Named limits only ("<field> is at most N characters"). Any other refusal stands.
+        limit = int(re.search(r"at most (\d+)", error).group(1))
+        value, error = gn_bots.coerce(item, raw[:limit])
+        if error:
+            return (value, error, "")
+        return (value, "", f"{item.key} was shortened to {limit} characters")
+    if not error and isinstance(value, str) and len(raw.strip()) > len(value):
+        return (value, "", f"{item.key} was shortened to {len(value)} characters")
+    return (value, error, "")
 
 
 def migrate_bots(request: BotMigrateRequest) -> dict[str, Any]:
@@ -6592,12 +6669,22 @@ def migrate_bots(request: BotMigrateRequest) -> dict[str, Any]:
 
     Idempotent, which is the second half of "a migration that cannot run twice". The app records a
     marker once this returns, but a marker that fails to persist (a full or blocked localStorage)
-    must not be able to duplicate anybody's bots, so an id the store already holds is reported
+    must not be able to duplicate anybody's bots, so an id the store ALREADY HELD is reported
     ``exists`` and left exactly as it is. Nothing deletes the browser's copy either, so a rolled-back
     build still has it.
 
-    ``register`` does the placement, so a colliding id is NUMBERED rather than overwriting the bot
-    already there, and refused honestly when every variant is taken.
+    "Already held" means BEFORE this handover, which is the distinction that makes the difference
+    between the two kinds of collision:
+
+    * the store had that id when the route started  -> ``exists``, nothing written
+    * an EARLIER ENTRY OF THIS SAME PAYLOAD took it -> ``register`` numbers it (``forge-2``)
+
+    They were one branch, tested against the growing registry, so two browser bots that slug to one
+    id (``Forge`` and ``FORGE``; two bots both named "New Bot" with no id) silently became one, and
+    the survivor was reported with a sentence that was false twice over: the id was not already in
+    the store, and nothing was "left as it is" -- a different bot was. The app then re-keys an
+    ``exists`` row too, so the dropped bot's chat history and memories were folded onto the one that
+    survived it. That is the opposite of this docstring's first line.
     """
     gn_bots = _bots_module()
     registry = gn_bots.load(RUNTIME_DIR)
@@ -6606,10 +6693,14 @@ def migrate_bots(request: BotMigrateRequest) -> dict[str, Any]:
         # bots that were never written.
         raise HTTPError(409, registry.error
                         or f"{registry.path} could not be read, so nothing was changed.")
+    # The store AS LOADED. ``registry`` grows as this handover places bots, so "was it already
+    # there" has to be asked of this one -- see the docstring.
+    before = registry
     by_key = {item.key: item for item in gn_bots.fields_table()}
     results: list[dict[str, Any]] = []
     created = 0
-    for entry in request.bots[:200]:
+    entries = list(request.bots)[:MIGRATE_LIMIT]
+    for entry in entries:
         if not isinstance(entry, dict):
             results.append({"from": "", "id": "", "status": "refused",
                             "note": "an entry that is not an object"})
@@ -6621,19 +6712,22 @@ def migrate_bots(request: BotMigrateRequest) -> dict[str, Any]:
             results.append({"from": source_id, "id": "", "status": "refused",
                             "note": f"{(source_id or name)[:24]!r} cannot be a bot id"})
             continue
-        if registry.taken(identifier):
+        if before.taken(identifier):
             results.append({"from": source_id, "id": identifier, "status": "exists",
                             "note": f"{identifier} was already in the store; left as it is"})
             continue
         values: dict[str, Any] = {}
+        notes: list[str] = []
         refusal = ""
-        for key, raw in (("name", name[:60]), ("persona", entry.get("persona")),
+        for key, raw in (("name", name), ("persona", entry.get("persona")),
                          ("style", entry.get("style")),
                          ("temperature", _browser_temperature(entry.get("temperature")))):
-            value, error = gn_bots.coerce(by_key[key], raw)
+            value, error, shortened = _migrated_field(gn_bots, by_key[key], raw)
             if error:
                 refusal = error
                 break
+            if shortened:
+                notes.append(shortened)
             values[key] = value
         if refusal:
             results.append({"from": source_id, "id": "", "status": "refused", "note": refusal})
@@ -6652,15 +6746,31 @@ def migrate_bots(request: BotMigrateRequest) -> dict[str, Any]:
         for line in (corpus if isinstance(corpus, list) else [])[:gn_bots.MAX_LESSONS]:
             registry, _taught, _note = gn_bots.teach(registry, placed.id, str(line or ""))
         created += 1
+        if placed.id != identifier:
+            notes.insert(0, f"{identifier} was taken by another bot in this handover, "
+                            f"so it is {placed.id}")
         results.append({"from": source_id, "id": placed.id, "status": "created",
-                        "note": "" if placed.id == identifier
-                                else f"{identifier} was taken, so it is {placed.id}"})
+                        "note": "; ".join(notes)})
+    dropped = len(request.bots) - len(entries)
+    if dropped > 0:
+        # Reported, not silent. This route's whole promise is that nothing is lost, and the app
+        # records its one-shot marker on success -- so bots that fell off the end without a word
+        # would never arrive and nobody would know to look for them. The sentence used to say "run
+        # it again", which the operator had no way to do; ``read`` below is what makes the app keep
+        # the unread tail pending and send it on the next load, so the sentence is true now.
+        results.append({"from": "", "id": "", "status": "deferred",
+                        "note": f"{dropped} more bot(s) were not read: this takes "
+                                f"{MIGRATE_LIMIT} at a time; the rest will be added on the "
+                                f"next load"})
     if created:
         payload = _bots_saved(gn_bots, registry)
     else:
         payload = _bots_response(gn_bots, registry)
     payload["migrated"] = results
     payload["created"] = created
+    # How many entries this call consumed, so the app can slice its pending list rather than
+    # guess from a sentence.
+    payload["read"] = len(entries)
     return payload
 
 

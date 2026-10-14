@@ -56,7 +56,9 @@
           <form class="bot-editor" id="botEditor">
             <label>
               <span>Name</span>
-              <input id="botName" name="name" maxlength="28" autocomplete="off">
+              <!-- 60, the store's own limit for a display name (gn_bots.coerce). At 28 a name set from
+                   the CLI could be shown but never retyped once cleared. -->
+              <input id="botName" name="name" maxlength="60" autocomplete="off">
             </label>
 
             <label>

@@ -485,6 +485,60 @@ body {
     </p>
   </div>
 
+  <h2>What the redesign must KEEP (operator, approving this mockup)</h2>
+  <p>
+    The look changes; the capability does not. Everything below already exists and has to come
+    through the restructure with a home in the new layout &mdash; several of them are what the right
+    pane is <em>for</em>, which is why that zone is in the proposal at all.
+  </p>
+  <table>
+    <tr><th>Capability</th><th>Where it lives today</th><th>Home in the new layout</th></tr>
+    <tr>
+      <td><strong>Workbench files</strong> &mdash; explorer, code preview, diffs, agent steps,
+        verification output</td>
+      <td>The Workbench panel (<code>#workbench*</code> in <code>public/index.html</code>,
+        <code>renderWorkbench</code> in <code>app.js</code>)</td>
+      <td>The right pane's <em>Files</em> and <em>Diff</em> tabs &mdash; the two tabs already drawn
+        in the mockup above. This is the single biggest reason the zone exists.</td>
+    </tr>
+    <tr>
+      <td><strong>Server / app preview</strong></td>
+      <td>Dev-server and preview surfaces</td>
+      <td>A third right-pane tab beside Files and Diff, so a running app sits next to the transcript
+        rather than replacing it.</td>
+    </tr>
+    <tr>
+      <td><strong>Hugging Face agent clones</strong> &mdash; <code>gn bot hf &lt;ref&gt;</code> /
+        <code>gn agent clone</code>, cloned at a pinned digest-verified commit and registered
+        <strong>inert</strong></td>
+      <td>CLI + <code>gn studio</code>'s <code>/hf</code>; the app has no door onto it</td>
+      <td>A control in the bot rail that posts to the same machinery. The inert rule is not
+        cosmetic &mdash; a clone can never become a brain, its provider field refuses to change, and
+        nothing cloned is imported or executed. The new panel must say that on the row, as the CLI
+        does.</td>
+    </tr>
+    <tr>
+      <td><strong>GGUF import</strong> &mdash; a GGUF repo pulled into local Ollama, probed for chat
+        and tool calls, registered as a runnable <code>local</code> bot</td>
+      <td><code>hf_gguf_import</code>, <code>/api/coder/huggingface/import</code>,
+        <code>gn bot hf</code></td>
+      <td>Same control, same flow: pick a repo, watch the download, end with a bot in the roster.
+        A model that fails the chat probe must still be registered and shown as <em>not ready</em>
+        rather than quietly made live.</td>
+    </tr>
+    <tr>
+      <td><strong>Free local stack</strong> &mdash; Ollama + Hugging Face downloads, no key, nothing
+        leaving the machine</td>
+      <td>The <code>local</code> provider and the bundled TinyGPT</td>
+      <td>The path of least resistance in the new UI. Making a bot should reach a working local
+        model without a key; hosted brains stay available and stay marked <code>-&gt;net</code>.</td>
+    </tr>
+  </table>
+  <p>
+    None of this is new engineering &mdash; it is re-homing surfaces that exist. The one genuinely
+    new piece remains the structured tool-call record the transcript rows need.
+  </p>
+
   <h2>What it costs</h2>
   <ul>
     <li><strong>Palette, type, status line, tool rows:</strong> <code>public/styles.css</code> plus markup in

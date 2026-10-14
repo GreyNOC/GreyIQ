@@ -54,6 +54,9 @@ function harness(overrides = {}) {
       return (overrides.responses && overrides.responses[route]) || { ok: true, bots: [] };
     },
     render: () => {},
+    renderBots: () => {},
+    els: { botEditor: null },
+    document: { activeElement: null },
     saveState: () => {},
     queueCoreSync: () => {},
     trainBot: () => {},
@@ -174,7 +177,8 @@ test('the panel shows the store own sentence for what making a bot live means', 
   const state = { activeBotId: 'recon' };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state, BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+    { els: { botReadiness: node }, state, botStore: { loaded: true },
+      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
   const sentence = 'it answers chat and plans the hunt';
   run.renderBotReadiness({ id: 'recon', readiness: 'ready', key_state: 'not needed',
     what_it_does: sentence });
@@ -198,7 +202,7 @@ test('a posture is not reported as a failure', () => {
   const node = { textContent: '', classList: { add() {}, toggle(_c, on) { node.warn = on; } } };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state: { activeBotId: '' },
+    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: { loaded: true },
       BLOCKING_READINESS: ['needs a key', 'needs a model'] });
 
   for (const posture of ['off', 'edits only', 'inert']) {
@@ -220,13 +224,14 @@ test('a posture is not reported as a failure', () => {
 });
 
 test('a bot with no store record claims neither readiness nor where it runs', () => {
-  // The cached roster shown while the service is down carries neither fact, and those two are the
-  // ones this panel most has to be right about.
+  // A DEFAULT_BOTS-shaped record: the browser that has never reached the service. (Its sibling
+  // above covers the harder case -- a cache from a session that DID reach it.)
   const READINESS = slice('function renderBotReadiness(bot)', 'const activeChatPolls');
   const node = { textContent: '', classList: { add() { node.added = true; }, toggle() {} } };
+  const store = { loaded: true };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state: { activeBotId: '' },
+    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: store,
       BLOCKING_READINESS: ['needs a key', 'needs a model'] });
   run.renderBotReadiness({ id: 'astra', name: 'Astra' });
   assert.match(node.textContent, /Start the local GreyIQ service/);
@@ -237,18 +242,26 @@ test('a bot with no store record claims neither readiness nor where it runs', ()
   assert.match(node.textContent, /^Ready\. Stays on this machine\./);
 });
 
-test('with no store the editor takes no edits it could not keep', () => {
-  const FREEZE = slice('function freezeBotEditor()', 'function setSelectValue(');
+function availabilityHarness() {
+  const AVAIL = slice('function applyEditorAvailability(bot)', 'function setSelectValue(');
   const control = () => ({ disabled: false, title: '' });
   const els = { botName: control(), botPersona: control(), botStyle: control(),
     botTemperature: control(), botProvider: control(), botModel: control(),
     newBotButton: control(), cloneBotButton: control(), deleteBotButton: control() };
   const { api } = harness();
+  const state = { bots: [{ id: 'a' }, { id: 'b' }] };
+  const run = vm.runInNewContext(
+    `${AVAIL}
+({ applyEditorAvailability })`,
+    { els, state, botStore: api.botStore,
+      FROZEN_EDITOR_TITLE: 'The bot store is served by the local GreyIQ service — start it to edit bots.' });
+  return { els, api, run };
+}
+
+test('with no store the editor takes no edits it could not keep', () => {
+  const { els, api, run } = availabilityHarness();
   api.botStore.loaded = false;
-  const run = vm.runInNewContext(`${FREEZE}
-({ freezeBotEditor })`,
-    { els, botStore: api.botStore });
-  run.freezeBotEditor();
+  run.applyEditorAvailability({ id: 'recon', provider: 'local' });
   for (const [name, node] of Object.entries(els)) {
     assert.equal(node.disabled, true, `${name} must not accept an edit that cannot be saved`);
     assert.match(node.title, /local GreyIQ service/);
@@ -284,6 +297,7 @@ test('selecting a bot posts to the one writer of the setting', async () => {
   const { api, context, calls } = harness({
     responses: { '/api/bots/active': { bots: [{ id: 'shellmade' }], active_id: 'shellmade' } },
   });
+  api.botStore.loaded = true;
   context.state.activeBotId = 'tinygpt';
   await api.selectBot('shellmade');
   assert.deepEqual(calls.map((call) => call.route), ['/api/bots/active']);
@@ -291,9 +305,23 @@ test('selecting a bot posts to the one writer of the setting', async () => {
   assert.equal(context.state.activeBotId, 'shellmade');
 });
 
+test('clicking the roster before the store has answered posts nothing', async () => {
+  // The rows stay clickable while the editor is frozen, and the id under them is this browser's
+  // cache -- before the handover, a pre-registry id the store has never heard of. Clicking one
+  // posted it, painted a 422, and bumped the write counter, which discarded the boot read.
+  const { api, context, calls } = harness();
+  api.botStore.loaded = false;
+  context.state.activeBotId = 'tinygpt';
+  await api.selectBot('astra');
+  assert.equal(calls.length, 0, 'nothing may be posted before the store has answered');
+  assert.equal(context.state.activeBotId, 'tinygpt');
+  assert.match(api.botStore.lastError, /local GreyIQ service/);
+});
+
 test('a refused selection snaps back to the bot that is actually live', async () => {
   const { api, context } = harness();
   context.apiFetch = async () => { throw new Error('422 not in the store'); };
+  api.botStore.loaded = true;
   context.state.activeBotId = 'tinygpt';
   await api.selectBot('ghost');
   assert.equal(context.state.activeBotId, 'tinygpt');
@@ -309,6 +337,7 @@ test('a pending edit goes to the bot it was typed into, not the one clicked next
     responses: { '/api/bots/active': { bots: [{ id: 'other' }], active_id: 'other' },
       '/api/bots/update': { bots: [{ id: 'recon' }], active_id: 'recon' } },
   });
+  api.botStore.loaded = true;
   context.state.activeBotId = 'recon';
   api.queueBotSave({ persona: 'typed into recon' });
   await api.selectBot('other');
@@ -318,6 +347,117 @@ test('a pending edit goes to the bot it was typed into, not the one clicked next
   assert.equal(update.body.fields.persona, 'typed into recon');
   // And the switch still happened.
   assert.ok(calls.some((call) => call.route === '/api/bots/active'));
+});
+
+test('the editor comes back when the store does', () => {
+  // This only ever SET disabled, and three controls were enabled elsewhere. One render with the
+  // service down -- opening the app before the backend is up -- left Name/Persona/Style/Variation
+  // and both buttons permanently dead, with the tooltip explaining why cleared on the next render.
+  const { els, api, run } = availabilityHarness();
+  const runnable = { id: 'recon', provider: 'local' };
+
+  api.botStore.loaded = false;
+  run.applyEditorAvailability(runnable);
+  assert.equal(els.botName.disabled, true);
+
+  api.botStore.loaded = true;
+  run.applyEditorAvailability(runnable);
+  for (const [name, node] of Object.entries(els)) {
+    assert.equal(node.disabled, false, `${name} must be editable once the store answers`);
+    assert.equal(node.title, '', `${name} must not keep the "service is down" tooltip`);
+  }
+});
+
+test('a control disabled for its own reason says which reason, and recovers', () => {
+  // Every control is assigned on every call from (bot, store) alone, so the panel cannot depend
+  // on what ran before it.
+  const { els, api, run } = availabilityHarness();
+  api.botStore.loaded = true;
+
+  run.applyEditorAvailability({ id: 'tinygpt', provider: 'tinygpt', builtin: true });
+  assert.equal(els.botModel.disabled, true);
+  assert.match(els.botModel.title, /takes no model name/);
+  assert.equal(els.deleteBotButton.disabled, true);
+  assert.match(els.deleteBotButton.title, /ships with GreyIQ/);
+  assert.equal(els.botName.disabled, false);
+
+  run.applyEditorAvailability({ id: 'stranger', provider: 'off', inert: true });
+  assert.equal(els.botProvider.disabled, true);
+  assert.match(els.botProvider.title, /inert by design/);
+
+  // ...and an ordinary bot clears all of it, with no residue from the two above.
+  run.applyEditorAvailability({ id: 'recon', provider: 'anthropic' });
+  for (const [name, node] of Object.entries(els)) {
+    assert.equal(node.disabled, false, `${name} kept a rule that no longer applies`);
+    assert.equal(node.title, '', `${name} kept a stale reason`);
+  }
+});
+
+test('a cached roster claims nothing about readiness or the network', () => {
+  // The gate was `!bot.readiness`, but saveState persisted the backend-computed fields, so a cache
+  // written by an earlier session carried one -- and the panel said "Ready. Key configured. Stays
+  // on this machine." with no backend running at all.
+  const READINESS = slice('function renderBotReadiness(bot)', 'const activeChatPolls');
+  const SUMMARY = slice('function botRowSummary(bot)', 'function renderBotStoreNote()');
+  const node = { textContent: '', classList: { add() {}, toggle() {} } };
+  const { api } = harness();
+  api.botStore.loaded = false;
+  const context = { els: { botReadiness: node }, state: { activeBotId: 'recon' },
+    botStore: api.botStore, BLOCKING_READINESS: ['needs a key', 'needs a model'] };
+  const run = vm.runInNewContext(`${READINESS}
+${SUMMARY}
+({ renderBotReadiness, botRowSummary })`,
+    context);
+
+  // Exactly what localStorage would have handed back before saveState stopped writing these.
+  const stale = { id: 'recon', readiness: 'ready', key_state: 'configured', off_machine: true,
+    endpoint: 'https://api.anthropic.com', describe: 'anthropic - claude-opus-5',
+    what_it_does: 'it answers chat and plans the hunt' };
+  run.renderBotReadiness(stale);
+  assert.match(node.textContent, /Start the local GreyIQ service/);
+  for (const claim of ['Ready.', 'Key configured', 'Stays on this machine', 'off this machine']) {
+    assert.ok(!node.textContent.includes(claim), `claimed "${claim}" with no store behind it`);
+  }
+  // The roster row keeps what the record IS and drops what only a live check could know.
+  assert.equal(run.botRowSummary({ ...stale, readiness: 'needs a key' }), 'anthropic - claude-opus-5');
+
+  api.botStore.loaded = true;
+  assert.equal(run.botRowSummary({ ...stale, readiness: 'needs a key' }),
+    'anthropic - claude-opus-5 [needs a key] ->net');
+});
+
+test('the fields only the backend can compute are never persisted', () => {
+  const SAVE = slice('function saveState() {', '// Per-session token');
+  let saved = null;
+  const state = { theme: 'dark', chats: {}, bots: [
+    { id: 'recon', name: 'Recon', readiness: 'ready', key_state: 'configured',
+      off_machine: true, endpoint: 'https://api.anthropic.com', describe: 'anthropic - x' },
+  ] };
+  vm.runInNewContext(`${SAVE}
+saveState();`, {
+    state, STORE_KEY: 'test',
+    localStorage: { setItem(_key, value) { saved = JSON.parse(value); } },
+  });
+  for (const field of ['readiness', 'key_state', 'off_machine', 'endpoint']) {
+    assert.ok(!(field in saved.bots[0]), `${field} must not reach localStorage`);
+  }
+  assert.equal(saved.bots[0].describe, 'anthropic - x', 'what the record IS still caches');
+});
+
+test('an edit the store refuses leaves the screen as well as the disk', () => {
+  // updateBotFromEditor applies the typing to the cache so the panel stays responsive. On a
+  // refusal that optimistic value used to stay -- shown in the roster, the chat byline and the
+  // editor, and persisted -- while the error under the roster said the write had failed.
+  const { api, context } = harness();
+  api.applyBotStore({ bots: [{ id: 'recon', name: 'Recon' }], active_id: 'recon' });
+  assert.equal(context.state.bots[0].name, 'Recon');
+  Object.assign(context.state.bots[0], { name: 'Burned' });   // what the editor does as you type
+  context.apiFetch = async () => { throw new Error("422: 'recon' is not a bot in the store."); };
+  return api.botWrite('/api/bots/update', { bot: 'recon', fields: { name: 'Burned' } })
+    .then(() => {
+      assert.equal(context.state.bots[0].name, 'Recon', 'the refused name must not survive');
+      assert.match(api.botStore.lastError, /not a bot in the store/);
+    });
 });
 
 // --- the handover ------------------------------------------------------------------------------
@@ -334,7 +474,11 @@ function migrationHarness() {
         bots: [{ id: 'astra' }, { id: 'forge' }, { id: 'bot-6f1c0b7e-6b0a-4d6c-9a1a-2f2b' }],
         active_id: 'tinygpt', configured: 'tinygpt', created: 3, migrated,
       },
-      '/api/bots/active': { bots: [{ id: 'forge' }], active_id: 'forge' },
+      // Every route answers with the whole store (_bots_response), not just the bot it touched.
+      '/api/bots/active': {
+        bots: [{ id: 'astra' }, { id: 'forge' }, { id: 'bot-6f1c0b7e-6b0a-4d6c-9a1a-2f2b' }],
+        active_id: 'forge', configured: 'forge',
+      },
     },
   });
   harnessed.api.botStore.loaded = true;
@@ -361,6 +505,40 @@ test('a handover re-keys everything this browser keeps per bot', async () => {
   assert.deepEqual(state.botFit.astra.weights, [0.2], 'an id that did not change is left alone');
   assert.equal(state.botsMigration.created, 3);
   assert.deepEqual(state.botsMigration.refused, []);
+});
+
+test('a handover carries data onto an id the store already holds, never over it', async () => {
+  // The `delete store[from]` used to be unconditional, so whenever the destination key already
+  // existed the source's data was thrown away. For colours the destination ALWAYS exists, because
+  // the listing that arrived moments earlier assigns every id a palette colour.
+  const { api, context } = migrationHarness();
+  Object.assign(context.state, {
+    chats: { Forge: [{ text: 'from the browser' }], forge: [{ text: 'already here' }] },
+    memories: { Forge: [{ text: 'browser memory' }], forge: [{ text: 'shell memory' }] },
+    botPresentation: { Forge: { color: '#4bb377' }, forge: { color: '#8ec7d8', auto: true } },
+    botFit: { Forge: { weights: [0.9], trainedAt: 7 }, forge: { weights: [], trainedAt: 0 } },
+  });
+  await api.migrateBotsOnce();
+  const { state } = context;
+  // Joined rather than deepEqual'd: `.map()` on an array built inside the vm returns a vm-realm
+  // array, which assert's deep comparison will not match against one from this realm.
+  assert.equal(state.chats.forge.map((m) => m.text).join('|'), 'from the browser|already here',
+    'both sides are the operator own turns; both survive');
+  assert.equal(state.memories.forge.map((m) => m.text).join('|'), 'browser memory|shell memory');
+  assert.equal(state.botPresentation.forge.color, '#4bb377',
+    'a colour the operator picked beats one assigned from the palette');
+  assert.equal(state.botFit.forge.trainedAt, 7, 'the side that was actually fitted wins');
+  assert.ok(!('Forge' in state.chats), 'and nothing is left stranded under the old id');
+});
+
+test('a colour the operator chose is never overwritten by a handover', async () => {
+  const { api, context } = migrationHarness();
+  context.state.botPresentation = {
+    Forge: { color: '#4bb377' },
+    forge: { color: '#d9a441', auto: false },   // chosen in this browser, for the shell's bot
+  };
+  await api.migrateBotsOnce();
+  assert.equal(context.state.botPresentation.forge.color, '#d9a441');
 });
 
 test('the bot this browser had selected stays selected', async () => {
@@ -416,6 +594,182 @@ test('a handover runs once', async () => {
   await api.migrateBotsOnce();
   assert.equal(calls.length, after, 'the second call must do nothing at all');
   assert.equal(context.state.pendingBotMigration, null);
+});
+
+test('a failed handover keeps the selection it was going to restore', async () => {
+  // pendingBotSelection was cleared before the POST and only the bot LIST was restored on failure,
+  // so a handover that timed out lost the bot the operator had live -- and the retry could not
+  // re-derive it, because applyBotStore had already overwritten state.activeBotId.
+  const { api, context } = migrationHarness();
+  context.apiFetch = async () => { throw new Error('service went away'); };
+  await api.migrateBotsOnce();
+  assert.equal(context.state.pendingBotSelection, 'Forge');
+  assert.equal(context.state.pendingBotMigration.length, 3);
+});
+
+test('an answer that is not a store listing does not mark the handover done', async () => {
+  // A 200 that applyBotStore would refuse two lines later used to still write the marker, which
+  // permanently records a handover that never happened.
+  for (const bad of [{ ok: true }, { bots: [], migrated: [] }, { bots: [{ id: 'astra' }] }]) {
+    const { api, context } = migrationHarness();
+    context.apiFetch = async () => bad;
+    await api.migrateBotsOnce();
+    assert.equal(context.state.botsMigration, null, `marked done on ${JSON.stringify(bad)}`);
+    assert.equal(context.state.pendingBotMigration.length, 3, 'and it must be retried');
+  }
+});
+
+test('data for a bot the shell deleted is cleared on the next full read, not before it', async () => {
+  const { api, context } = harness({
+    responses: { '/api/bots': { bots: [{ id: 'tinygpt' }], active_id: 'tinygpt' } },
+  });
+  Object.assign(context.state, {
+    chats: { tinygpt: [{ text: 'keep' }], gone: [{ text: 'orphan' }] },
+    botPresentation: { gone: { color: '#fff' } },
+    // A handover is still pending, so this read must NOT prune: on the first load of a
+    // pre-registry browser the listing is the built-ins and this browser's own bots are exactly
+    // the ids missing from it.
+    pendingBotMigration: [{ id: 'gone' }],
+  });
+  await api.refreshBots({ render: false });
+  assert.ok('gone' in context.state.chats, 'pruned data the handover was about to re-key');
+
+  context.state.pendingBotMigration = null;
+  await api.refreshBots({ render: false });
+  assert.ok(!('gone' in context.state.chats), 'a bot the store no longer has leaves nothing behind');
+  assert.ok(!('gone' in context.state.botPresentation));
+  assert.ok('tinygpt' in context.state.chats, 'and a bot that is still there keeps its history');
+});
+
+test('a store the backend could not fully read deletes nothing', async () => {
+  // gn_bots.load answers an unparseable bots.json with the six built-ins, and a file holding an
+  // entry it refuses with that entry left out -- and never overwrites either, so the operator's
+  // bots come back once the file is fixed. Pruning against such a listing turned a recoverable
+  // file problem into permanent, silent loss of their chat history.
+  for (const degraded of [
+    { label: 'unparseable', listing: { bots: [{ id: 'tinygpt' }], active_id: 'tinygpt',
+        readable: false, error: 'bots.json is not valid JSON (Expecting value)' } },
+    { label: 'one entry refused', listing: { bots: [{ id: 'tinygpt' }], active_id: 'tinygpt',
+        readable: true, error: "bots.json: ghost: provider 'ollama' is not one of ..." } },
+  ]) {
+    const { api, context } = harness({ responses: { '/api/bots': degraded.listing } });
+    Object.assign(context.state, { chats: { recon: [{ text: 'keep me' }] },
+      memories: { recon: [{ text: 'and me' }] }, botPresentation: { recon: { color: '#fff' } } });
+    await api.refreshBots({ render: false });
+    assert.ok('recon' in context.state.chats, `${degraded.label}: chat history was deleted`);
+    assert.ok('recon' in context.state.memories, `${degraded.label}: memories were deleted`);
+    assert.equal(api.botStore.healthy, false);
+  }
+});
+
+test('a healthy listing is what decides a bot is gone', async () => {
+  const healthy = (ids) => ({ bots: ids.map((id) => ({ id })), active_id: ids[0],
+    readable: true, error: '' });
+  const { api, context } = harness({ responses: { '/api/bots': healthy(['tinygpt', 'recon']) } });
+  Object.assign(context.state, { chats: { recon: [{ text: 'keep me' }], stray: [{ text: 'orphan' }] } });
+
+  await api.refreshBots({ render: false });
+  assert.ok('recon' in context.state.chats, 'a bot still in the store keeps its history');
+  assert.ok(!('stray' in context.state.chats), 'an id the store vouches it does not have goes');
+
+  context.apiFetch = async () => healthy(['tinygpt']);
+  await api.refreshBots({ render: false });
+  assert.ok(!('recon' in context.state.chats), 'a bot the shell removed takes its data with it');
+});
+
+test('a revalidation read that started before a click cannot undo it', async () => {
+  // Nothing stopped a write starting while a read was in flight, and applyBotStore applied
+  // whichever landed last -- so the roster highlight and the "Live:" line snapped back to the
+  // previous bot for up to 30s while the store said otherwise.
+  let releaseRead;
+  const readLanded = new Promise((resolve) => { releaseRead = resolve; });
+  const { api, context } = harness();
+  context.apiFetch = async (route, options) => {
+    if (route === '/api/bots') {
+      await readLanded;
+      return { bots: [{ id: 'tinygpt' }, { id: 'recon' }], active_id: 'tinygpt', readable: true };
+    }
+    return { bots: [{ id: 'tinygpt' }, { id: 'recon' }], active_id: 'recon', readable: true,
+      ...(options ? {} : {}) };
+  };
+  // The store has answered once already, which is the only state a click is accepted in.
+  api.applyBotStore({ bots: [{ id: 'tinygpt' }, { id: 'recon' }], active_id: 'tinygpt', readable: true });
+  const read = api.refreshBots({ render: false, auto: true });   // starts, does not resolve yet
+  await api.selectBot('recon');                                   // the operator clicks
+  assert.equal(context.state.activeBotId, 'recon');
+  releaseRead();
+  await read;
+  assert.equal(context.state.activeBotId, 'recon',
+    'the older read must not put the previous bot back');
+});
+
+test('a failed handover survives a reload', () => {
+  // The pending list was DERIVED at load from the saved bots and never persisted. After the first
+  // successful read state.bots is the store's records and saveState writes those -- so a failed
+  // handover followed by a reload derived an empty pending list from a cache that no longer held
+  // the browser's own bots. One service hiccup during the one-shot handover, and they were gone.
+  const SAVE = slice('function saveState() {', '// Per-session token');
+  const LOAD = slice('function loadState() {', 'function migrateDefaultBots(');
+  let saved = null;
+  const legacy = [{ id: 'astra', name: 'Astra', corpus: [] }, { id: 'Forge', name: 'Forge', corpus: [] }];
+  // The state a browser is in right after a failed handover: the cache is the store's roster
+  // (every record names a provider), and the browser's own bots exist only in the pending list.
+  const state = { theme: 'dark', chats: {},
+    bots: [{ id: 'tinygpt', provider: 'tinygpt' }, { id: 'local', provider: 'local' }],
+    activeBotId: 'tinygpt', botsMigration: null,
+    pendingBotMigration: legacy, pendingBotSelection: 'Forge' };
+  vm.runInNewContext(`${SAVE}
+saveState();`, { state, STORE_KEY: 'test',
+    localStorage: { setItem(_k, v) { saved = JSON.parse(v); } } });
+  assert.equal(saved.pendingBotMigration.length, 2, 'the pending list must be written');
+
+  const reloaded = vm.runInNewContext(`${LOAD}
+loadState()`, {
+    STORE_KEY: 'test', localStorage: { getItem: () => JSON.stringify(saved) },
+    DEFAULT_BOTS: [{ id: 'astra', name: 'Astra' }], BOT_DEFAULT_REVISION: 2,
+    TRAINING_SOURCE_REVISION: 1, DEFAULT_SELECTED_TRAINING_SOURCES: [],
+    DEFAULT_TRAIN_SETTINGS: {}, structuredClone: (x) => JSON.parse(JSON.stringify(x)),
+    migrateDefaultBots: (bots) => bots, normalizeWeights: (w) => w || [],
+    migrateSelectedTrainingSources: () => [], harvestedPresentation: () => ({}),
+    harvestedFit: () => ({}),
+  });
+  assert.equal(reloaded.pendingBotMigration.length, 2, 'the browser own bots must still be pending');
+  assert.equal(reloaded.pendingBotMigration[1].id, 'Forge');
+  assert.equal(reloaded.pendingBotSelection, 'Forge', 'and so must the selection');
+});
+
+test('a capped handover keeps the unread tail pending and records no marker', async () => {
+  // The route reads MIGRATE_LIMIT entries per call. The cap row used to say "run it again", which
+  // the operator had no way to do: the marker landed and the tail was gone for good.
+  const pending = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  const { api, context, calls } = harness({
+    responses: {
+      '/api/bots/migrate': { bots: [{ id: 'a' }, { id: 'b' }], active_id: 'tinygpt',
+        configured: 'tinygpt', created: 2, read: 2,
+        migrated: [{ from: 'a', id: 'a', status: 'created' }, { from: 'b', id: 'b', status: 'created' },
+          { from: '', id: '', status: 'deferred', note: '1 more bot(s) were not read' }] },
+    },
+  });
+  api.botStore.loaded = true;
+  Object.assign(context.state, { pendingBotMigration: pending, pendingBotSelection: 'c' });
+  await api.migrateBotsOnce();
+  assert.deepEqual(context.state.pendingBotMigration.map((b) => b.id).join(','), 'c',
+    'the unread tail must stay pending');
+  assert.equal(context.state.pendingBotSelection, 'c', 'a selection in the tail stays with it');
+  assert.equal(context.state.botsMigration, null, 'no marker until the last of them lands');
+  // The next read sends the rest, and only then is the handover recorded.
+  context.apiFetch = async (route, options) => {
+    calls.push({ route, body: options && options.body ? JSON.parse(options.body) : null });
+    return route === '/api/bots/migrate'
+      ? { bots: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], active_id: 'tinygpt', configured: 'tinygpt',
+          created: 1, read: 1, migrated: [{ from: 'c', id: 'c', status: 'created' }] }
+      : { bots: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], active_id: 'c' };
+  };
+  await api.migrateBotsOnce();
+  const second = calls.filter((c) => c.route === '/api/bots/migrate').pop();
+  assert.deepEqual(second.body.bots.map((b) => b.id), ['c'], 'only the tail is sent');
+  assert.equal(context.state.pendingBotMigration, null);
+  assert.ok(context.state.botsMigration, 'recorded once everything has landed');
 });
 
 test('a bot the store refused is named rather than swallowed', async () => {

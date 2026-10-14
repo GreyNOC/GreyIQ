@@ -342,6 +342,36 @@ class InvariantsSurviveThisDoorTests(BotRouteCase):
         self.assertTrue(row["off_machine"])            # and the payload still tells the truth
         self.assertEqual(row["endpoint"], "http://10.0.0.9:11434/v1")
 
+    def test_a_credential_in_the_apps_own_config_never_reaches_a_payload(self) -> None:
+        """The leak chain: POST /api/coder writes coder.local.base_url unvalidated, endpoint_for
+        read it back through _text with no validation either, and /api/bots echoed it verbatim --
+        one field, two rules, depending only on which file it was read from."""
+        (self.runtime / "solin_runtime_config.json").write_text(json.dumps({"coder": {"local": {
+            "base_url": "http://u:sk-live-SECRET@10.0.0.9:11434/v1?api_key=sk-live-SECRET#f"}}}),
+            encoding="utf-8")
+        self.create("Remote", provider="local", model="qwen2.5-coder:14b")
+        payload = api.list_bots()
+        self.assertNotIn("sk-live-SECRET", json.dumps(payload))
+        row = self.row(payload, "remote")
+        # NOT blanked: the request really goes to that host, so the marker must still say so.
+        self.assertTrue(row["off_machine"])
+        self.assertEqual(row["endpoint"], "http://10.0.0.9:11434/v1")
+        # And gn_bots' own surfaces get the same redaction, from the same function.
+        self.assertEqual(gn_bots.endpoint_for(self.runtime, gn_bots.load(self.runtime).get("remote")),
+                         "http://10.0.0.9:11434/v1")
+
+    def test_an_over_long_endpoint_is_refused_on_the_update_door_too(self) -> None:
+        # The create model was bounded to 200; the update door carries base_url inside
+        # `fields: dict[str, Any]`, which nothing bounded -- so 326 characters were accepted, the
+        # first 200 kept, and the truncated string echoed back as the endpoint.
+        self.create("Long", provider="local")
+        with self.assertRaises(api.HTTPError) as caught:
+            api.update_bot(api.BotUpdateRequest(bot="long",
+                fields={"base_url": "http://h/" + "a" * 320}))
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("at most 200", caught.exception.detail)
+        self.assertEqual(self.row(api.list_bots(), "long")["base_url"], "")
+
     def test_a_loopback_bot_is_not_marked(self) -> None:
         (self.runtime / "solin_runtime_config.json").write_text(
             json.dumps({"coder": {"local": {"base_url": "http://127.0.0.1:11434/v1"}}}),
@@ -388,14 +418,96 @@ class MigrationTests(BotRouteCase):
         self.assertIsNotNone(gn_bots.load(self.runtime).get(assigned))
 
     def test_two_bots_that_slug_the_same_are_both_kept(self) -> None:
+        """Ids that really DO collide. The first version of this test used ``bot-aaaa``/``bot-bbbb``,
+        which are already valid ids, so ``bot_id`` short-circuited and no collision was ever
+        exercised -- it passed while the behaviour it is named for silently dropped a bot.
+        """
+        for label, payload_bots in (
+            ("different case", [{"id": "Forge", "name": "Forge", "persona": "the first"},
+                                {"id": "FORGE", "name": "Forge", "persona": "the second"}]),
+            ("no id at all", [{"name": "New Bot", "persona": "the first"},
+                              {"name": "New Bot", "persona": "the second"}]),
+        ):
+            with self.subTest(collision=label):
+                self.setUp()
+                payload = api.migrate_bots(api.BotMigrateRequest(bots=payload_bots))
+                rows = payload["migrated"]
+                self.assertEqual([row["status"] for row in rows], ["created", "created"],
+                                 f"a bot was dropped: {rows}")
+                ids = [row["id"] for row in rows]
+                self.assertEqual(len(set(ids)), 2, f"both bots got one id: {rows}")
+                personas = sorted(self.row(payload, bot_id)["persona"] for bot_id in ids)
+                self.assertEqual(personas, ["the first", "the second"])
+                # And the second one's row says what actually happened, rather than claiming it
+                # was already in the store and left alone -- which was false twice over.
+                self.assertIn("taken by another bot in this handover", rows[1]["note"])
+                self.assertNotIn("already in the store", rows[1]["note"])
+
+    def test_already_in_the_store_means_before_this_handover(self) -> None:
+        # The one case that IS "exists": the operator made it in the shell first.
+        self.create("Forge", persona="the one I made in the shell")
         payload = api.migrate_bots(api.BotMigrateRequest(bots=[
-            {"id": "bot-aaaa", "name": "New Bot", "persona": "the first"},
-            {"id": "bot-bbbb", "name": "New Bot", "persona": "the second"},
+            {"id": "Forge", "name": "Forge", "persona": "the browser's"}]))
+        row = payload["migrated"][0]
+        self.assertEqual(row["status"], "exists")
+        self.assertEqual(self.row(payload, "forge")["persona"], "the one I made in the shell")
+
+    def test_one_tampered_entry_cannot_take_the_whole_handover_down(self) -> None:
+        """A 400-digit integer: ``float(10**400)`` raises OverflowError, not ValueError.
+
+        It 500'd the route, so every other bot in the body was lost -- and because the app leaves
+        the handover pending and retries it on each load, it failed identically forever.
+        """
+        payload = api.migrate_bots(api.BotMigrateRequest(bots=[
+            {"id": "good", "name": "Good"},
+            {"id": "evil", "name": "Evil", "temperature": int("1" + "0" * 400)},
+            {"id": "also-good", "name": "Also Good"},
         ]))
-        ids = [row["id"] for row in payload["migrated"]]
-        self.assertEqual(len(set(ids)), 2, f"a bot was lost: {payload['migrated']}")
-        personas = sorted(self.row(payload, bot_id)["persona"] for bot_id in ids)
-        self.assertEqual(personas, ["the first", "the second"])
+        self.assertEqual([row["status"] for row in payload["migrated"]],
+                         ["created", "created", "created"])
+        # The unusable temperature is simply unset -- the provider's default, not a derived number.
+        self.assertIsNone(self.row(payload, "evil")["temperature"])
+        for bot_id in ("good", "also-good"):
+            self.assertIsNotNone(gn_bots.load(self.runtime).get(bot_id))
+
+    def test_a_boolean_is_not_a_temperature(self) -> None:
+        # float(True) is 1.0, so `"temperature": true` became a stored 0.01 -- a number nobody
+        # chose, which is the fabrication this program forbids.
+        payload = api.migrate_bots(api.BotMigrateRequest(bots=[
+            {"id": "yes", "name": "Yes", "temperature": True},
+            {"id": "no", "name": "No", "temperature": False},
+            {"id": "sneaky", "name": "Sneaky", "temperature": "1_0"},
+        ]))
+        for bot_id in ("yes", "no", "sneaky"):
+            with self.subTest(bot=bot_id):
+                self.assertIsNone(self.row(payload, bot_id)["temperature"])
+
+    def test_more_bots_than_one_handover_reads_is_reported(self) -> None:
+        extra = api.MIGRATE_LIMIT + 5
+        payload = api.migrate_bots(api.BotMigrateRequest(bots=[
+            {"id": f"b{index:04d}", "name": f"Bot {index}"} for index in range(extra)]))
+        self.assertEqual(payload["created"], api.MIGRATE_LIMIT)
+        overflow = [row for row in payload["migrated"] if row["status"] == "deferred"]
+        self.assertEqual(len(overflow), 1, "the bots that fell off the end must be reported")
+        self.assertIn("5 more bot(s) were not read", overflow[0]["note"])
+        # And the app is told how many were consumed, so it can keep the unread tail pending and
+        # send it next time -- which is what makes "the rest will be added" a true sentence.
+        self.assertEqual(payload["read"], api.MIGRATE_LIMIT)
+        self.assertIn("next load", overflow[0]["note"])
+        self.assertNotIn("run it again", overflow[0]["note"])
+
+    def test_a_field_too_long_shortens_the_field_and_says_so(self) -> None:
+        # Losing text silently and losing the whole bot are both wrong inside a route that
+        # promises to lose nothing. It is cut to fit, and the row says it was cut.
+        payload = api.migrate_bots(api.BotMigrateRequest(bots=[
+            {"id": "wordy", "name": "N" * 300, "persona": "P" * 2000, "style": "S" * 300}]))
+        row = payload["migrated"][0]
+        self.assertEqual(row["status"], "created")
+        for field in ("name", "persona", "style"):
+            self.assertIn(f"{field} was shortened", row["note"])
+        stored = self.row(payload, "wordy")
+        self.assertEqual((len(stored["name"]), len(stored["persona"]), len(stored["style"])),
+                         (60, 600, 80))
 
     def test_it_cannot_run_twice(self) -> None:
         first = api.migrate_bots(api.BotMigrateRequest(bots=self.BROWSER))

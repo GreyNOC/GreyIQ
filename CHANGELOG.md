@@ -51,6 +51,107 @@ Notable changes to GreyIQ.
   with `gn bot use` is not overruled by a browser arriving late. A browser that never had its own
   bots migrates nothing — a registry record names a provider and a browser-only bot never did, which
   is how the two are told apart.
+- **Sixteen more defects from the adversarial review of the above, every one reproduced before it
+  was fixed.** Two reviewers were pointed at the diff and told to refute it, one at the routes and
+  one at the browser. The pattern is the one this program cares most about, again: a surface saying
+  something it had no right to say.
+
+  *The handover dropped a bot and told the operator it had not.* Two browser bots that slug to one
+  id — `Forge` and `FORGE`, or two called "New Bot" with no id — were checked against the registry
+  as it GREW, so the second was reported `exists: forge was already in the store; left as it is`.
+  Both halves were false: it was not already there, and nothing was left as it was — a different
+  bot was, and the app then re-keyed the dropped bot's chat history onto the survivor.
+  `register`'s numbering could never run from that path at all. "Already there" now means *before
+  this handover*, and a collision inside one payload is numbered and says so.
+
+  *One tampered entry bricked the handover permanently.* A 400-digit JSON integer in `temperature`
+  made `float()` raise `OverflowError` — an `ArithmeticError`, which a `(TypeError, ValueError)`
+  clause does not catch — so the route 500'd, every other bot in the body was lost, and because the
+  app leaves a failed handover pending and retries it on every load, it failed identically forever.
+  The value is stringified first now, exactly as `gn_bots.coerce` does it. A JSON `true` had been
+  becoming a stored temperature of 0.01, which is a number nobody chose.
+
+  *A stale cache asserted things only a running backend can know.* `saveState` persisted the four
+  fields `_bot_payload` computes precisely BECAUSE the browser cannot see the files behind them, and
+  the panel decided "this is a cache" by asking whether the record had a `readiness` — which a cache
+  has. So a browser that had reached the service once said **"Ready. Key configured. Stays on this
+  machine."** with nothing running at all. The gate is now whether the store has answered in this
+  session, the roster drops its readiness bracket and `->net` marker with it, and those four fields
+  are no longer written to localStorage.
+
+  *The editor froze permanently after any service blip.* `disabled` was only ever set, never
+  cleared, and six of the nine controls had no other writer — so opening the app before the backend
+  was up left Name, Persona, Style, Variation and both buttons dead, with the tooltip explaining why
+  cleared on the next render, and nothing but a reload to recover. One function now assigns every
+  control's state on every call from the bot and the store alone.
+
+  *A refused edit stayed on screen and in localStorage.* The panel applies your typing to the cache
+  so it stays responsive; on a refusal it stayed — the roster, the chat byline and the editor all
+  showing a bot name the store had never held, under an error saying the write had failed. It
+  reverts to what the store last served.
+
+  *Nothing ever re-read the store.* After the first successful read the app never asked again, so
+  "the app's selection and the `*` in `gn bot ls` are the same bot" was true only at page load:
+  `gn bot use` in the shell left the app naming the old bot, and `gn bot rm` left a deleted bot in
+  the roster, selectable, with a full editor. It revalidates every 30 seconds — never while you are
+  mid-edit — and a bot the store no longer has now takes its colour, fit, chat and memories with it.
+
+  *And the rest.* A new chat with the hosted `anthropic` bot opened with "Claude is loaded and
+  running locally", under a readiness line saying prompts leave the machine; the greeting is the
+  store's own sentence now. A failed handover lost the operator's selected bot, which the retry
+  could not re-derive. The re-key `delete`d per-viewer data whenever the destination id already
+  existed — which for colours is always — instead of merging it. A 200 that was not a store listing
+  still marked the handover done. Deleting a bot with an edit in the debounce posted that edit
+  afterwards and painted its 422 as if the delete had failed. `teach` rewrote the whole store for a
+  lesson the bot already knew, which can lose a bot another shell created inside that window — the
+  CLI's door does not save there and this one no longer does. The migration capped at 200 bots and
+  said nothing; a long persona was truncated silently while a long style refused the whole bot;
+  `base_url` was advertised as 400 characters and stored as 200; the clone's "pick an unused colour"
+  could never find one; `#botName` held 28 characters where the store holds 60; the chat floored an
+  explicit temperature of 0 at 0.05; and one of the new tests asserted a string that could never
+  match.
+- **Five more from the reviewers' second pass, two of them introduced by the first round's fixes.**
+  Fixing a thing is not the same as fixing it safely, so the reviewers were asked to re-refute their
+  own closed findings.
+
+  *A `bots.json` the backend could not read deleted the operator's chat history.* The new reaper —
+  which clears colour, fit, chats and memories for a bot `gn bot rm` removed — ran against whatever
+  `/api/bots` listed. But `gn_bots.load` answers an unparseable store with the six built-ins and a
+  store holding a refused entry with that entry left out, and goes to real lengths never to
+  overwrite either, precisely so the bots come back once the file is fixed. The browser deleted
+  their history the moment such a listing landed, which turned a recoverable file problem into
+  permanent silent loss — reachable by editing the store in Notepad or PowerShell, which write
+  UTF-16. Nothing is pruned now unless the store vouches for the listing (`error` empty,
+  `readable` true). Driven for real: a UTF-16 `bots.json` falls back to the built-ins, says so, and
+  every bot's history is still there when the file is repaired.
+
+  *A revalidation read could undo a click.* Nothing stopped a write starting while a read was in
+  flight, and the later response won — so clicking a bot inside a slow read snapped the roster and
+  the "Live:" line back to the previous bot for up to 30 seconds while the store, and `gn bot ls`,
+  said otherwise. A read now carries a write counter and drops its own answer if a write began
+  after it.
+
+  *A credential in the app's own config was printed verbatim.* `POST /api/coder` writes
+  `coder.local.base_url` with no validation and `endpoint_for` read it back with none either, so
+  `http://u:sk-live-...@10.0.0.9:11434/v1` reached `/api/bots`' `endpoint`, `gn bot show`, the
+  studio's BRAIN row and the app's readiness line — the same value the identical field on a *bot*
+  refuses, with a refusal that deliberately does not quote it. One field, two rules, decided only
+  by which file it was read from. `endpoint_for` runs the config through the same `coerce` now and,
+  on refusal, keeps `scheme://host[:port]/path` and drops the rest: the host must survive, because
+  the request really goes there and `->net` depends on it. The `->net` answer was already correct
+  for every hostile value — `_is_loopback` parses and fails closed — so this was a leak, never a
+  false "stays on this machine".
+
+  *And two smaller ones.* The migration's cap row said "run it again", which the operator had no
+  way to do: a capped handover is still a successful 200, so the one-shot marker landed and bot 201
+  onward never arrived. The route reports how many entries it read, the app keeps the unread tail
+  pending — persisted, which also means a handover that fails and is followed by a reload no longer
+  loses the browser's bots — and the marker waits for the last of them. An over-long `base_url` was
+  bounded on the create door but not on `update`, whose `fields` dict nothing bounded; `coerce`
+  refuses it at the source now instead of silently keeping the first 200 characters. And a roster
+  row stayed clickable while the editor was frozen, so a click before the store had answered posted
+  a pre-registry id it had never heard of and painted a 422 — refused now, in the same sentence the
+  frozen controls carry.
 - **Three sentences on that panel were the app's own, and one of them was false.** `gn_bots` owns
   one sentence for "what making this bot live means" (`what_it_does`) precisely because the CLI and
   the studio each had their own and one contradicted itself inside a single line. Clicking a bot in

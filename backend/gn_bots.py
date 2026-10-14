@@ -776,7 +776,39 @@ def endpoint_for(runtime_dir: str | Path, bot: Bot) -> str:
         return ""
     block = doc.get("coder") if isinstance(doc, dict) else {}
     local = block.get("local") if isinstance(block, dict) else {}
-    return _text(local.get("base_url"), 200) if isinstance(local, dict) else ""
+    raw = local.get("base_url") if isinstance(local, dict) else None
+    endpoint, error = coerce(_FIELD_BY_KEY["base_url"], raw)
+    if not error:
+        return endpoint
+    # REFUSED: a credential, a query, a fragment or an over-long value is riding in the app's own
+    # config. That field is written by ``POST /api/coder`` with no validation and was read here
+    # through ``_text`` with none either, so ``http://u:sk-live-...@10.0.0.9:11434/v1`` reached
+    # ``/api/bots``' ``endpoint``, ``gn bot show``, the studio's BRAIN row and the app's readiness
+    # line verbatim — one field, two rules, depending only on which file it was read from. It is
+    # NOT blanked: ``coder.generate`` still posts to that host, so :func:`sends_off_machine` must
+    # keep the host to answer truthfully. The parts no surface may print are dropped instead.
+    return _redacted_endpoint(raw)
+
+
+def _redacted_endpoint(value: Any) -> str:
+    """``scheme://host[:port]/path`` of a URL that failed :func:`coerce`, or ``""``.
+
+    Userinfo, query and fragment are gone — those are where a credential travels. The host is
+    kept because the request really goes there and the ``->net`` marker depends on it.
+    """
+    import urllib.parse
+
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+        hostname = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not hostname:
+        return ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    path = re.sub(r"[^A-Za-z0-9._~%/+-]", "", parsed.path or "")[:120]
+    return f"{parsed.scheme}://{host}{f':{port}' if port else ''}{path}"
 
 
 def sends_off_machine(runtime_dir: str | Path, bot: Bot) -> bool:
@@ -858,6 +890,11 @@ def coerce(item: Field, value: Any) -> tuple[Any, str]:
     if item.kind == "url":
         if not text:
             return ("", "")
+        # Refused rather than truncated. ``_text`` above has already cut the value to 200, so a
+        # 326-character endpoint used to be stored as its first 200 characters with nothing said,
+        # and the app then showed and used an endpoint the operator never typed.
+        if len(str(value or "").strip()) > 200:
+            return (None, f"{item.key} is at most 200 characters")
         # NO userinfo, query or fragment. An endpoint needs none of the three, and each one is a
         # place a credential travels: `https://api.example.com/v1?api_key=sk-live-...` used to be
         # accepted, stored in bots.json and printed verbatim by `gn bot show` and `--json` - from
