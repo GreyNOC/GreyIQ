@@ -17,9 +17,24 @@ docker run --rm \
     mkdir -p "$target/bin"
     tar -xzf /tmp/greyiq-cli.tar.gz -C "$target"
     env PATH=/usr/bin:/bin "$target/greyiq-cli" --version
-    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend status --json >/tmp/defend-status.json
-    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend rules --json >/tmp/defend-rules.json
-    grep -Fq '"rule_id": "defender.risky_listener"' /tmp/defend-rules.json
+    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend status --json >/tmp/defend-status.json 2>/tmp/defend-status.err || {
+      cat /tmp/defend-status.err >&2
+      cat /tmp/defend-status.json >&2
+      echo "Debian 13 CLI archive defender status command failed." >&2
+      exit 1
+    }
+    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend rules --json >/tmp/defend-rules.json 2>/tmp/defend-rules.err || {
+      cat /tmp/defend-rules.err >&2
+      cat /tmp/defend-rules.json >&2
+      echo "Debian 13 CLI archive defender rules command failed." >&2
+      exit 1
+    }
+    # The surrounding bash -c body is single-quoted by the host shell.
+    grep -Fq "defender.risky_listener" /tmp/defend-rules.json || {
+      cat /tmp/defend-rules.json >&2
+      echo "Debian 13 CLI archive is missing the frozen defender rule." >&2
+      exit 1
+    }
     env PATH=/usr/bin:/bin "$target/greyiq-cli" path > /tmp/path-direct.txt
     grep -F "export PATH=" /tmp/path-direct.txt
     ln -s "$target/greyiq-cli" "$target/bin/greyiq-cli"
