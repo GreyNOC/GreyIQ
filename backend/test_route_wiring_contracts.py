@@ -471,6 +471,7 @@ class NoNewOrphanRoutesTests(unittest.TestCase):
     # route -> why it has no app.js caller today
     KNOWN = {
         "/api/health": "the readiness gate the Electron shell and the release smoke tests poll",
+        "/api/internal/defense-identity": "the gn defense CLI proves the local API identity before sending credentials",
         "/api/internal/ollama-model-store": "the Electron shell reports the managed model-store path after starting Ollama",
         "/api/bounty/finding/reverify": "superseded in the UI by /finding/prove; still served for API clients",
         "/api/bounty/platforms": "the app ships the same list as CK_PLATFORMS and renders it offline",
