@@ -96,7 +96,7 @@ files in the repository** — download one from
 desktop libraries and `zstd`, which the on-demand Ollama download needs:
 
 ```bash
-sudo apt install ./GreyIQ-5.0.4-amd64.deb
+sudo apt install ./GreyIQ-5.0.5-amd64.deb
 greyiq-cli dashboard
 ```
 
@@ -139,7 +139,7 @@ cat /etc/debian_version     # 12.x derivatives (Parrot 6, Kali) are not the buil
 | Message | Cause | Fix |
 | --- | --- | --- |
 | `Unsupported file … given on commandline` | the filename matched nothing — most often the `GreyIQ-*-amd64.deb` glob pasted inside a fresh clone, where no release asset exists | download the asset from Releases, or use the git-clone CLI install above |
-| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-5.0.4-amd64.deb` |
+| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-5.0.5-amd64.deb` |
 | `package architecture (amd64) does not match system (arm64)` | the release package is amd64 only | use the git-clone CLI install above — it is pure Python and architecture-independent |
 | `Depends: libasound2t64 but it is not installable` | releases up to 4.12.0 require the Debian 13 package name; Debian 12 derivatives call it `libasound2` | use the git-clone CLI install or the AppImage; packages built after 4.12.0 accept either name |
 | `version 'GLIBC_2.xx' not found` from `greyiq-cli` or `greyiq` | the frozen binaries are built on Ubuntu 24.04 and need a newer glibc than Debian 12 derivatives ship | use the git-clone CLI install above, which runs on the distribution's own Python |

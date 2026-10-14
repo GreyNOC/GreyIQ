@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import io
+import json
 import sys
 import tempfile
 import time
@@ -150,6 +151,49 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertIn("SNAPSHOT 12:00:00Z", "\n".join(plain))
         self.assertIn("SYN:1 ACK:0", state.selected_detail())
         self.assertIn("SYN:1 ACK:0", "\n".join(plain))
+
+    def test_packet_pid_is_visible_searchable_and_provenance_labeled(self) -> None:
+        state = BoardState(capture_enabled=True)
+        result = _result()
+        result["tools"]["tshark"]["packets"][0].update(
+            {"pid": 4321, "pid_attribution": "socket_snapshot"})
+        state.ingest(result)
+        frame = "\n".join(render(state, gn_tui.Size(100, 25), color=False))
+        self.assertIn("PID SOURCE", frame)
+        self.assertIn("  4321 ", frame)
+        self.assertIn("PID:4321 [socket_snapshot]", state.selected_detail())
+        state.query = "4321"
+        self.assertEqual(len(state.matching_packets()), 1)
+        state.query = "9876"
+        self.assertEqual(state.matching_packets(), [])
+
+    def test_scan_persists_socket_joined_packet_pid(self) -> None:
+        snapshot = {"schema_version": 1, "collected_at": "2026-10-14T12:00:00Z",
+                    "host": {"hostname": "fixture"},
+                    **{name: [] for name in ("processes", "routes", "services", "startup",
+                                              "packages", "files")},
+                    "connections": [{"protocol": "tcp", "local_address": "10.0.0.2",
+                                     "local_port": 51000, "remote_address": "198.51.100.3",
+                                     "remote_port": 443, "state": "ESTABLISHED", "pid": 4321}],
+                    "interfaces": [{"addresses": ["10.0.0.2/24"]}],
+                    "file_roots": [], "coverage": {}, "errors": []}
+        capture = {"ok": True, "tool": "tshark", "status": "complete",
+                   "duration_seconds": 1, "packets": [
+                       {"timestamp": "2026-10-14T12:00:01Z", "source": "10.0.0.2",
+                        "source_port": 51000, "destination": "198.51.100.3",
+                        "destination_port": 443, "protocol": "tcp", "length": 80}],
+                   "flows": []}
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, \
+             mock.patch.object(defender_cli, "_runtime", return_value=Path(temp)), \
+             mock.patch("defender.inventory.collect_inventory", return_value=snapshot), \
+             mock.patch("defender.tools.capture_tshark", return_value=capture), \
+             mock.patch.object(sys, "stdout", output):
+            self.assertEqual(gn_cli.main(["defend", "scan", "--capture-interface", "test0",
+                                          "--capture-seconds", "1", "-y", "--json"]), 0)
+        row = json.loads(output.getvalue())["tools"]["tshark"]["packets"][0]
+        self.assertEqual(row["pid"], 4321)
+        self.assertEqual(row["pid_attribution"], "socket_snapshot")
 
     def test_retro_signal_and_bounded_alert_queue_keep_strongest_lead_visible(self) -> None:
         state = BoardState(capture_enabled=True, sweep=2)

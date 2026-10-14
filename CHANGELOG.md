@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.5
+
+- Show a best-effort local PID beside each captured TCP/UDP packet in the
+  defender wire table and searchable packet detail. Join packet tuples against
+  the local socket inventory, preferring exact connected sockets and using
+  listener or bound endpoints only for inventoried local addresses. Record
+  `socket_snapshot`, `listener_endpoint`, `ambiguous`, or `unknown` with every
+  packet and leave conflicting or unmatched PIDs blank. This is a time-sensitive
+  local socket association, not remote process or actor attribution.
+
 ## 5.0.4
 
 - Add keyboard paging and edge jumps across ports, configured proxy endpoints,

@@ -395,6 +395,9 @@ def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False,
                                                authorized=args.authorize_local_scan,
                                                seconds=args.capture_seconds,
                                                packet_limit=args.packet_limit)
+            from defender.packet_owner import annotate_packet_owners
+
+            annotate_packet_owners(tools["tshark"], current)
             from defender.detection import detect_tcp_syn_probes
 
             findings.extend(detect_tcp_syn_probes(tools["tshark"], current))
