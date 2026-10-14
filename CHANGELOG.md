@@ -322,6 +322,48 @@ Notable changes to GreyIQ.
   at all (`ValueError` from inside pathlib, not `OSError`) instead of raising into a footer. And the
   agent-clone row is always present, even when the store is empty: a clone made by `gn agent clone`
   rather than `gn bot hf` is not a registry entry, so a vanishing row made those clones invisible.
+- **The threat board fills the terminal, and you can drive it mid-hunt.** It used to draw in a
+  fixed 78x24 box, which on a 200x60 window is a small rectangle surrounded by nothing. The map,
+  its asset sites and the GREYNOC home node are authored on a 72x17 grid and now scale together
+  (`gn_fx.scaled_map`), so an arc still lands on the continent its asset was placed on; both
+  dimensions fill, clamped to an aspect that still reads as continents rather than a smear. Below
+  72x17 it refuses as before — a world map with Asia cut off is not a threat board.
+- **In-hunt controls.** The board read no keys while a hunt ran, so the only way to see detail was
+  to wait for the summary. It now reads the keyboard on its own daemon (the run owns the main
+  thread here, the inverse of the panel cockpit) and `l` / `f` / `r` open three views over the map,
+  keeping the header, DEFCON, scope statement and tally around them: **LOG** (the engine's own
+  lines, scrollable with PgUp/PgDn — the teletype only ever showed the last two), **FINDINGS**
+  (arcs that resolved, with the severity the engine confirmed) and **TRAFFIC** (every active
+  request, with method, host, path and status). `b` or Esc returns to the map; `q` asks the hunt to
+  **stop at the next safe point** through the engine's existing `should_stop` hook, so the probe in
+  flight finishes and the report is still written — Ctrl-C remains the hard way out. The board
+  releases the keyboard before the engine's auth prompt reads stdin, which is what keeps the two
+  off the same tty.
+  A review of this branch caught `q` reaching only one of the three surfaces that offer it. Every
+  scoped board advertises the key, but only `gn hunt` passed the board's predicate to its engine:
+  `gn campaign` and `gn auto`'s reviewed cycle passed neither it nor the request feed, and a direct
+  campaign registers no dashboard run id, so the engine's own `progress.is_stopped` could not see
+  the key press either — the board printed STOP REQUESTED and the campaign went on sending requests
+  at someone else's host. `run_campaign` and `run_campaign_over_targets` now take `should_stop` and
+  `on_request` beside the run id, honour Stop from either source between URLs and inside a single
+  URL's own fan-out, and the CLI wires every board to both. A surface does not offer a control this
+  engine will not honour.
+- **More animation, all of it driven by something real.** A **tracking reticle** closes around the
+  asset the prover is hitting at that instant — from the request feed, so when the traffic stops so
+  does the reticle; a **request-rate sparkline** on the status bar, one cell per second off the same
+  feed, so the bars and the TRAFFIC list can never disagree; and the **DEFCON label flashes** the
+  moment it drops, which is the one state change on this board an operator must not miss. The
+  traffic feed is taken at `active_verify_service._Http.fetch` — the single chokepoint every active
+  request passes through — so it is what actually left the machine rather than a guess from a
+  progress line, and an observer that raises can never cost a probe. That promise needed one more
+  line to be true: `fetch` reported every refusal it caught, and the preflight refusals — an
+  exhausted request budget, a standing halt, a virtual-host header on an exact-host run, an http URL
+  under an HTTPS-only session, the SSRF guard, the governor — are raised before a socket is opened.
+  The feed and the sparkline gained rows for requests that never happened. The observation is now
+  drawn at the transport attempt itself (the line that increments `sent`), so a refusal is counted
+  as a failure and never shown as traffic, while a request that really went out and then failed
+  still appears.
+
 - **An agent studio, in the board's own theme.** `gn studio` (also `/studio` from the threat board,
   and `gn dash --studio`) is the third view of one cockpit: **BRAIN** (which bot answers, the
   provider and model, agent skills and commands, internet — the key row says *configured* or *none*,
@@ -430,12 +472,31 @@ Notable changes to GreyIQ.
   `scan`, `takeover`, `cve`, `idor`, `idor-probe` and `bfla`. Three bounds make it safe: without
   `-y` nothing is added (the flag is the attestation); the grant is **exact** — the target's own host
   or repository root, never a `*.` wildcard, and `gn auto`'s wider apex is not used; and only the
-  target the operator NAMED is granted, so a host the engine discovers mid-run must still be in
-  scope on its own. `settings.excluded_hosts` still wins over it, a bare public suffix
-  (`herokuapp.com`), a single-label host, a local path and a credentialed URL grant nothing, and the
-  derived grant is produced in one place in the engine (`bounty.self_scope_grant`) that is pinned
-  against the scope preflight so the two cannot drift. The threat board's `SCOPE` heading and the
-  report's scope line now state the run's effective scope, which is what it is bound by.
+  target the operator NAMED is probed.
+  That last bound needs the caller's help, and a security review of this branch caught it not
+  getting it: a bare host token is exact-OR-proper-subdomain at `host_in_active_scope` — long
+  established, and what a wildcard program wants — so a derived grant would have let an `--active`
+  hunt reach `admin.acme.example` off `gn hunt https://acme.example -y`. `run_bounty_hunt` and
+  `campaign` now **pin** their recon gate and their active prover to the exact host unless the scope
+  carries a `*.` token. That question was first asked of the scope TEXT as a whole — "does any
+  token carry a `*.`" — and a second review pass caught it widening scope on its own: with `-s
+  '*.other.example'`, `-y` makes the effective scope `*.other.example acme.example`, and the one
+  wildcard lifted the pin off the other token, so the crawl and the prover could reach
+  `admin.acme.example` on the strength of a grant about somebody else's domain. A wildcard is a
+  grant about the domain it names, so the question now takes the host it is being asked about
+  (`active_verify_service.wildcard_admits_host`) and the global form is gone. A real wildcard
+  program's reach is unchanged. A URL on a code forge — a
+  repository link with a query, a fragment, a `/tree/` path, or an org with no repository — grants
+  **nothing** rather than the whole forge, which is a shared platform with thousands of unrelated
+  tenants; the canonical repository root still grants the repository and no host authority at all.
+  `gn takeover` deliberately does not pin, because enumerating the named apex's subdomains is the
+  whole verb, and it now announces that derived reach on the way in the way `gn auto` announces a
+  derived scope.
+  `settings.excluded_hosts` still wins over all of it, a bare public suffix (`herokuapp.com`), a
+  single-label host, a local path and a credentialed URL grant nothing, and the derived grant is
+  produced in one place in the engine (`bounty.self_scope_grant`) that is pinned against the scope
+  preflight — and now against the active gate — so the readings cannot drift. The threat board's
+  `SCOPE` heading and the report's scope line state the run's effective scope.
 
 ## v4.12.0 - hunts that pause at the login wall
 

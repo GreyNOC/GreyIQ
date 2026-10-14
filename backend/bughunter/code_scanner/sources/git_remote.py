@@ -39,6 +39,17 @@ _NON_REPOSITORY_SEGMENTS = frozenset({
 })
 
 
+def is_forge_host(host: str) -> bool:
+    """Whether this host is one of the code forges this module knows how to clone from.
+
+    Public because ``bughunter.bounty.self_scope_grant`` has to recognise a forge PAGE url — a
+    link with a query, a fragment, a ``/tree/`` path or an org with no repository — which is not a
+    canonical repository root and must not be mistaken for a web target whose whole host the
+    operator attested to. A forge is a shared platform with thousands of unrelated tenants on it.
+    """
+    return str(host or "").strip().lower().rstrip(".") in _HOST_ALLOWLIST
+
+
 def canonical_repo_root(url: str) -> str:
     """Return a supported public HTTPS repository root, or ``''`` if ambiguous.
 

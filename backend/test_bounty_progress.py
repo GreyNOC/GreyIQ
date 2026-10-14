@@ -554,6 +554,11 @@ class KillSwitchReachesADirectHuntTests(unittest.TestCase):
     provers kept sending requests at a host the operator had just realised was out of scope. That is
     the one control in an authorized-testing tool that has to work.
 
+    Stop now has a second source for the same reason: a run id only exists when a DASHBOARD
+    registered one, so the CLI threat board's `q` reaches the engines as a predicate the caller owns
+    (``should_stop``). ``TheCampaignHonoursAStopFromItsCallerTests`` in test_campaign.py drives that
+    half; these stay on the wiring.
+
     These tests assert the wiring rather than driving a live hunt: the predicate exists, every probe
     launch site consults it, and a broken predicate cannot abort a legitimate run.
     """
@@ -590,12 +595,27 @@ class KillSwitchReachesADirectHuntTests(unittest.TestCase):
         self.assertIn("return False", body)
 
     def test_both_entry_points_pass_the_predicate(self) -> None:
+        import inspect
+
+        from bughunter import campaign as campaign_mod
+
         api = (BACKEND_DIR / "greyiq_api.py").read_text(encoding="utf-8")
         self.assertIn("should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid))", api,
                       "the direct-hunt route does not pass the kill switch")
-        campaign_src = (BACKEND_DIR / "bughunter" / "campaign.py").read_text(encoding="utf-8")
-        self.assertIn("should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid))", campaign_src,
-                      "a campaign's per-URL hunt does not pass the kill switch, so Stop waits out the URL")
+        # A campaign forwarded the dashboard's run-id check and nothing else, spelled as a literal
+        # lambda this test matched on. It now forwards its own ``_stopped()``, which ORs that check
+        # with a predicate the CALLER owns — the CLI threat board's `q`, which no run id can see.
+        # So the assertion is on the wiring, not on one spelling of it.
+        signature = inspect.signature(campaign_mod._run_campaign_body)
+        self.assertIn("should_stop", signature.parameters,
+                      "a campaign cannot be told to stop by the surface watching it")
+        source = inspect.getsource(campaign_mod._run_campaign_body)
+        self.assertIn("def _stopped()", source)
+        self.assertIn("should_stop=_stopped", source,
+                      "a campaign's per-URL hunt does not pass the kill switch, so Stop waits out "
+                      "the URL")
+        self.assertIn("if _stopped():", source,
+                      "the campaign's own per-URL loop does not consult the kill switch")
 
     def test_the_flag_itself_round_trips(self) -> None:
         run_id = "killswitch-contract-test"

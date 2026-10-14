@@ -57,7 +57,11 @@ from bughunter import surface_drift
 from bughunter import toolkit as toolkit_lib
 from bughunter import web_ingest
 from bughunter.code_scanner.redaction import redact_text
-from bughunter.code_scanner.sources.git_remote import canonical_repo_root, is_supported_remote_git_url
+from bughunter.code_scanner.sources.git_remote import (
+    canonical_repo_root,
+    is_forge_host,
+    is_supported_remote_git_url,
+)
 from bughunter.live_scan_service import run_live_scan
 from bughunter.rate_limit import HostRateGovernor, shared_governor
 from bughunter.registrable_domain import is_bare_public_suffix
@@ -653,9 +657,19 @@ def self_scope_grant(target: str) -> str:
     same reason (``hunt_dir._derive_scope``); this is that rule, one place, for every verb.
 
     THE ONE PLACE a target becomes a grant, so the CLI never reimplements host identity and the
-    two cannot disagree about what ``acme.example`` means. Deliberately NARROWER than ``gn auto``'s
-    derived scope, which takes the apex and admits subdomains: this grants the exact host and
-    nothing else. ``-s *.acme.example`` is how an operator asks for more.
+    two cannot disagree about what ``acme.example`` means. The token is the EXACT host — never a
+    ``*.`` wildcard, and never ``gn auto``'s wider apex. ``-s *.acme.example`` is how an operator
+    asks for more.
+
+    "Exact" is a property of the TOKEN, and one caller has to do the other half. A bare host token
+    is exact-OR-proper-subdomain at :func:`active_verify_service.host_in_active_scope` — long
+    established, and what a wildcard program wants — so the scope text alone cannot say whether
+    subdomains were attested to. ``run_bounty_hunt`` and ``campaign`` therefore PIN their recon
+    gate and their prover to this exact host unless a ``*.`` token in the scope asks for the host
+    being considered (``active_verify_service.wildcard_admits_host`` — a question about THAT host,
+    so a wildcard over one domain cannot lift the pin off a bare token for another). ``gn takeover``
+    does not pin, because enumerating the named apex's subdomains is the whole verb — and it says
+    so on the way in.
 
     Returns ``""`` — never a guess — for a local path (which needs no scope), for anything
     unparseable, and for any token the preflight would then reject as ambiguous, so the operator
@@ -678,6 +692,16 @@ def self_scope_grant(target: str) -> str:
     # be a grant for a target that can never be hunted — and this is not a place to be holding a
     # password at all.
     if "@" in parsed.netloc:
+        return ""
+    # A forge PAGE — a repository link with a query, a fragment, a /tree/ or /issues/ path, or an
+    # org with no repository — reaches here because ``canonical_repo_root`` is strict and
+    # ``_infer_kind`` then calls it a url. It is NOT evidence that the operator attested to the
+    # whole forge: that is a shared platform with thousands of unrelated tenants, exactly the harm
+    # ``is_bare_public_suffix`` exists to prevent for a scope token an operator typed. The
+    # canonical root (above) grants the repository and no host authority; anything else on a forge
+    # host grants nothing, and the operator gets the ordinary explicit-scope refusal, which names
+    # what to pass instead.
+    if is_forge_host(host):
         return ""
     # The same validity test _url_scope_preflight applies to a token the OPERATOR typed. A grant
     # that fails it is one the preflight would reject, and the test below pins that agreement.
@@ -2904,6 +2928,9 @@ def _run_bounty_hunt_body(
     # "Stopped", disabled the button — and the active fan-out, the re-plan wave and the OOB probes all
     # kept sending requests at a production host the operator had just realised was out of scope.
     should_stop: Any = None,
+    #: Called with ``(method, url, status)`` for every ACTIVE request. The CLI passes the threat
+    #: board's own sink so its TRAFFIC view shows what actually left the machine.
+    on_request: Any = None,
     settings: Any = None,
     oob_base: str = "",
     oob_secret: str = "",
@@ -2973,6 +3000,18 @@ def _run_bounty_hunt_body(
         scope_host, scope_error = _url_scope_preflight(clean_target, scope, settings)
         if scope_error:
             return {"ok": False, "error": scope_error}
+
+    # The host the active paths below are PINNED to. A bare host token is exact-OR-proper-subdomain
+    # at ``host_in_active_scope``, which is the established semantics and what a wildcard program
+    # wants — but a token DERIVED from the target by ``-y`` (``self_scope_grant``) is an attestation
+    # about ONE host, and the scope text cannot carry that difference. So the pin holds unless a
+    # ``*.`` token in the scope asks for the host being considered, which is a question about THAT
+    # host (``active_verify_service.wildcard_admits_host``) and not about the scope text as a whole:
+    # asked globally, a ``-s *.other.example`` grant lifted the pin off ``acme.example`` as well and
+    # the prover could reach ``admin.acme.example``, which nobody attested to.
+    # Resolved HERE, beside the preflight that produced it: the recon block and the active target
+    # list both read it, and neither is guaranteed to run.
+    exact_active_host = scope_host
 
     # Optional authenticated scanning: bind the operator's cookie/headers to the
     # target host. Attached SAME-SITE only (see scan_auth) so the session reaches
@@ -3047,8 +3086,13 @@ def _run_bounty_hunt_body(
         try:
             _emit("active recon: mapping forms, JS parameters, and API hints...")
             active_settings = settings or active_verify_service.get_settings()
+            # PINNED to the exact host unless the operator asked for a wildcard (see
+            # exact_active_host, resolved beside the preflight above): without it this crawl — and
+            # the active prover it feeds — would reach a subdomain the operator never named.
             scope_gate = (
-                (lambda h: active_verify_service.host_in_active_scope(h, scope, active_settings))
+                (lambda h: active_verify_service.host_in_active_scope(h, scope, active_settings)
+                 and (_canonical_scope_host(h) == exact_active_host
+                      or active_verify_service.wildcard_admits_host(scope, h)))
                 if str(scope or "").strip()
                 else None
             )
@@ -3217,6 +3261,21 @@ def _run_bounty_hunt_body(
             endpoint_class_priorities = _merge_endpoint_priorities(
                 endpoint_class_priorities, _plan_priorities_by_endpoint(hb)
             )
+            if exact_active_host:
+                # Belt to the recon gate's braces, and the actual bound on what gets probed: a
+                # derived grant (-y, no -s) attests to ONE host, and a bare host token reads as
+                # exact-OR-proper-subdomain at host_in_active_scope. Done on the LIST rather than
+                # through verify_active's ``scope_host``, which is the chat-run mode (one attempt,
+                # halt on 429, no host-header check) and would change what a hunt does. The two
+                # gates have to agree about a wildcard, so the same per-host question is asked here.
+                _pinned = [u for u in active_targets
+                           if _canonical_scope_host(urlparse(u).hostname or "") == exact_active_host
+                           or active_verify_service.wildcard_admits_host(
+                               scope, urlparse(u).hostname or "")]
+                if len(_pinned) != len(active_targets):
+                    _emit(f"active: {len(active_targets) - len(_pinned)} discovered endpoint(s) are "
+                          f"off {exact_active_host} — not probed (scope names one host; -s *.{exact_active_host} widens it)")
+                active_targets = _pinned or [clean_target]
             if len(active_targets) > 1:
                 _emit(f"active recon: checking {len(active_targets)} discovered in-scope endpoint(s)")
         except operator_guard.GuardHalt:
@@ -3298,6 +3357,7 @@ def _run_bounty_hunt_body(
                         governor=active_governor,
                         class_priority=target_priority,
                         xss_params=target_xss_params,
+                        on_request=on_request,
                     )
                     target_meta = dict(target_meta)
                     target_meta["target"] = active_target

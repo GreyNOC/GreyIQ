@@ -673,6 +673,13 @@ after saving.
   model's. Opening the studio still sends nothing — no model call happens on the repaint path, only
   on a question you typed. A bot that sends off this machine is marked `->net` in the header, and
   `/pack <q>` asks the offline pack regardless.
+- **The board during a hunt** — it fills the terminal now, and takes keys while the run is going:
+  `l` the full engine log (PgUp/PgDn to scroll), `f` the findings as they are confirmed, `r` the
+  live request traffic (method, host, path, status), `b`/Esc back to the map, `q` to stop the hunt
+  at the next safe point rather than killing it mid-probe. A reticle closes on whichever asset the
+  prover is hitting, a sparkline on the status bar shows the request rate per second, and DEFCON
+  flashes when it drops. Every one of those is driven by something the engine reported — the
+  traffic feed is taken at the one chokepoint every active request goes through.
 - **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
   so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
   you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository
