@@ -185,6 +185,7 @@ class DefenderDetectionTests(unittest.TestCase):
         self.assertEqual(positive[0]["rule_id"], "defender.tcp_syn_port_probe")
         self.assertEqual(positive[0]["evidence"]["distinct_port_count"], 8)
         self.assertEqual(positive[0]["evidence"]["source_ip"], "8.8.8.8")
+        self.assertEqual(positive[0]["evidence"]["local_destinations"], ["192.168.1.10"])
         self.assertEqual(positive[0]["assessment"], "review_indicator")
         self.assertIn("does not prove an intrusion", positive[0]["explanation"])
 
@@ -202,6 +203,25 @@ class DefenderDetectionTests(unittest.TestCase):
         self.assertEqual(detect_tcp_syn_probes({"ok": False, "tool": "tshark"}, inventory), [])
         self.assertEqual(detect_tcp_syn_probes({"ok": True, "tool": "tshark", "packets": [],
                                                 "duration_seconds": 31}, inventory), [])
+
+    def test_tshark_syn_probe_counts_ports_per_local_destination(self) -> None:
+        inventory = {"interfaces": [{"name": "eth0", "addresses": ["192.168.1.10/24",
+                                                              "192.168.1.11/24"]}]}
+        rows = [{"timestamp": f"2026-10-13T12:00:{index:02d}Z", "source": "8.8.8.8",
+                 "destination": "192.168.1.10" if index % 2 == 0 else "192.168.1.11",
+                 "protocol": "tcp", "destination_port": 1000 + index,
+                 "tcp_syn": True, "tcp_ack": False} for index in range(8)]
+        capture = {"ok": True, "tool": "tshark", "interface": "eth0",
+                   "duration_seconds": 30, "packets": rows}
+        self.assertEqual(detect_tcp_syn_probes(capture, inventory), [])
+
+        capture["packets"] = rows + [
+            {**rows[0], "timestamp": f"2026-10-13T12:00:{index + 8:02d}Z",
+             "destination_port": 2000 + index} for index in range(4)]
+        findings = detect_tcp_syn_probes(capture, inventory)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["evidence"]["local_destinations"], ["192.168.1.10"])
+        self.assertEqual(findings[0]["evidence"]["distinct_port_count"], 8)
 
     def test_same_path_executable_hash_drift_needs_two_valid_hashes(self) -> None:
         inventory = {"processes": [], "connections": []}

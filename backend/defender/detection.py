@@ -515,7 +515,7 @@ def detect_tcp_syn_probes(
     if not local_addresses:
         return []
 
-    observations: dict[str, list[tuple[datetime, str, int]]] = {}
+    observations: dict[tuple[str, str], list[tuple[datetime, int]]] = {}
     for packet in packets:
         if not isinstance(packet, Mapping) or packet.get("protocol") != "tcp":
             continue
@@ -532,19 +532,19 @@ def detect_tcp_syn_probes(
                 or destination not in local_addresses or type(port) is not int
                 or not 1 <= port <= 65535):
             continue
-        observations.setdefault(str(source_ip), []).append((stamp, destination, port))
+        observations.setdefault((str(source_ip), destination), []).append((stamp, port))
 
     findings: list[dict[str, Any]] = []
-    for source, rows in observations.items():
+    for (source, destination), rows in observations.items():
         rows.sort(key=lambda row: row[0])
         left = 0
         port_counts: Counter[int] = Counter()
-        best: list[tuple[datetime, str, int]] = []
+        best: list[tuple[datetime, int]] = []
         best_port_count = 0
         for right, row in enumerate(rows):
-            port_counts[row[2]] += 1
+            port_counts[row[1]] += 1
             while (row[0] - rows[left][0]).total_seconds() > 30:
-                old_port = rows[left][2]
+                old_port = rows[left][1]
                 port_counts[old_port] -= 1
                 if port_counts[old_port] == 0:
                     del port_counts[old_port]
@@ -554,11 +554,10 @@ def detect_tcp_syn_probes(
                 best = rows[left:right + 1]
         if best_port_count < 8:
             continue
-        ports = sorted({row[2] for row in best})
-        destinations = sorted({row[1] for row in best})
+        ports = sorted({row[1] for row in best})
         evidence = {
             "source_ip": source, "interface": _text(capture.get("interface"), 128),
-            "local_destinations": destinations[:16], "distinct_port_count": len(ports),
+            "local_destinations": [destination], "distinct_port_count": len(ports),
             "destination_ports": ports[:64], "syn_packet_count": len(best),
             "first_seen": best[0][0].isoformat(timespec="milliseconds"),
             "last_seen": best[-1][0].isoformat(timespec="milliseconds"),

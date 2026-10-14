@@ -348,7 +348,7 @@ def _validate_active(args: argparse.Namespace) -> str:
     return ""
 
 
-def _scan_once(args: argparse.Namespace) -> dict[str, Any]:
+def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False) -> dict[str, Any]:
     from defender.baseline import compare_baseline, load_baseline
     from defender.detection import evaluate_inventory
     from defender.inventory import collect_inventory
@@ -362,7 +362,9 @@ def _scan_once(args: argparse.Namespace) -> dict[str, Any]:
         except (OSError, ValueError) as exc:
             raise ValueError(f"indicator file could not be used: {exc}") from exc
     path = _baseline_file(args.baseline)
-    baseline = load_baseline(path) if path.is_file() else None
+    if require_baseline and not path.is_file():
+        raise ValueError(f"watch baseline disappeared at {path}; watch stopped")
+    baseline = load_baseline(path) if require_baseline or path.is_file() else None
     roots = tuple(args.path or (baseline["inventory"].get("file_roots") or () if baseline else ()))
     feed_hashes = any(row.get("type") == "sha256" for row in feed["indicators"]) if feed else False
     reference_hashes = (baseline["inventory"].get("coverage", {}).get("process_binaries")
@@ -469,7 +471,7 @@ def _watch(args: argparse.Namespace) -> int:
     try:
         while not args.iterations or cycle < args.iterations:
             try:
-                result = _scan_once(args)
+                result = _scan_once(args, require_baseline=True)
             except (OSError, ValueError) as exc:
                 _event("watch_stopped", status="failed", evidence={"count": cycle},
                        message=f"scan failed: {type(exc).__name__}")

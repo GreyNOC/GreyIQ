@@ -214,6 +214,24 @@ class DefenderCliTests(unittest.TestCase):
             self.assertEqual(json.loads(output)["cycle"], 1)
             self.assertEqual(verify_events(root)["event_count"], 3)
 
+    def test_watch_stops_if_baseline_disappears_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = root / "defender" / "baseline.json"
+            with mock.patch.object(defender_cli, "_runtime", return_value=root), \
+                 mock.patch("defender.inventory.collect_inventory", return_value=_snapshot()):
+                self.assertEqual(_run(["defend", "baseline", "create",
+                                       "--accept-current-state"])[0], 0)
+                with mock.patch("time.sleep", side_effect=lambda _: baseline.unlink()):
+                    code, output, error = _run(["defend", "watch", "--iterations", "2", "--json"])
+            self.assertEqual(code, 2)
+            self.assertEqual(len(output.splitlines()), 1)
+            self.assertEqual(json.loads(output)["cycle"], 1)
+            self.assertIn("watch baseline disappeared", error)
+            events = verify_events(root)
+            self.assertTrue(events["ok"])
+            self.assertEqual(events["event_count"], 3)
+
     def test_evidence_budget_stops_without_deleting_existing_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with mock.patch.object(defender_cli, "_runtime", return_value=Path(temp)), \
