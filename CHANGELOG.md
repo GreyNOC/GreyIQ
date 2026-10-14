@@ -2,6 +2,12 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.1
+
+- Fix the Debian 13 release smoke check for the frozen defender CLI. Its rule
+  assertion now survives the nested shell quoting and reports command output on
+  failure. The 5.0.0 release remained unpublished after this check failed.
+
 ## 5.0.0
 
 - **Defender signal dashboard.** `gn defend dash` adds a full-screen terminal
