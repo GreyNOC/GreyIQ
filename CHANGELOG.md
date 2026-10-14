@@ -2,6 +2,15 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.3
+
+- Give the defender dashboard a retro live-circuit signal display while keeping
+  the port and packet tables readable. Retain up to 64 distinct rule leads in
+  the session, show the strongest severity first, and let operators cycle the
+  leads with `a`. A later clean scan does not erase the lead that turned the
+  board red, and the selected lead keeps its original evidence artifact path.
+  Each cycle's durable evidence remains in the journal and artifact.
+
 ## 5.0.2
 
 - Fix the same nested-shell rule assertion in the Linux headless CLI archive

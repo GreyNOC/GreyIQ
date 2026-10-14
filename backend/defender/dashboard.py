@@ -20,6 +20,9 @@ import gn_tui
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 _PACKET_HISTORY = 2000
+_ALERT_HISTORY = 64
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_SWEEP = ("[>    ]", "[=>   ]", "[==>  ]", "[===> ]", "[====>]", "[==== ]")
 
 
 def _safe(value: Any, limit: int = 160) -> str:
@@ -34,6 +37,10 @@ def _port(value: Any) -> str:
 
 def _count(value: Any) -> str:
     return str(value) if type(value) is int and value >= 0 else "-"
+
+
+def _flag(value: Any) -> str:
+    return "1" if value is True else "0" if value is False else "-"
 
 
 def _packet_text(packet: dict[str, Any]) -> str:
@@ -57,7 +64,10 @@ class BoardState:
     ports: list[dict[str, Any]] = field(default_factory=list)
     packets: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=_PACKET_HISTORY))
     findings: list[dict[str, Any]] = field(default_factory=list)
+    alert_history: deque[dict[str, str | int]] = field(default_factory=lambda: deque(maxlen=_ALERT_HISTORY))
     alert_latched: bool = False
+    selected_alert: int = 0
+    sweep: int = 0
     query: str = ""
     search_original: str = ""
     search_mode: bool = False
@@ -81,11 +91,35 @@ class BoardState:
         for packet in capture.get("packets") or []:
             if isinstance(packet, dict):
                 self.packets.append(packet)
-        self.findings = [row for row in result.get("findings") or [] if isinstance(row, dict)]
-        self.alert_latched |= bool(self.findings)
+        self.artifact = _safe((result.get("artifact") or {}).get("artifact_path"), 250)
+        self.findings = sorted(
+            [row for row in result.get("findings") or [] if isinstance(row, dict)],
+            key=lambda row: _SEVERITY_ORDER.get(str(row.get("severity") or "").lower(), 5),
+        )
+        known = {str(row["key"]) for row in self.alert_history}
+        fresh: list[dict[str, str | int]] = []
+        for finding in self.findings:
+            rule_id = _safe(finding.get("rule_id"), 80)
+            title = _safe(finding.get("title"), 140)
+            key = _safe(finding.get("finding_id") or f"{rule_id}|{title}", 220)
+            if key in known:
+                continue
+            known.add(key)
+            fresh.append({"key": key, "rule_id": rule_id, "title": title,
+                          "severity": _safe(finding.get("severity") or "review", 16).lower(),
+                          "cycle": self.cycle + 1, "artifact": self.artifact})
+        if fresh:
+            selected_key = (self.alert_history[self.selected_alert]["key"]
+                            if self.alert_history and self.selected_alert < len(self.alert_history) else None)
+            self.alert_history = deque(sorted(
+                [*self.alert_history, *fresh],
+                key=lambda row: (_SEVERITY_ORDER.get(str(row["severity"]), 5), -int(row["cycle"])),
+            )[:_ALERT_HISTORY], maxlen=_ALERT_HISTORY)
+            self.selected_alert = next(
+                (index for index, row in enumerate(self.alert_history) if row["key"] == selected_key), 0)
+        self.alert_latched = bool(self.alert_history)
         self.baseline = bool(result.get("baseline_sha256"))
         self.coverage_error = bool((result.get("inventory") or {}).get("errors"))
-        self.artifact = _safe((result.get("artifact") or {}).get("artifact_path"), 250)
         self.collected_at = _safe(result.get("at"), 32)
         self.cycle += 1
         self.busy = False
@@ -121,10 +155,11 @@ class BoardState:
         matches = self.matching_packets()
         if matches:
             row = matches[min(self.selected_packet, len(matches) - 1)]
-            return (f"PACKET {_safe(row.get('timestamp'))} | {_safe(row.get('protocol')).upper()} "
-                    f"{_safe(row.get('source'))}:{_port(row.get('source_port'))} > "
-                    f"{_safe(row.get('destination'))}:{_port(row.get('destination_port'))} | "
-                    f"{_count(row.get('length'))} bytes | SYN {row.get('tcp_syn')} ACK {row.get('tcp_ack')}")
+            stamp = _safe(row.get("timestamp"), 25)[11:23]
+            return (f"PKT {stamp} {_safe(row.get('protocol'), 8).upper()} {_count(row.get('length'))}B "
+                    f"SYN:{_flag(row.get('tcp_syn'))} ACK:{_flag(row.get('tcp_ack'))} "
+                    f"{_safe(row.get('source'), 48)}:{_port(row.get('source_port'))} > "
+                    f"{_safe(row.get('destination'), 48)}:{_port(row.get('destination_port'))}")
         return "No packet selected. Capture metadata with --capture-interface IFACE -y."
 
 
@@ -156,21 +191,24 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
     def divider(title: str) -> None:
         rows.append((_border(title, width, lt, rt, h), "bright"))
 
-    rows.append((_border(" GREYIQ // DEFENDER SIGNAL GRID ", width, tl, tr, h), "bright"))
+    rows.append((_border(" GREYIQ :: CYBER DEFENDER // LIVE CIRCUIT ", width, tl, tr, h), "bright"))
+    lead = state.alert_history[min(state.selected_alert, len(state.alert_history) - 1)] if state.alert_history else None
     if state.alert_latched:
-        signal = "[!] SUSPECTED ACTIVITY // INVESTIGATE THE EVIDENCE"
+        level = str(lead["severity"]).upper() if lead else "REVIEW"
+        signal = f"[!] SUSPECTED ACTIVITY [{level}] // INVESTIGATE"
     elif state.cycle:
-        signal = "[+] MONITORING // NO INDICATORS IN THIS SESSION"
+        signal = "[+] NETWORK WATCH // NO INDICATORS IN THIS SESSION"
     else:
-        signal = "[.] INITIALIZING // WAITING FOR OBSERVATION"
-    add(f"{signal}                                      CYCLE {state.cycle:04d}", "bright")
+        signal = "[.] UPLINK INITIALIZING // WAITING FOR OBSERVATION"
+    add(f"{signal}  {_SWEEP[state.sweep % len(_SWEEP)]}  CYCLE {state.cycle:04d}", "bright")
     coverage = "BASELINE ACTIVE" if state.baseline else "NO REVIEWED BASELINE"
     if state.coverage_error:
         coverage += " / PARTIAL COVERAGE"
     capture = "CAPTURE ON" if state.capture_enabled else "CAPTURE OFF"
-    add(f"{_safe(state.message, 55)}  |  {coverage}  |  {capture}  |  "
-        f"{state.collected_at or 'NO SNAPSHOT YET'}", "bright" if state.stopped else "mid")
-    divider(f"LOCAL PORTS [{len(state.ports)}]")
+    stamp = state.collected_at[11:19] + "Z" if len(state.collected_at) >= 19 else state.collected_at or "PENDING"
+    status = (_safe(state.message, 55) if state.stopped or state.busy else f"SNAPSHOT {stamp}")
+    add(f"{status}  |  {coverage}  |  {capture}", "bright" if state.stopped else "mid")
+    divider(f"PORT MATRIX // {len(state.ports)} OBSERVED")
     add("    PROTO  LOCAL ADDRESS:PORT                 STATE          PID   REMOTE", "dim")
     port_height = min(10, max(4, (height - 13) // 2))
     port_start = max(0, state.selected_port - port_height + 1)
@@ -185,7 +223,7 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
                 f"{_safe(row.get('remote_address'), 26)}", "bright" if marker == ">" else "mid")
         else:
             add("    ... no additional observed sockets ..." if index == 0 else "", "dim")
-    divider(f"PACKET STREAM [{len(state.packets)} buffered | {len(state.matching_packets())} matches]")
+    divider(f"WIRE TRAFFIC // {len(state.packets)} BUFFERED | {len(state.matching_packets())} MATCHES")
     add("    TIME         PROTO  SOURCE                       DESTINATION                    SIZE", "dim")
     packet_height = max(1, height - 13 - port_height)
     matches = state.matching_packets()
@@ -196,22 +234,20 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
             add(f"{marker}   {_packet_text(matches[index])}", "bright" if marker == ">" else "mid")
         else:
             add("    ... no matching packet metadata ..." if index == 0 else "", "dim")
-    divider("SELECTED EVIDENCE")
+    divider("FORENSIC CONSOLE // SELECTED EVIDENCE")
     add(state.selected_detail())
-    lead = state.findings[0] if state.findings else None
     if lead:
-        add(f"ALERT {len(state.findings)} finding(s): {_safe(lead.get('rule_id'), 55)} "
-            f"| {_safe(lead.get('title'), 75)}", "bright")
-    elif state.alert_latched:
-        add("Earlier indicator remains latched. Review the event journal and saved scan artifacts.", "bright")
+        add(f"ALERT {state.selected_alert + 1}/{len(state.alert_history)} "
+            f"[{str(lead['severity']).upper()}] {lead['rule_id']} | {lead['title']}", "bright")
     else:
         add("No current rule finding. Indicators are leads, not proof of an intruder.", "dim")
-    add(f"EVIDENCE {state.artifact or 'first scan pending'} | metadata only; no packet payloads", "dim")
+    artifact = str(lead.get("artifact") or "") if lead else state.artifact
+    add(f"EVIDENCE {artifact or 'first scan pending'} | metadata only; no packet payloads", "dim")
     if state.search_mode:
         add(f"SEARCH /{_safe(state.query, width - 28)}_    ENTER apply  ESC cancel", "bright")
     else:
-        add(f"[TAB] focus  [UP/DOWN] inspect  [/] search  [x] clear  [r] rescan  [q] quit", "bright")
-    rows.append((_border(" OBSERVE / PRESERVE / VERIFY ", width, bl, br, h), "bright"))
+        add("TAB pane  UP/DOWN inspect  / search  a next alert  x clear  r rescan  q quit", "bright")
+    rows.append((_border(" TRACE // TRIAGE // PRESERVE EVIDENCE ", width, bl, br, h), "bright"))
     palette = {"bright": bright, "mid": mid, "dim": dim}
     if not color:
         return [row for row, _ in rows]
@@ -256,6 +292,8 @@ def _handle_key(state: BoardState, key: str | None, editor: gn_tui.CommandLine) 
     elif key in ("x", "X"):
         state.query = ""
         state.selected_packet = 0
+    elif key in ("a", "A") and state.alert_history:
+        state.selected_alert = (state.selected_alert + 1) % len(state.alert_history)
     elif key in ("r", "R"):
         state.stopped = False
         return "refresh"
@@ -292,6 +330,7 @@ def run_dashboard(args: Any, *, scan: Callable[[], dict[str, Any]]) -> int:
                         state.busy = True
                         state.message = "Collecting local inventory and bounded packet metadata..."
                         future = pool.submit(scan)
+                    state.sweep = int(now * 4) % len(_SWEEP)
                     screen.take_resize()
                     screen.frame(render(state, screen.size(), gn_tui.tier()))
                     action = _handle_key(state, keys.read(0.08), editor)
