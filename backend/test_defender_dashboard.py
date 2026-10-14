@@ -5,8 +5,10 @@ from __future__ import annotations
 import io
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 BACKEND = Path(__file__).resolve().parent
@@ -16,7 +18,7 @@ if str(BACKEND) not in sys.path:
 import gn_cli  # noqa: E402
 import gn_tui  # noqa: E402
 from defender import cli as defender_cli  # noqa: E402
-from defender.dashboard import BoardState, _handle_key, render  # noqa: E402
+from defender.dashboard import BoardState, _handle_key, render, run_dashboard  # noqa: E402
 
 
 def _result(*, finding: bool = False) -> dict:
@@ -104,6 +106,54 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertIn("tool_missing", state.message)
         self.assertEqual(_handle_key(state, "r", gn_tui.CommandLine()), "refresh")
         self.assertFalse(state.stopped)
+
+    def test_live_runner_paints_red_finding_and_restores_screen(self) -> None:
+        frames: list[list[str]] = []
+
+        class FakeScreen:
+            active = True
+            restored = False
+
+            def __enter__(self) -> "FakeScreen":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                self.restored = True
+
+            def take_resize(self) -> bool:
+                return False
+
+            def size(self) -> gn_tui.Size:
+                return gn_tui.Size(100, 25)
+
+            def frame(self, rows: list[str]) -> None:
+                frames.append(rows)
+
+        class FakeKeys:
+            def __enter__(self) -> "FakeKeys":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+            def read(self, _timeout: float) -> str | None:
+                if any("SUSPECTED ACTIVITY" in row for frame in frames for row in frame):
+                    return "q"
+                if time.monotonic() - started > 2:
+                    return "q"
+                time.sleep(0.01)
+                return None
+
+        screen = FakeScreen()
+        started = time.monotonic()
+        with mock.patch.object(gn_tui, "refusal", return_value=""), \
+             mock.patch.object(gn_tui, "Screen", return_value=screen), \
+             mock.patch.object(gn_tui, "KeyReader", return_value=FakeKeys()):
+            self.assertEqual(run_dashboard(SimpleNamespace(capture_interface="test0", interval=2),
+                                           scan=lambda: _result(finding=True)), 0)
+        self.assertTrue(screen.restored)
+        self.assertTrue(any("\033[38;5;196m" in row and "SUSPECTED ACTIVITY" in row
+                            for frame in frames for row in frame))
 
     def test_dashboard_uses_evidence_producing_scan_and_keeps_observation_private(self) -> None:
         snapshot = {"schema_version": 1, "collected_at": "2026-10-14T12:00:00Z",
