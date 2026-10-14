@@ -102,6 +102,18 @@ save packet payloads or a PCAP by default. A watch that repeats Nmap is
 restricted to intervals of at least five minutes. If a tool is unavailable or
 cannot run, the result records that limitation.
 
+Each captured TCP/UDP packet has a best-effort **local** `pid` and
+`pid_attribution` in the saved scan artifact and dashboard. `socket_snapshot`
+means an exact local/remote socket tuple matched the inventory taken before
+capture. `listener_endpoint` or `bound_endpoint` means a local TCP listener or
+UDP socket matched an inventoried local address and port. `ambiguous` or
+`unknown` leaves the PID empty. A PID does not identify the remote sender, and
+socket ownership can change between inventory and capture. Search the dashboard by PID with
+`/1234`; use `gn defend trace --pid 1234` to inspect a fresh local snapshot.
+Inbound multicast and broadcast packets remain unassigned when the inventory
+cannot show which local socket received them. IPv6 wildcard listeners are not
+assumed to accept IPv4 traffic without a recorded dual-stack socket setting.
+
 The `-y` flag is an operator assertion that the named network or interface is
 authorized for this assessment. Private addressing alone is not authorization.
 Do not use these flags on a third party's network or on a segment with unclear

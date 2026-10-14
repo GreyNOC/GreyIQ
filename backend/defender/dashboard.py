@@ -48,7 +48,8 @@ def _packet_text(packet: dict[str, Any]) -> str:
     destination = f"{_safe(packet.get('destination'), 48)}:{_port(packet.get('destination_port'))}"
     return (f"{_safe(packet.get('timestamp'), 25)[11:23]:12} "
             f"{_safe(packet.get('protocol'), 8).upper():5} "
-            f"{source:28.28} > {destination:28.28} "
+            f"{_count(packet.get('pid')):>6} "
+            f"{source:24.24} > {destination:24.24} "
             f"{_count(packet.get('length')):>5}B")
 
 
@@ -157,7 +158,8 @@ class BoardState:
         return [row for row in packets if needle in " ".join(
             _safe(row.get(key), 100) for key in ("timestamp", "source", "destination",
                                                  "source_port", "destination_port", "protocol",
-                                                 "length", "tcp_syn", "tcp_ack")
+                                                 "length", "tcp_syn", "tcp_ack", "pid",
+                                                 "pid_attribution")
         ).casefold()]
 
     def selected_detail(self) -> str:
@@ -183,6 +185,8 @@ class BoardState:
             stamp = _safe(row.get("timestamp"), 25)[11:23]
             return (f"PKT {stamp} {_safe(row.get('protocol'), 8).upper()} {_count(row.get('length'))}B "
                     f"SYN:{_flag(row.get('tcp_syn'))} ACK:{_flag(row.get('tcp_ack'))} "
+                    f"PID:{_count(row.get('pid'))} "
+                    f"[{_safe(row.get('pid_attribution') or 'unknown', 24)}] "
                     f"{_safe(row.get('source'), 48)}:{_port(row.get('source_port'))} > "
                     f"{_safe(row.get('destination'), 48)}:{_port(row.get('destination_port'))}")
         return "No packet selected. Capture metadata with --capture-interface IFACE -y."
@@ -262,7 +266,7 @@ def render(state: BoardState, size: gn_tui.Size, tier: dict[str, Any] | None = N
                      "    ... no additional observed sockets ...")
             add(empty if index == 0 else "", "dim")
     divider(f"WIRE TRAFFIC // {len(state.packets)} BUFFERED | {len(state.matching_packets())} MATCHES")
-    add("    TIME         PROTO  SOURCE                       DESTINATION                    SIZE", "dim")
+    add("    TIME         PROTO     PID SOURCE                   DESTINATION              SIZE", "dim")
     packet_height = max(1, height - 13 - port_height)
     matches = state.matching_packets()
     packet_start = max(0, state.selected_packet - packet_height + 1)
