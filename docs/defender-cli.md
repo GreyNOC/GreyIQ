@@ -170,6 +170,40 @@ large.
 The chain cannot prove that an attacker with write access to both files did not
 rewrite them.
 
+## Live defender dashboard
+
+```bash
+gn defend dash
+gn defend dash --capture-interface eth0 --capture-seconds 3 --packet-limit 500 -y
+gn defend dash --baseline /path/to/reviewed-baseline.json --indicators /path/to/reviewed-iocs.json
+```
+
+`dash` opens a full-screen terminal board with observed local ports, socket
+owners, packet metadata, and current detector findings. It refreshes after each
+completed scan plus `--interval` seconds (default 5). The board is green while
+no rule has emitted a finding in this session. A finding turns it red and the
+red review state remains visible for the session, even if a later cycle no longer
+matches. Red means suspected activity requiring investigation; it never claims
+that an intrusion or a person has been identified. The board shows when there
+is no reviewed baseline or when inventory coverage is partial.
+
+Packet capture is opt-in. Name one exact local interface and supply `-y` only
+for an authorized assessment. The capture is non-promiscuous, lasts at most 30
+seconds per cycle, and stores timestamps, addresses, ports, protocol, TCP SYN
+and ACK flags, and frame length. It does not save packet payloads or PCAPs.
+The in-memory search buffer holds at most 2,000 packet records; the scan
+artifact and journal preserve each completed cycle. A missing or failed network
+tool pauses automatic scans and leaves its error visible. Press `r` to retry.
+
+Press `/` to filter packet metadata by a case-insensitive substring (IP, port,
+protocol, timestamp, length, or TCP flag), `Enter` to apply, and `Esc` to cancel.
+`Tab` switches between ports and packets; arrow keys inspect a row in detail.
+Press `x` to clear the filter, `r` to scan again, or `q` to quit. The dashboard
+requires an interactive terminal; use `gn defend watch --json` for a log
+collector. Repeated Nmap scans require an interval of at least five minutes.
+
+## Evidence retention
+
 Full compressed observations are kept under `runtime/defender/runs` and linked
 from journal records by runtime-relative path and SHA-256 (the original absolute
 path is also retained for immediate access). Verification still works after the

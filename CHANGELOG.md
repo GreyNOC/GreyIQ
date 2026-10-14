@@ -2,7 +2,17 @@
 
 Notable changes to GreyIQ.
 
-## Unreleased
+## 5.0.0
+
+- **Defender signal dashboard.** `gn defend dash` adds a full-screen terminal
+  view of observed local ports, process IDs, bounded packet metadata, and
+  detector findings. The board uses a green signal palette during observation
+  and latches a red review state when a rule emits a finding. Operators can
+  search and inspect captured packet metadata in a bounded session buffer;
+  each scan also preserves its full observation artifact and journal event.
+  Active TShark and Nmap operations retain the exact scope and authorization
+  gates of `gn defend scan`. Red means a review lead, not proven intrusion or
+  actor attribution.
 
 - **A posture is not a fault.** `gn bot use off` printed "off: `gn bot show off` says what is
   missing", and `gn bot use offline` said the same about `edits only` — nothing is missing in

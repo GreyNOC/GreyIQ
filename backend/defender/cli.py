@@ -70,6 +70,13 @@ def register_cli(sub: Any) -> None:
                        help="stop after N cycles; 0 watches until Ctrl-C")
     watch.set_defaults(func=_watch)
 
+    dashboard = commands.add_parser("dash", aliases=["dashboard"],
+                                    help="live neon terminal view of local ports, packet metadata, and indicators")
+    _scan_flags(dashboard, capture_seconds=3, include_json=False)
+    dashboard.add_argument("--interval", type=int, default=5, metavar="SECONDS",
+                           help="seconds between completed scans, 2-3600 (default: 5)")
+    dashboard.set_defaults(func=_dashboard)
+
     trace = commands.add_parser("trace", help="correlate a local PID or remote IP with observed sockets")
     target = trace.add_mutually_exclusive_group(required=True)
     target.add_argument("--pid", type=int, help="local process ID")
@@ -114,7 +121,7 @@ def _process_hashes(parser: Any) -> None:
                         help="hash observed process executable files within fixed file and byte limits")
 
 
-def _scan_flags(parser: Any) -> None:
+def _scan_flags(parser: Any, *, capture_seconds: int = 10, include_json: bool = True) -> None:
     _paths(parser)
     _process_hashes(parser)
     parser.add_argument("--baseline", default="", help="trusted baseline file (default: runtime/defender/baseline.json)")
@@ -126,13 +133,14 @@ def _scan_flags(parser: Any) -> None:
                         help="exact authorized local scan boundary (required with --nmap-target)")
     parser.add_argument("--capture-interface", default="", metavar="IFACE",
                         help="optional non-promiscuous TShark metadata capture interface")
-    parser.add_argument("--capture-seconds", type=int, default=10, metavar="N",
-                        help="TShark capture duration, 1-30 seconds (default: 10)")
+    parser.add_argument("--capture-seconds", type=int, default=capture_seconds, metavar="N",
+                        help=f"TShark capture duration, 1-30 seconds (default: {capture_seconds})")
     parser.add_argument("--packet-limit", type=int, default=500, metavar="N",
                         help="TShark packet cap, 1-1000 (default: 500)")
     parser.add_argument("-y", "--authorize-local-scan", action="store_true",
                         help="assert authorization for the named local network/interface")
-    _json(parser)
+    if include_json:
+        _json(parser)
 
 
 def _root() -> Path:
@@ -348,7 +356,9 @@ def _validate_active(args: argparse.Namespace) -> str:
     return ""
 
 
-def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False) -> dict[str, Any]:
+def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False,
+               include_observation: bool = False,
+               baseline_context: str = "watch") -> dict[str, Any]:
     from defender.baseline import compare_baseline, load_baseline
     from defender.detection import evaluate_inventory
     from defender.inventory import collect_inventory
@@ -363,7 +373,7 @@ def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False) -> d
             raise ValueError(f"indicator file could not be used: {exc}") from exc
     path = _baseline_file(args.baseline)
     if require_baseline and not path.is_file():
-        raise ValueError(f"watch baseline disappeared at {path}; watch stopped")
+        raise ValueError(f"{baseline_context} baseline disappeared at {path}; monitoring stopped")
     baseline = load_baseline(path) if require_baseline or path.is_file() else None
     roots = tuple(args.path or (baseline["inventory"].get("file_roots") or () if baseline else ()))
     feed_hashes = any(row.get("type") == "sha256" for row in feed["indicators"]) if feed else False
@@ -411,6 +421,8 @@ def _scan_once(args: argparse.Namespace, *, require_baseline: bool = False) -> d
                      "baseline_sha256": baseline["sha256"] if baseline else None,
                      "tool": ",".join(sorted(tools)) if tools else "passive",
                      "error_code": ",".join(tool_failures) if tool_failures else ""})
+    if include_observation:
+        result["observation"] = current
     return result
 
 
@@ -497,6 +509,37 @@ def _watch(args: argparse.Namespace) -> int:
         return 0
     _event("watch_stopped", evidence={"count": cycle}, message="iteration limit")
     return 0
+
+
+def _dashboard(args: argparse.Namespace) -> int:
+    refusal = _validate_active(args)
+    if refusal:
+        return _err(refusal)
+    if not 2 <= args.interval <= 3600:
+        return _err("--interval must be 2-3600 seconds")
+    if args.nmap_target:
+        from defender.tools import validate_nmap_scope
+
+        guard_error = validate_nmap_scope(args.nmap_target, args.scope)
+        if guard_error:
+            return _err(guard_error)
+        if args.interval < 300:
+            return _err("recurring Nmap scans require --interval of at least 300 seconds")
+    from defender.dashboard import run_dashboard
+
+    baseline_path = _baseline_file(args.baseline)
+    if args.baseline and not baseline_path.is_file():
+        return _err(f"dashboard requires the selected baseline at {baseline_path}")
+    baseline_required = baseline_path.is_file()
+
+    def scan_dashboard() -> dict[str, Any]:
+        nonlocal baseline_required
+        result = _scan_once(args, require_baseline=baseline_required,
+                            include_observation=True, baseline_context="dashboard")
+        baseline_required |= bool(result.get("baseline_sha256"))
+        return result
+
+    return run_dashboard(args, scan=scan_dashboard)
 
 
 def _trace(args: argparse.Namespace) -> int:
