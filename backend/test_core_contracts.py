@@ -161,9 +161,8 @@ class KnowledgeSourceFilterTests(unittest.TestCase):
 
 
 class SourceTrustTests(unittest.TestCase):
-    """The manual-PDF extract is ~99.8% of the corpus by bytes and overwhelmingly
-    off-domain; retrieval must not let a lexical hit inside it outrank the curated
-    bug-bounty corpus."""
+    """A retained manual extract must not outrank curated bug-bounty knowledge
+    solely because it has a similar lexical hit."""
 
     def _corpus(self, root: Path) -> None:
         data = root / "data"

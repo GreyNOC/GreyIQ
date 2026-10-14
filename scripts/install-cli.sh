@@ -10,9 +10,10 @@
 # Debian-family distro — Debian, Ubuntu, Kali, Parrot — and on arm64, where the
 # amd64 release .deb cannot be installed at all.
 #
-# `--extras` adds the two optional pure-Python engine libraries in a checkout
-# .venv (see requirements-cli.txt). The release .deb/AppImage/CLI tarball remain
-# the no-Python-needed options; this script never touches them.
+# `--extras` adds optional YAML/cryptography support and Defense log database
+# drivers/connectors in a checkout .venv (see requirements-cli.txt). The release
+# .deb/AppImage/CLI tarball remain the no-Python-needed options; this script
+# never touches them.
 set -euo pipefail
 
 command_name="gn"
@@ -25,7 +26,7 @@ usage() {
 Usage: scripts/install-cli.sh [options]
 
   --extras           also create .venv and install requirements-cli.txt
-                     (YAML spec parsing + cryptographic key-liveness proofs)
+                     (YAML, cryptographic proof, and Defense log DB connectors)
   --bin-dir DIR      install the launcher here (default: $HOME/.local/bin,
                      override with GN_BIN_DIR)
   --name NAME        command name to install (default: gn; use this when the

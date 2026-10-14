@@ -11,7 +11,7 @@ It includes:
   Hugging Face bot.
 - A pluggable **coding brain** — answer with a local model (Ollama), Claude, or any OpenAI-compatible endpoint; falls back to the bundled local engine.
 - **Agent mode + the Workbench IDE** — let the brain read, edit, and (optionally) run things in a workspace folder, with a file explorer, code preview, diffs, agent steps, and verification output.
-- **BugHunter** — a static/passive security scanner, a **bug-bounty hunt** that writes reports with attack plans, and an **agent security red-team** that tests GreyIQ's own agent.
+- **Security** — defensive log monitoring for local files, SQL databases, MongoDB, and Elasticsearch; a static/passive scanner; a **bug-bounty hunt** that writes reports with attack plans; and an **agent security red-team** that tests GreyIQ's own agent.
 - Personal training from preferences, source-specific data, and 👍/👎 feedback; folder ingestion (PDF/DOCX/text/OCR).
 - Browser fallback (CPU/WebGPU) when the Python service isn't running, plus an Electron launcher that boots the backend and fetches a **GPU-accelerated** Ollama runtime on first use of the local model — NVIDIA (CUDA) works out of the box; AMD (ROCm) is auto-provisioned on first run.
 
@@ -79,9 +79,10 @@ That stdlib-only guarantee is enforced, not assumed:
 with every `site-packages` import blocked, and `scripts/smoke-source-cli.sh`
 repeats the clone-and-run install in Debian 12 and Debian 13 containers that have
 `python3` and no pip at all. Every scanner, the impact model and the report
-writers work there. `--extras` adds only two optional engine libraries (YAML
-OpenAPI-spec parsing, and the RS256 proof that a leaked cloud key is live); both
-features degrade silently without them. See `requirements-cli.txt`.
+writers work there. `--extras` adds optional engine libraries for YAML
+OpenAPI-spec parsing, cloud-key proof, and Defense database log sources. The
+scanner remains usable without them; database log monitoring requires its
+matching driver. See `requirements-cli.txt`.
 
 **This is the install to use on Parrot and Kali**, and the only one on arm64 —
 the release package is built for Debian 13 amd64. For the desktop app and the
@@ -96,7 +97,7 @@ files in the repository** — download one from
 desktop libraries and `zstd`, which the on-demand Ollama download needs:
 
 ```bash
-sudo apt install ./GreyIQ-5.0.5-amd64.deb
+sudo apt install ./GreyIQ-5.0.6-amd64.deb
 greyiq-cli dashboard
 ```
 
@@ -139,7 +140,7 @@ cat /etc/debian_version     # 12.x derivatives (Parrot 6, Kali) are not the buil
 | Message | Cause | Fix |
 | --- | --- | --- |
 | `Unsupported file … given on commandline` | the filename matched nothing — most often the `GreyIQ-*-amd64.deb` glob pasted inside a fresh clone, where no release asset exists | download the asset from Releases, or use the git-clone CLI install above |
-| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-5.0.5-amd64.deb` |
+| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-5.0.6-amd64.deb` |
 | `package architecture (amd64) does not match system (arm64)` | the release package is amd64 only | use the git-clone CLI install above — it is pure Python and architecture-independent |
 | `Depends: libasound2t64 but it is not installable` | releases up to 4.12.0 require the Debian 13 package name; Debian 12 derivatives call it `libasound2` | use the git-clone CLI install or the AppImage; packages built after 4.12.0 accept either name |
 | `version 'GLIBC_2.xx' not found` from `greyiq-cli` or `greyiq` | the frozen binaries are built on Ubuntu 24.04 and need a newer glibc than Debian 12 derivatives ship | use the git-clone CLI install above, which runs on the distribution's own Python |
@@ -179,6 +180,108 @@ npm run check:js
 npm run check:python
 npm run check:devops
 ```
+
+## Defense log monitoring
+
+Open **Security → Defense · Log monitoring**, confirm you are authorized to read
+the source, and add a log file, SQL database, MongoDB collection, or Elasticsearch
+index. GreyIQ monitors entries while its local engine runs, including when the
+Security panel is closed. Check **Include existing entries** to process
+older entries in bounded batches. The panel shows source health, recent alerts,
+and controls to pause, resume, or remove each source.
+
+For a database, provide a [SQLAlchemy URL](https://docs.sqlalchemy.org/en/20/core/engines.html#database-urls),
+the log table, a unique increasing cursor column (usually an integer `id`), the
+message column, and an optional severity column. Examples include
+`sqlite:///C:/logs/events.db`, `postgresql+psycopg://user:password@host/logs`,
+and `mysql+pymysql://user:password@host/logs`. SQLAlchemy includes dialects for
+SQLite, PostgreSQL, MySQL/MariaDB, Oracle, and SQL Server; each requires its
+matching driver. The desktop build bundles the common drivers listed in
+`requirements.txt`. SQL Server also requires an ODBC driver installed on the
+host. Other SQLAlchemy dialects can work when their dialect and driver are
+installed in the Python runtime. Use a database account with **SELECT-only**
+access to the chosen log table.
+
+For MongoDB, provide a `mongodb://` or `mongodb+srv://` URI that names a
+database, the collection, and the cursor/message/severity fields. The default
+`_id` cursor works for ordinary append-only collections; if events can arrive
+out of order, use a unique increasing field supplied by your logging pipeline.
+A custom cursor field needs a single-field unique ascending index; dotted field
+paths such as `event.sequence` and `log.level` are supported.
+For Elasticsearch, provide the cluster's HTTP(S) URL, an index, an optional API
+key, and the field mapping. The cursor field must be unique and increasing
+across the selected exact index or alias; a timestamp alone can tie and skip events. Use an
+account or API key limited to reading the selected collection or index.
+
+Database monitoring needs a cursor that reflects ingestion order. Rows or
+documents committed out of cursor order can be skipped. For a new database or
+index source, the first successful poll establishes the new-only baseline;
+events arriving before that poll are treated as existing entries. Choose
+**Include existing entries** when that gap is unacceptable. Source health shows
+connection and schema failures; a failed source does not stop other sources.
+
+The monitor reads files and databases without changing their contents. It
+stores non-secret source settings, checkpoints, and a bounded alert history in
+the runtime directory. Connection URLs and API keys are kept separately under
+the operating system's local application-data profile, outside the project
+workspace, and are never returned by the status API. Both files are created
+with restrictive permissions where supported; protect the local profile and
+its backups. Alert snippets are short and redact common credential patterns,
+but logs may contain other sensitive content. Alerts are triage signals based
+on severity and explicit security terms, not proof of compromise. Verify a
+signal against the underlying logs before acting on it.
+
+### Defense log monitoring from the CLI
+
+The source CLI needs `./scripts/install-cli.sh --extras` for database sources
+on Unix, or `python -m pip install -r requirements-cli.txt` in a Windows
+environment; file sources use the standard library. Give `--url-env` and
+`--api-key-env` the names of environment variables that already contain your
+credentials. The examples below use `gn` after installing its launcher. From
+a checkout, `./gn` works on Unix, and `python backend/gn_cli.py` works on
+Windows. A literal `--url` rejects embedded credentials;
+`--url-file` and `--api-key-file` are available when a file is preferable to
+an environment variable.
+
+```bash
+gn defense add --kind file --name "App log" --path /var/log/myapp/app.log -y
+gn defense add --kind database --name "SQL audit" --url-env LOG_SQL_URL \
+  --table audit_events --cursor id --message message --severity level -y
+gn defense add --kind mongodb --name "Mongo audit" --url-env LOG_MONGO_URL \
+  --table audit_events --cursor _id --message message --severity level -y
+gn defense add --kind elasticsearch --name "ES audit" --url-env LOG_ES_URL \
+  --api-key-env LOG_ES_API_KEY --table audit-events --cursor event.sequence \
+  --message message --severity log.level -y
+gn defense status
+gn defense watch
+```
+
+For a SQLite file on Windows, run from the checkout in PowerShell:
+
+```powershell
+python backend/gn_cli.py defense add --kind database --name "SQLite audit" --url "sqlite:///C:/Logs/app.db" --table audit_events --cursor id --message message -y
+python backend/gn_cli.py defense watch
+```
+
+`-y` confirms that you are authorized to read the source. The `add` and
+`status` commands show each source ID; use it to pause, resume, or remove a
+source:
+
+```bash
+gn defense stop log_1234
+gn defense start log_1234
+gn defense remove log_1234
+```
+
+`gn defense add` saves a source. Headless collection continues while
+`gn defense watch` runs, or while the desktop backend runs against the same
+runtime directory. Other CLI commands can manage sources while `watch` runs.
+Use `gn defense watch --once` for one bounded poll and
+`gn defense status --json` for machine-readable status. A source checkout uses
+its `runtime/` directory by default, while the installed Linux desktop and
+frozen CLI use the local application-data directory described above. Set
+`GREYIQ_RUNTIME_DIR` to the same absolute directory for both processes when
+you want them to share sources and alerts.
 
 ## Coding brain
 
@@ -767,3 +870,7 @@ Each bot owns browser-side preference weights for instant fallback behavior. Whe
 ## AI Cores
 
 GreyIQ starts with companion, builder, researcher, and BugHunter cores. Each core carries a response contract, confidence policy, trust posture, and starter knowledge profile so first-run answers feel useful before personal training begins. Personal choices and imported documents become higher-priority local sources as the user trains the app.
+
+## License
+
+GreyIQ's original source code is licensed under the [Apache License, Version 2.0](LICENSE). Third-party components, model assets, and material users import retain their own license terms.

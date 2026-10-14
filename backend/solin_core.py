@@ -54,16 +54,10 @@ GENERATED_KNOWLEDGE_FILES = {
 }
 
 # Retrieval trust multiplier by SOURCE FILE NAME, applied to the search score before the
-# min_score cut. Rationale: greyiq_manual_pdfs.txt is ~6.27 MB of native-text PDF extract
-# (sensor fusion, category theory, English-language textbooks) sitting in the SAME lexical
-# index as 9.4 KB of actual bug-bounty knowledge — roughly 99.8% of the corpus by bytes and
-# overwhelmingly off-domain. The hardcoded "practice makes perfect" / "ch\d+.indd" junk
-# filters downstream in _compress_context are the smoking gun that it was already winning
-# retrievals it should not. Down-weighting it (and lifting the curated corpus) fixes the
-# RANKING without removing anything: every chunk is still indexed, still citable, and still
-# reachable through exactly the same source_ids filter as before — a deliberate choice over
-# re-keying its source id, which would have silently dropped it out of every existing core's
-# saved sourceIds with no UI to add it back.
+# min_score cut. Earlier installations may still have greyiq_manual_pdfs.txt in runtime
+# data/. Keep its lower weight so large, off-domain manual extracts do not outrank curated
+# bug-bounty knowledge. Existing files remain indexed, citable, and reachable through
+# their saved source ids; new installations do not receive a bundled manual corpus.
 _SOURCE_TRUST_BY_FILE: dict[str, float] = {
     "greyiq_bug_bounty_knowledge.txt": 1.25,
     "greyiq_manual_pdfs.txt": 0.70,

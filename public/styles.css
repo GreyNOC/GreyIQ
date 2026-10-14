@@ -2935,6 +2935,127 @@ body.is-resizing {
   padding: 0.85rem;
 }
 
+/* Defense log monitor sits inside the narrow Security tools column. */
+.defense-monitor {
+  padding: 0.85rem;
+}
+
+.defense-monitor #defenseSourceForm {
+  padding: 0;
+  border: 0;
+}
+
+.defense-db-fields {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.defense-db-fields[hidden],
+.defense-monitor [data-defense-kind][hidden],
+.defense-monitor #defenseApiKeyRow[hidden] {
+  display: none;
+}
+
+.defense-source-list,
+.defense-alert-list {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.defense-source-card,
+.defense-alert-card {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.defense-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 0.76rem;
+}
+
+.defense-card-heading strong {
+  overflow-wrap: anywhere;
+}
+
+.defense-state,
+.defense-alert-severity {
+  flex: 0 0 auto;
+  padding: 0.12rem 0.35rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--code-font);
+  font-size: 0.58rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.defense-state.is-running,
+.defense-alert-severity.is-low {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.defense-state.is-error,
+.defense-alert-severity.is-high,
+.defense-alert-severity.is-critical {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.defense-alert-severity.is-medium {
+  color: var(--sun);
+  border-color: var(--sun);
+}
+
+.defense-source-meta,
+.defense-source-location,
+.defense-alert-time,
+.defense-source-error,
+.defense-alert-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.defense-source-error {
+  color: var(--danger);
+}
+
+.defense-source-location {
+  font-family: var(--code-font);
+}
+
+.defense-source-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.defense-source-actions .text-button {
+  width: auto;
+  min-height: 1.7rem;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.66rem;
+}
+
+.defense-alert-title {
+  color: var(--ink);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
 /* Train mode's add-forms are genuinely secondary — quiet their submit buttons so
    only the one primary action (Train the local model) reads as the main CTA. */
 #panelTrain .mode-fold .text-button[type="submit"] {

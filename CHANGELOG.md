@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.6
+
+- Add defensive log monitoring for operator-authorized local files, SQL tables,
+  MongoDB collections, and Elasticsearch indexes. The Security panel and
+  `gn defense` CLI can add, pause, resume, remove, and watch sources; bounded
+  polling records source health and recent triage alerts. Database cursors
+  must be unique and increasing, and source credentials are stored outside the
+  project runtime and omitted from status responses.
+- Keep the existing `gn defend` network dashboard available alongside the new
+  log monitor, and bundle its on-demand modules and common database drivers in
+  desktop and headless CLI builds.
+- License GreyIQ's original source under Apache License 2.0 and include the
+  license and notice in packaged artifacts. Remove the previously bundled
+  third-party PDF text corpus from this release's source and binaries because
+  its redistribution rights are not established.
+
 ## 5.0.5
 
 - Show a best-effort local PID beside each captured TCP/UDP packet in the

@@ -131,6 +131,175 @@ test('MCP server UI saves inert configuration, tests explicitly, edits and remov
   assert.ok(calls.some(([url, method]) => url === '/api/mcp/servers/local-files' && method === 'DELETE'));
 });
 
+test('Defense monitor sends database fields, clears credentials, and renders log text inertly', async () => {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const start = source.indexOf('// ---- Defense: local log sources and recent signals ----');
+  const end = source.indexOf('\nfor (const button of els.panelModeButtons)', start);
+  assert.ok(start >= 0 && end > start, 'Defense controls should be found');
+  let mockDocument;
+  const node = (value = '') => ({
+    value, checked: false, textContent: '', hidden: false, disabled: false, required: false, className: '',
+    dataset: {}, children: [], listeners: {},
+    addEventListener(event, fn) { this.listeners[event] = fn; },
+    append(...items) { this.children.push(...items); },
+    replaceChildren(...items) { this.children = items; },
+    reset() {},
+    contains(item) { return this === item || this.children.some((child) => child.contains?.(item)); },
+    querySelectorAll(selector) {
+      const found = [];
+      const visit = (parent) => {
+        for (const child of parent.children) {
+          if (selector === 'button[data-defense-action]' && child.tag === 'button'
+            && child.dataset.defenseAction) found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    },
+    focus() { mockDocument.activeElement = this; },
+    set innerHTML(_value) { throw Error('Log content must not be parsed as HTML'); },
+  });
+  const fileFields = node(); fileFields.dataset.defenseKind = 'file';
+  const databaseFields = node(); databaseFields.dataset.defenseKind = 'database';
+  const els = {
+    defenseSourceForm: node(), defenseSourceKind: node('database'),
+    defenseSourceName: node('Application database'), defenseSourcePath: node(),
+    defenseSourceUrl: node('postgresql+psycopg://reader:secret@localhost/logs'),
+    defenseUrlLabel: node(), defenseUrlHint: node(), defenseTableLabel: node(),
+    defenseApiKeyRow: node(), defenseApiKey: node(),
+    defenseCursorLabel: node(), defenseCursorHint: node(),
+    defenseMessageLabel: node(), defenseSeverityLabel: node(),
+    defenseSourceTable: node('app_logs'), defenseCursorColumn: node('event_id'),
+    defenseMessageColumn: node('body'), defenseSeverityColumn: node('priority'),
+    defenseBackfill: node(), defenseAuthorized: node(),
+    defenseSourceAdd: node(), defenseMonitorStatus: node(), defenseRefresh: node(),
+    defenseSourceList: node(), defenseAlertList: node(),
+  };
+  const calls = [];
+  let statusWarning = '';
+  const alertText = '<img src=x onerror=alert(1)>';
+  const apiFetch = async (url, options = {}) => {
+    calls.push({ url, method: options.method || 'GET', body: options.body && JSON.parse(options.body) });
+    if (url === '/api/defense/sources') return { ok: true };
+    if (url === '/api/defense/status') return {
+      ok: true, warning: statusWarning,
+      sources: [{ id: 's1', name: 'Application database', kind: 'database', enabled: true,
+        state: 'running', events_seen: 3, display_target: 'localhost/logs', watch_mode: 'new events only' }],
+      alerts: [{ id: 'a1', source_name: 'Application database', severity: 'high',
+        title: 'Suspicious entry', message: alertText, timestamp: '2026-10-14T12:00:00Z' }],
+    };
+    throw Error(`Unexpected ${url}`);
+  };
+  mockDocument = { activeElement: null, createElement: (tag) => Object.assign(node(), { tag }),
+    querySelectorAll: () => [fileFields, databaseFields] };
+  const controls = vm.runInNewContext(`${source.slice(start, end)}\n({ renderDefenseSources, renderDefenseAlerts, refreshDefenseStatus })`, {
+    els, apiFetch, document: mockDocument, URL,
+    window: {}, state: { appMode: 'studio', panelMode: 'security' },
+  });
+  assert.equal(databaseFields.hidden, false);
+  assert.equal(fileFields.hidden, true);
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.equal(calls.length, 0, 'unconfirmed source must not be submitted');
+  assert.match(els.defenseMonitorStatus.textContent, /authorized/);
+  assert.equal(els.defenseSourceUrl.value, '', 'credentials clear after authorization validation fails');
+  els.defenseAuthorized.checked = true;
+  els.defenseSourceUrl.value = 'postgresql+psycopg://reader:secret@localhost/logs';
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  const post = calls.find((call) => call.method === 'POST');
+  assert.deepEqual(JSON.parse(JSON.stringify(post.body)), {
+    kind: 'database', name: 'Application database',
+    url: 'postgresql+psycopg://reader:secret@localhost/logs',
+    table: 'app_logs', cursor_column: 'event_id', message_column: 'body',
+    severity_column: 'priority', backfill: false, authorized: true,
+  });
+  assert.equal(els.defenseSourceUrl.value, '', 'database URL must be removed from DOM after submit');
+  assert.equal(els.defenseSourceList.children.length, 1);
+  assert.equal(els.defenseSourceList.children[0].children[1].textContent, 'localhost/logs');
+  assert.match(els.defenseSourceList.children[0].children[2].textContent, /new events only/);
+  assert.equal(els.defenseAlertList.children[0].children[2].textContent, alertText,
+    'log text must remain literal text');
+  const oldButton = els.defenseSourceList.children[0].children[3].children[0];
+  oldButton.focus();
+  controls.renderDefenseSources([{ id: 's1', name: 'Application database', kind: 'database',
+    enabled: true, state: 'monitoring', events_seen: 3, display_target: 'localhost/logs',
+    watch_mode: 'new events only', last_checked_at: '2026-10-14T12:00:05Z' }]);
+  const replacementButton = els.defenseSourceList.children[0].children[3].children[0];
+  assert.notEqual(replacementButton, oldButton);
+  assert.equal(mockDocument.activeElement, replacementButton,
+    'poll-driven card replacement must preserve button focus');
+  controls.renderDefenseSources([{ id: 's1', name: 'Database', kind: 'database',
+    enabled: true, display_target: 'postgresql://reader:secret@localhost/logs' }]);
+  assert.equal(els.defenseSourceList.children[0].children.some((child) =>
+    child.textContent.includes('reader:secret')), false, 'credential-bearing URLs must not render');
+  els.defenseSourceKind.value = 'file';
+  els.defenseSourceKind.listeners.change();
+  els.defenseSourceName.value = 'Web access log';
+  els.defenseSourcePath.value = 'C:\\logs\\access.log';
+  els.defenseBackfill.checked = true;
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.filter((call) => call.method === 'POST')[1].body)), {
+    kind: 'file', name: 'Web access log', path: 'C:\\logs\\access.log', backfill: true, authorized: true,
+  });
+  els.defenseBackfill.checked = false;
+  els.defenseSourceKind.value = 'mongodb';
+  els.defenseSourceKind.listeners.change();
+  assert.equal(els.defenseTableLabel.textContent, 'Collection');
+  assert.equal(els.defenseCursorColumn.placeholder, '_id');
+  els.defenseSourceName.value = 'Mongo events';
+  els.defenseSourceUrl.value = 'mongodb://reader:secret@localhost/logs';
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.filter((call) => call.method === 'POST')[2].body)), {
+    kind: 'mongodb', name: 'Mongo events', url: 'mongodb://reader:secret@localhost/logs',
+    table: 'logs', cursor_column: '_id', message_column: 'message',
+    severity_column: '', backfill: false, authorized: true,
+  });
+  assert.equal(els.defenseSourceUrl.value, '');
+  els.defenseSourceKind.value = 'elasticsearch';
+  els.defenseSourceKind.listeners.change();
+  assert.equal(els.defenseTableLabel.textContent, 'Index');
+  assert.equal(els.defenseApiKeyRow.hidden, false);
+  assert.match(els.defenseCursorHint.textContent, /timestamp alone can tie/);
+  els.defenseSourceName.value = 'Search events';
+  els.defenseSourceUrl.value = 'https://reader:secret@search.example.test:9200';
+  els.defenseApiKey.value = 'id:secret';
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.equal(calls.filter((call) => call.method === 'POST').length, 3,
+    'Elasticsearch requires an explicit unique cursor mapping');
+  assert.equal(els.defenseApiKey.value, '', 'API key clears even when client validation stops submission');
+  assert.equal(els.defenseSourceUrl.value, '', 'URL clears when client validation stops submission');
+  els.defenseSourceUrl.value = 'https://reader:secret@search.example.test:9200';
+  els.defenseApiKey.value = 'native-invalid-secret';
+  els.defenseSourceForm.listeners.invalid();
+  assert.equal(els.defenseApiKey.value, '', 'API key clears when native validation blocks submit');
+  assert.equal(els.defenseSourceUrl.value, '', 'URL clears when native validation blocks submit');
+  els.defenseCursorColumn.value = 'event.sequence';
+  els.defenseSourceUrl.value = 'https://reader:secret@search.example.test:9200';
+  els.defenseApiKey.value = 'id:secret';
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.equal(calls.filter((call) => call.method === 'POST').length, 3,
+    'Elasticsearch must block simultaneous URL Basic auth and API key');
+  assert.match(els.defenseMonitorStatus.textContent, /one Elasticsearch authentication method/);
+  assert.equal(els.defenseSourceUrl.value, '');
+  assert.equal(els.defenseApiKey.value, '');
+  els.defenseSourceUrl.value = 'https://search.example.test:9200';
+  els.defenseApiKey.value = 'id:secret';
+  await els.defenseSourceForm.listeners.submit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.filter((call) => call.method === 'POST')[3].body)), {
+    kind: 'elasticsearch', name: 'Search events', url: 'https://search.example.test:9200',
+    table: 'logs', cursor_column: 'event.sequence', message_column: 'message',
+    severity_column: '', backfill: false, api_key: 'id:secret', authorized: true,
+  });
+  assert.equal(els.defenseSourceUrl.value, '');
+  assert.equal(els.defenseApiKey.value, '');
+  controls.renderDefenseSources([{ id: 's2', name: 'Search events', kind: 'elasticsearch',
+    enabled: true, watch_mode: 'new events only' }]);
+  assert.match(els.defenseSourceList.children[0].children[1].textContent, /^Elasticsearch ·/);
+  statusWarning = 'Saved source credentials require re-entry.';
+  await controls.refreshDefenseStatus();
+  assert.equal(els.defenseMonitorStatus.textContent, statusWarning);
+});
+
 test('external MCP hunt approvals use an exact tool name and show stale grants', async () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
   const start = source.indexOf('// ---- MCP servers: saved configurations, explicit connection tests ----');
