@@ -85,6 +85,47 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertIn("127.0.0.1 [31mBAD", "\n".join(plain))
         self.assertIn("PROTO  LOCAL ADDRESS", "\n".join(plain))
 
+    def test_retro_signal_and_bounded_alert_queue_keep_strongest_lead_visible(self) -> None:
+        state = BoardState(capture_enabled=True, sweep=2)
+        result = _result()
+        result["findings"] = [
+            {"finding_id": "low-1", "severity": "low", "rule_id": "defender.new_listener",
+             "title": "New local listener"},
+            {"finding_id": "high-1", "severity": "high", "rule_id": "defender.ioc_match",
+             "title": "Reviewed indicator match"},
+        ]
+        state.ingest(result)
+        frame = "\n".join(render(state, gn_tui.Size(100, 25), color=False))
+        self.assertIn("LIVE CIRCUIT", frame)
+        self.assertIn("[==>  ]", frame)
+        self.assertIn("SUSPECTED ACTIVITY [HIGH]", frame)
+        self.assertIn("ALERT 1/2 [HIGH] defender.ioc_match", frame)
+        self.assertEqual(_handle_key(state, "a", gn_tui.CommandLine()), "")
+        self.assertIn("ALERT 2/2 [LOW] defender.new_listener",
+                      "\n".join(render(state, gn_tui.Size(100, 25), color=False)))
+        clean = _result()
+        clean["artifact"]["artifact_path"] = "/private/runs/clean.json.gz"
+        state.ingest(clean)
+        self.assertTrue(state.alert_latched)
+        self.assertEqual(len(state.alert_history), 2)
+        after_clean = "\n".join(render(state, gn_tui.Size(100, 25), color=False))
+        self.assertIn("ALERT 2/2 [LOW]", after_clean)
+        self.assertIn("EVIDENCE /private/runs/scan.json.gz", after_clean)
+        self.assertNotIn("EVIDENCE /private/runs/clean.json.gz", after_clean)
+        state.ingest(result)
+        self.assertEqual(len(state.alert_history), 2)
+        self.assertEqual(_handle_key(state, "a", gn_tui.CommandLine()), "")
+        self.assertIn("ALERT 1/2 [HIGH]", "\n".join(render(state, gn_tui.Size(100, 25), color=False)))
+        many = _result()
+        many["findings"] = [
+            {"finding_id": f"low-{index}", "severity": "low", "rule_id": "defender.new_listener",
+             "title": f"Listener {index}"} for index in range(80)
+        ] + [{"finding_id": "critical-1", "severity": "critical", "rule_id": "defender.ioc_match",
+              "title": "Strongest reviewed lead"}]
+        state.ingest(many)
+        self.assertEqual(len(state.alert_history), 64)
+        self.assertEqual(state.alert_history[0]["severity"], "critical")
+
     def test_search_cancel_restores_filter_and_q_does_not_quit_while_typing(self) -> None:
         state = BoardState(query="tcp")
         editor = gn_tui.CommandLine()

@@ -186,6 +186,12 @@ red review state remains visible for the session, even if a later cycle no longe
 matches. Red means suspected activity requiring investigation; it never claims
 that an intrusion or a person has been identified. The board shows when there
 is no reviewed baseline or when inventory coverage is partial.
+The retro signal sweep is a display animation, not a network probe. The board
+keeps up to 64 distinct rule leads in memory, ranks them by severity, and keeps
+the strongest lead visible after a later clean cycle. Its red state remains
+latched until the dashboard exits. The evidence path follows the selected lead,
+even after another scan, so it points to the observation that raised that lead.
+Saved scan artifacts and journal events are the durable investigation record.
 
 Packet capture is opt-in. Name one exact local interface and supply `-y` only
 for an authorized assessment. The capture is non-promiscuous, lasts at most 30
@@ -198,7 +204,8 @@ tool pauses automatic scans and leaves its error visible. Press `r` to retry.
 Press `/` to filter packet metadata by a case-insensitive substring (IP, port,
 protocol, timestamp, length, or TCP flag), `Enter` to apply, and `Esc` to cancel.
 `Tab` switches between ports and packets; arrow keys inspect a row in detail.
-Press `x` to clear the filter, `r` to scan again, or `q` to quit. The dashboard
+Press `a` to cycle through retained alert leads, `x` to clear the packet filter,
+`r` to scan again, or `q` to quit. The dashboard
 requires an interactive terminal; use `gn defend watch --json` for a log
 collector. Repeated Nmap scans require an interval of at least five minutes.
 
