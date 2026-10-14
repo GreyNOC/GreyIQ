@@ -39,9 +39,25 @@ docker run --rm --security-opt seccomp=unconfined \
       cat /tmp/cli.log >&2
       exit 1
     }
-    runuser -u greyiq-ci -- "$cli" defend status --json >/tmp/defend-status.json
-    runuser -u greyiq-ci -- "$cli" defend rules --json >/tmp/defend-rules.json
-    grep -Fq '"rule_id": "defender.risky_listener"' /tmp/defend-rules.json
+    runuser -u greyiq-ci -- "$cli" defend status --json >/tmp/defend-status.json 2>/tmp/defend-status.err || {
+      cat /tmp/defend-status.err >&2
+      cat /tmp/defend-status.json >&2
+      echo "Debian 13 defender status command failed." >&2
+      exit 1
+    }
+    runuser -u greyiq-ci -- "$cli" defend rules --json >/tmp/defend-rules.json 2>/tmp/defend-rules.err || {
+      cat /tmp/defend-rules.err >&2
+      cat /tmp/defend-rules.json >&2
+      echo "Debian 13 defender rules command failed." >&2
+      exit 1
+    }
+    # This body is already a single-quoted bash -c argument: an inner single-quoted
+    # grep pattern is stripped by the outer shell and silently changes the match.
+    grep -Fq "defender.risky_listener" /tmp/defend-rules.json || {
+      cat /tmp/defend-rules.json >&2
+      echo "Debian 13 defender rule is missing from the frozen CLI." >&2
+      exit 1
+    }
     runuser -u greyiq-ci -- "$cli" dashboard --help >/dev/null
     runuser -u greyiq-ci -- "$cli" path >/tmp/cli-path.log
     grep -q "greyiq-cli is already on PATH" /tmp/cli-path.log
