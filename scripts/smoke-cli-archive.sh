@@ -17,6 +17,9 @@ docker run --rm \
     mkdir -p "$target/bin"
     tar -xzf /tmp/greyiq-cli.tar.gz -C "$target"
     env PATH=/usr/bin:/bin "$target/greyiq-cli" --version
+    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend status --json >/tmp/defend-status.json
+    env PATH=/usr/bin:/bin "$target/greyiq-cli" defend rules --json >/tmp/defend-rules.json
+    grep -Fq '"rule_id": "defender.risky_listener"' /tmp/defend-rules.json
     env PATH=/usr/bin:/bin "$target/greyiq-cli" path > /tmp/path-direct.txt
     grep -F "export PATH=" /tmp/path-direct.txt
     ln -s "$target/greyiq-cli" "$target/bin/greyiq-cli"

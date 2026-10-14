@@ -41,6 +41,9 @@ runuser -u hunter -- bash -c 'cd "$HOME/GreyIQ" && ./scripts/install-cli.sh'
 runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn --version'
 runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn path'
 runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn profiles >/dev/null'
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn defend status --json >/tmp/defend-status.json'
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn defend rules --json >/tmp/defend-rules.json'
+grep -Fq '"rule_id": "defender.risky_listener"' /tmp/defend-rules.json
 
 # The first things a new operator runs after a clone: the profile verbs. They write the operator
 # profile and read it back, so this also proves the runtime directory is writable as an ordinary

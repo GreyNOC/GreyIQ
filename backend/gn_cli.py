@@ -101,7 +101,8 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # registration time would break test_boot_no_torch.py and CLI startup. Import the engine
 # inside the command function, exactly like the _cmd_* handlers below.
 _VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
-                                  "bughunter.wardrive.cli", "hf_agent_clone", "edit_mine")
+                                  "bughunter.wardrive.cli", "hf_agent_clone", "edit_mine",
+                                  "defender.cli")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
