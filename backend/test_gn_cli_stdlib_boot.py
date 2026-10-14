@@ -168,7 +168,7 @@ print("chat|answered|%%s" %% bool(body and how))
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         rows = dict(line.split("|", 2)[1:] for line in proc.stdout.splitlines() if "|" in line)
         self.assertEqual(rows.get("answered"), "True", "the chat must answer from the bundled pack")
-        for label in ("bot", "corpus", "confirmed", "store"):
+        for label in ("bot", "corpus", "confirmed", "clones"):
             with self.subTest(label=label):
                 self.assertIn(label, rows)
                 self.assertFalse(rows[label].startswith("--"),

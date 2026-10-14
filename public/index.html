@@ -42,6 +42,11 @@
         </header>
 
         <section class="bot-list" id="botList" aria-label="Bots"></section>
+        <!-- Whatever the shared bot store could not do, in its own words: an unparseable
+             runtime/bots.json, an entry it refused, a profile naming a bot that is gone, or the
+             local service being down (in which case this list is the last state it served, and
+             nothing here can be edited). Never silently empty. -->
+        <p class="bot-store-note" id="botStoreNote" aria-live="polite" hidden></p>
 
         <details class="bot-editor-fold" id="botEditorFold">
           <summary>
@@ -51,7 +56,9 @@
           <form class="bot-editor" id="botEditor">
             <label>
               <span>Name</span>
-              <input id="botName" name="name" maxlength="28" autocomplete="off">
+              <!-- 60, the store's own limit for a display name (gn_bots.coerce). At 28 a name set from
+                   the CLI could be shown but never retyped once cleared. -->
+              <input id="botName" name="name" maxlength="60" autocomplete="off">
             </label>
 
             <label>
@@ -71,12 +78,29 @@
               </label>
 
               <label>
-                <span>Variation</span>
-                <input id="botTemperature" name="temperature" type="range" min="0" max="100" step="1">
+                <!-- The registry's own units (0.0-2.0), the same number `gn bot show` prints. The
+                     readout next to it says "provider default" when the bot has none, because a
+                     slider cannot sit at "unset" and a thumb at 0 would read as temperature 0. -->
+                <span>Variation <em class="field-readout" id="botTemperatureValue"></em></span>
+                <input id="botTemperature" name="temperature" type="range" min="0" max="2" step="0.01">
               </label>
             </div>
 
+            <div class="field-grid">
+              <label>
+                <span>Brain</span>
+                <select id="botProvider" name="provider"></select>
+              </label>
+
+              <label>
+                <span>Model</span>
+                <input id="botModel" name="model" maxlength="120" autocomplete="off" spellcheck="false" placeholder="provider default">
+              </label>
+            </div>
+
+            <p class="bot-readiness" id="botReadiness" aria-live="polite"></p>
             <div class="swatch-row" id="swatchRow" aria-label="Bot color"></div>
+            <button class="text-button" type="button" id="cloneBotButton">Duplicate this bot</button>
             <button class="text-button danger" type="button" id="deleteBotButton">Delete this bot</button>
           </form>
         </details>
