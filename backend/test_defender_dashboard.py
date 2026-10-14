@@ -125,6 +125,25 @@ class DefenderDashboardTests(unittest.TestCase):
         self.assertTrue(observed[0]["artifact"]["artifact_path"])
         self.assertEqual(len(observed[0]["findings"]), 0)
 
+    def test_dashboard_pins_baseline_after_first_observed_cycle(self) -> None:
+        required: list[bool] = []
+
+        def fake_scan(_args: object, **kwargs: object) -> dict:
+            required.append(bool(kwargs["require_baseline"]))
+            return {"baseline_sha256": "a" * 64}
+
+        def two_cycles(_args: object, *, scan: object) -> int:
+            scan()  # type: ignore[operator]
+            scan()  # type: ignore[operator]
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp, \
+             mock.patch.object(defender_cli, "_runtime", return_value=Path(temp)), \
+             mock.patch.object(defender_cli, "_scan_once", side_effect=fake_scan), \
+             mock.patch("defender.dashboard.run_dashboard", side_effect=two_cycles):
+            self.assertEqual(gn_cli.main(["defend", "dash"]), 0)
+        self.assertEqual(required, [False, True])
+
     def test_cli_requires_authorized_capture_and_terminal_before_scanning(self) -> None:
         def run(args: list[str]) -> tuple[int, str]:
             output = io.StringIO()
@@ -142,6 +161,10 @@ class DefenderDashboardTests(unittest.TestCase):
         code, error = run(["--nmap-target", "8.8.8.8", "--scope", "8.8.8.8", "-y"])
         self.assertEqual(code, 2)
         self.assertIn("local/private", error)
+        with tempfile.TemporaryDirectory() as temp:
+            code, error = run(["--baseline", str(Path(temp) / "missing.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("requires the selected baseline", error)
 
 
 if __name__ == "__main__":
