@@ -2,6 +2,13 @@
 
 Notable changes to GreyIQ.
 
+## 5.0.2
+
+- Fix the same nested-shell rule assertion in the Linux headless CLI archive
+  smoke test. The installed Debian package passed in 5.0.1; the archive check
+  stopped Linux asset upload before that release could be published. Command
+  failures now print their output for diagnosis.
+
 ## 5.0.1
 
 - Fix the Debian 13 release smoke check for the frozen defender CLI. Its rule
