@@ -67,6 +67,13 @@ directory is not on your PATH yet) and `git pull` then updates the command in
 place. Flags: `--extras`, `--bin-dir DIR`, `--name NAME` (Google's GN build tool
 also installs a `gn`), `--force`; `--help` lists them.
 
+The same CLI now includes **local defender monitoring** alongside bug discovery:
+`gn defend inventory`, `gn defend baseline create --accept-current-state`,
+`gn defend scan`, `gn defend watch`, and `gn defend trace --pid PID`. Optional,
+explicitly authorized Nmap and TShark adapters add bounded local network and
+packet-metadata observations. See the [Defender CLI guide](docs/defender-cli.md)
+for scope gates, baseline trust, examples, and detection limits.
+
 That stdlib-only guarantee is enforced, not assumed:
 `backend/test_gn_cli_stdlib_boot.py` runs the CLI — including a real code scan —
 with every `site-packages` import blocked, and `scripts/smoke-source-cli.sh`

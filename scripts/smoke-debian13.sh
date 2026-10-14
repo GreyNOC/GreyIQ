@@ -39,6 +39,9 @@ docker run --rm --security-opt seccomp=unconfined \
       cat /tmp/cli.log >&2
       exit 1
     }
+    runuser -u greyiq-ci -- "$cli" defend status --json >/tmp/defend-status.json
+    runuser -u greyiq-ci -- "$cli" defend rules --json >/tmp/defend-rules.json
+    grep -Fq '"rule_id": "defender.risky_listener"' /tmp/defend-rules.json
     runuser -u greyiq-ci -- "$cli" dashboard --help >/dev/null
     runuser -u greyiq-ci -- "$cli" path >/tmp/cli-path.log
     grep -q "greyiq-cli is already on PATH" /tmp/cli-path.log

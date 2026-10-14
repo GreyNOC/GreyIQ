@@ -114,6 +114,16 @@ class StdlibOnlyCliBootTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertTrue(proc.stdout.strip(), f"{args} printed nothing")
 
+    def test_defender_discovery_works_on_bare_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"GREYIQ_RUNTIME_DIR": tmp}
+            for args in (["defend", "status", "--json"], ["defend", "rules", "--json"]):
+                with self.subTest(args=args):
+                    proc = _run_cli(args, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(proc.stdout.strip())
+                    self.assertNotIn("third-party import blocked", proc.stderr)
+
     def test_the_profile_verbs_work_on_a_bare_python(self) -> None:
         """`gn setup` / `settings` / `output` are the first thing a new operator runs.
 

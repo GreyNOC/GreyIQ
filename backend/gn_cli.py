@@ -102,7 +102,7 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # inside the command function, exactly like the _cmd_* handlers below.
 _VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
                                   "bughunter.wardrive.cli", "hf_agent_clone", "edit_mine",
-                                  "gn_bots")
+                                  "gn_bots", "defender.cli")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 

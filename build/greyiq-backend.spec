@@ -146,6 +146,9 @@ for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "p
 
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("bughunter")
+# The defender verb imports its collectors, rules, and journal only when run.
+# Keep the entire stdlib-only package in the frozen CLI as well as source installs.
+hiddenimports += collect_submodules("defender")
 # Bundle the MCP SDK modules GreyIQ uses. collect_all("mcp") also imports the
 # optional mcp.cli package, whose Typer extra is intentionally not installed
 # and aborts PyInstaller's isolated module scan.
