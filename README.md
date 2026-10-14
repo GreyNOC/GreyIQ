@@ -5,9 +5,10 @@ GreyIQ (GreyNOC-IQ) is a **local-first AI** desktop/web app. It's a GreyNOC prod
 It includes:
 
 - **DevOps/server setup playbooks** for PM2 ecosystem files, Ubuntu VPS setup, Nginx reverse proxies, environment variables/secrets, and `DEPLOY.md` runbooks.
-- **Editable bots** with name, color, persona, style, and response variation — plus a **bot store**
-  the CLI and the agent studio drive: make, edit, clone, teach, train and delete bots, pick which
-  one is live (it answers you *and* plans your hunts), and plug in a Hugging Face bot.
+- **Editable bots** with name, color, persona, style, and response variation, kept in one **bot
+  store** the app, the CLI and the agent studio all drive: make, edit, clone, teach, train and
+  delete bots, pick which one is live (it answers you *and* plans your hunts), and plug in a
+  Hugging Face bot.
 - A pluggable **coding brain** — answer with a local model (Ollama), Claude, or any OpenAI-compatible endpoint; falls back to the bundled local engine.
 - **Agent mode + the Workbench IDE** — let the brain read, edit, and (optionally) run things in a workspace folder, with a file explorer, code preview, diffs, agent steps, and verification output.
 - **BugHunter** — a static/passive security scanner, a **bug-bounty hunt** that writes reports with attack plans, and an **agent security red-team** that tests GreyIQ's own agent.
@@ -378,6 +379,42 @@ hosted model's weights: the offline hunt ranker (`hunt_train`, from the trace co
 own checkpoint (`gn train-coder`, which needs torch). A hosted bot trains its *ranker* and the verb
 says so — claiming "trained" about an API model would be a number nobody could reproduce. A refused
 gate is reported as the gate's own reason and leaves no trained stamp.
+
+### The same bots in the app
+
+The desktop/web app's **AI Studio** and `gn bot` are two doors onto that one store, not two stores.
+A bot you make in the app is in `gn bot ls` and can be made live there; a bot you make with `gn bot
+new` is in the app's roster, with its provider, its model and whether it is ready; and `gn studio`'s
+BOTS panel agrees with both. Picking a bot in the app's roster goes through the same single writer
+`gn bot use` does, so the app's selected bot and the `*` in `gn bot ls` are the same bot — and the
+one your next `gn hunt --brain` plans with.
+
+The app's roster used to live in the browser's localStorage, which is why none of that was true.
+Three things stay in the browser, deliberately:
+
+- **A bot's colour.** It is how one browser draws the bot — no CLI surface can use a hex triple, and
+  a field every other surface has to ignore does not belong in a shared store.
+- **The in-browser preference weights.** They are fitted from that browser's own chat ratings and
+  memories, which never leave it, so a copy in the store would be a number nobody could reproduce
+  from the store. They are also not a training run: the registry's trained stamp is written only by
+  a real trainer (`gn bot train`), which is why the Studio's Model meter stopped reading them.
+- **Chat history and memories**, as before.
+
+Everything else is the store's, including what the app called a bot's **corpus** — operator prose
+that shapes the bot, which is exactly what a **lesson** is, so it lives in `lessons` and shows up in
+`gn bot show`. The app's **Variation** slider now speaks the store's own units (0.0-2.0, the number
+`gn bot show` prints) rather than a 0-100 position, and a bot with none set reads *provider default*
+instead of a number nobody chose.
+
+The first time the app runs against this store it hands over whatever bots that browser had, **once**
+— keeping the persona, the style, the corpus (as lessons), the temperature (the old slider was a
+sampling temperature x100 on its only consumer, so 46 becomes 0.46) and which bot was selected. An id
+the store already holds is left exactly as it is, so the handover cannot overwrite a bot you made in
+the shell or duplicate anything if it runs again, and nothing deletes the browser's copy. A bot the
+store refuses is named rather than dropped quietly.
+
+The store is served by the local GreyIQ service. With the service down the app shows the last roster
+it saw, says so, and takes no edits it could not save.
 
 ## Plugging in Hugging Face bots
 

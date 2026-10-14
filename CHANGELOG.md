@@ -2,6 +2,67 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased
+
+- **The app's bots and the CLI's bots are one store.** v4.13.0 made a bot a record in
+  `runtime/bots.json`, and the desktop/web app went on keeping its own in the browser's
+  localStorage: a bot made in the AI Studio was invisible to `gn bot ls`, a bot made with `gn bot
+  new` was invisible to the app, and "which bot is live" had two answers that nothing ever compared.
+  There is one store now and the app is a second DOOR onto it — `/api/bots` with create, update,
+  delete, clone, teach and set-active over `gn_bots`, each one delegating rather than reimplementing,
+  so the invariants that module's docstring promises hold through this door too: no key in the store
+  (the payload reports `key configured` / `key none`, never a key), no field that implies
+  authorization, an inert Hugging Face clone that cannot become a brain, a refused entry written back
+  verbatim, a store that cannot be parsed never overwritten (a 409 that says to fix or move it), and
+  `set_active` still the only writer of the profile's `bot` setting. **Picking a bot in the app is
+  `gn bot use`**: the roster's selection posts to that one writer and re-reads, so the app's selected
+  bot, the `*` in `gn bot ls` and `gn studio`'s BOTS panel are the same bot — and it is the one the
+  next `gn hunt --brain` resolves. The app's roster now shows what each bot IS (provider · model, its
+  readiness, `->net` when asking it leaves the machine) instead of its style, and every one of those
+  facts is computed by the backend from files the browser cannot see — the key store, and the app's
+  own `coder.local.base_url`, which is the endpoint a `local` bot with none of its own will really
+  use. The panel gained the Brain and Model it could not express before, a Duplicate that is
+  `gn bot clone`, and the store's own sentence under the roster when something is wrong with it.
+  With the service down the app shows the last roster it saw, says so, and takes no edits it could
+  not save, rather than quietly keeping a second copy of your bots.
+- **Three fields stay in the browser, and the reason is written down.** A bot's **colour** is how one
+  browser draws it: no CLI surface can use a hex triple, and a field every other surface must ignore
+  does not belong in a shared store. The **in-browser preference weights** are fitted from that
+  browser's own chat ratings and memories, which never leave it, so a copy in the store would be a
+  number nobody could reproduce from it — and that fit is not a training run, which is why it is not
+  the registry's `trained_at` (`mark_trained` is written only with a real trainer's result, the same
+  rule that made the Studio's Model meter stop reading it). Both are kept per viewer, keyed by the
+  registry's bot id. The browser's **corpus** DOES have a home and moved into it: it is operator
+  prose that shapes the bot, which is what a `lesson` already is, so it is carried into chat prompts
+  by `system_extra` and printed by `gn bot show`. The **Variation** slider now speaks the store's own
+  units (0.0-2.0, the number `gn bot show` prints) rather than a 0-100 position — 0-100 here and
+  0.0-2.0 there would have been two surfaces printing different numbers for one bot's one field.
+- **A one-time handover of whatever bots that browser had, which cannot run twice and loses
+  nothing.** Persona, style, corpus (as lessons), the temperature (the old slider was a sampling
+  temperature x100 on its only consumer, so 46 becomes 0.46 — a conversion, not a new number) and
+  the bot that was selected all come across. Ids change in the handover — `Forge` slugs to `forge`,
+  and a `bot-<uuid>` is longer than an id may be — so every bot is reported back with the id it
+  ENDED UP WITH and this browser re-keys its chat history, memories, colour and fit onto it; without
+  that, all four would have been orphaned by a rename nobody saw. An id the store already holds is
+  reported `exists` and left exactly as it is, so a marker that fails to persist cannot duplicate
+  anybody's bots and the handover can never overwrite a bot made in the shell; a colliding name is
+  numbered by `register` rather than replacing the bot already there; nothing deletes the browser's
+  copy; one tampered entry is refused by name while the rest still land; and a selection already made
+  with `gn bot use` is not overruled by a browser arriving late. A browser that never had its own
+  bots migrates nothing — a registry record names a provider and a browser-only bot never did, which
+  is how the two are told apart.
+- **Four defects found by driving the app rather than by running the tests.** A bot whose temperature
+  is unset — a real state, meaning "whatever the provider defaults to" — read back as a temperature
+  of ZERO, because `Number(null)` is 0 and `Number.isFinite(0)` is true: the editor showed `0.00`
+  for it, and the next keystroke anywhere in the panel would have SAVED that as the operator's
+  choice. The slider also snapped a stored value to its own step, so a `0.46` set from the CLI
+  became `0.45` the moment anything else in the panel was typed; it is only sent when the operator
+  moves it, and its step matches what the store holds. The bot a browser had selected came back as
+  the default after the handover, because the selection was read after the store's answer had
+  already replaced it. And a persona typed into one bot was written to whichever bot was clicked
+  next, because the debounced save read "the live bot" when it fired rather than remembering which
+  bot the words were typed into. All four have tests that run the real code.
+
 ## v4.13.0 - your bots, and the studio that drives them
 
 - **Full control over the bots, and `bot` finally means something.** A bot was a provider name —
