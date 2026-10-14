@@ -8,7 +8,8 @@ Notable changes to GreyIQ.
   defender wire table and searchable packet detail. Join packet tuples against
   the local socket inventory, preferring exact connected sockets and using
   listener or bound endpoints only for inventoried local addresses. Record
-  `socket_snapshot`, `listener_endpoint`, `ambiguous`, or `unknown` with every
+  `socket_snapshot`, `listener_endpoint`, `bound_endpoint`, `ambiguous`, or
+  `unknown` with every
   packet and leave conflicting or unmatched PIDs blank. This is a time-sensitive
   local socket association, not remote process or actor attribution.
 

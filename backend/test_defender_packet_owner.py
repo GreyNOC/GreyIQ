@@ -40,7 +40,7 @@ class PacketOwnerTests(unittest.TestCase):
         annotate_packet_owners(capture, inventory)
         self.assertEqual([(row["pid"], row["pid_attribution"]) for row in capture["packets"]], [
             (1234, "socket_snapshot"), (1234, "socket_snapshot"),
-            (5678, "listener_endpoint"), (9012, "listener_endpoint"), (None, "unknown")])
+            (5678, "listener_endpoint"), (9012, "bound_endpoint"), (None, "unknown")])
         self.assertEqual(capture["pid_attribution"]["socket_snapshot"], 2)
 
     def test_ambiguous_and_stale_or_unowned_socket_stay_unknown(self) -> None:

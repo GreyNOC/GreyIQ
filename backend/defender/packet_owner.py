@@ -61,7 +61,8 @@ def annotate_packet_owners(capture: dict[str, Any], inventory: Mapping[str, Any]
         elif (protocol == "tcp" and str(row.get("state") or "").upper() == "LISTEN") or protocol == "udp":
             endpoints.setdefault((protocol, local, local_port), set()).add(pid)
 
-    counts = {"socket_snapshot": 0, "listener_endpoint": 0, "ambiguous": 0, "unknown": 0}
+    counts = {"socket_snapshot": 0, "listener_endpoint": 0, "bound_endpoint": 0,
+              "ambiguous": 0, "unknown": 0}
     for packet in packets:
         if not isinstance(packet, dict):
             continue
@@ -79,7 +80,7 @@ def annotate_packet_owners(capture: dict[str, Any], inventory: Mapping[str, Any]
                 owners.update(connected.get((protocol, local, local_port, remote, remote_port), set()))
             attribution = "socket_snapshot"
             if not owners:
-                attribution = "listener_endpoint"
+                attribution = "bound_endpoint" if protocol == "udp" else "listener_endpoint"
                 for local, local_port in ((source, source_port), (destination, destination_port)):
                     if local not in local_ips:
                         continue
