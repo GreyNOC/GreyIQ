@@ -64,6 +64,23 @@ class PacketOwnerTests(unittest.TestCase):
         self.assertEqual(capture["packets"][1]["pid_attribution"], "unknown")
         self.assertEqual(capture["packets"][2]["pid_attribution"], "unknown")
 
+    def test_ipv4_mapped_socket_matches_ipv4_packet_but_multicast_ingress_is_unknown(self) -> None:
+        inventory = {"interfaces": [{"addresses": ["::ffff:10.0.0.2/128"]}],
+                     "connections": [
+                         {"protocol": "tcp", "local_address": "::ffff:10.0.0.2",
+                          "local_port": 50000, "remote_address": "::ffff:198.51.100.3",
+                          "remote_port": 443, "state": "ESTABLISHED", "pid": 1234},
+                         {"protocol": "udp", "local_address": "0.0.0.0",
+                          "local_port": 5353, "state": "BOUND", "pid": 5678},
+                     ]}
+        capture = {"ok": True, "packets": [
+            packet("10.0.0.2", 50000, "198.51.100.3", 443),
+            packet("198.51.100.3", 5353, "224.0.0.251", 5353, "udp"),
+        ]}
+        annotate_packet_owners(capture, inventory)
+        self.assertEqual(capture["packets"][0]["pid"], 1234)
+        self.assertEqual(capture["packets"][1]["pid_attribution"], "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

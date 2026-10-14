@@ -12,7 +12,10 @@ from typing import Any, Mapping
 
 def _ip(value: Any) -> str | None:
     try:
-        return str(ipaddress.ip_address(str(value).split("%", 1)[0]))
+        address = ipaddress.ip_address(str(value).split("%", 1)[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            return str(address.ipv4_mapped)
+        return str(address)
     except ValueError:
         return None
 

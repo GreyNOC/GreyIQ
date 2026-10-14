@@ -110,6 +110,9 @@ UDP socket matched an inventoried local address and port. `ambiguous` or
 `unknown` leaves the PID empty. A PID does not identify the remote sender, and
 socket ownership can change between inventory and capture. Search the dashboard by PID with
 `/1234`; use `gn defend trace --pid 1234` to inspect a fresh local snapshot.
+Inbound multicast and broadcast packets remain unassigned when the inventory
+cannot show which local socket received them. IPv6 wildcard listeners are not
+assumed to accept IPv4 traffic without a recorded dual-stack socket setting.
 
 The `-y` flag is an operator assertion that the named network or interface is
 authorized for this assessment. Private addressing alone is not authorization.
