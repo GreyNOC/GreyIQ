@@ -432,6 +432,24 @@ class InvariantsSurviveThisDoorTests(BotRouteCase):
                 self.assertEqual(footer[0].count("answers chat and plans the hunt"),
                                  1 if bot_id == "remote" else 0)
 
+    def test_whether_a_readiness_is_a_fault_is_the_stores_judgement(self) -> None:
+        """``is_blocked`` is the single answer; the app kept its own copy of the same list.
+
+        `off`, `edits only` and `inert` are postures — bots working exactly as designed — and the
+        CLI had this wrong in its own words at the same time (`gn bot use off` printed "off: `gn
+        bot show off` says what is missing"). Two copies of one judgement is how they drift.
+        """
+        self.create("Hosted", provider="anthropic", model="claude-opus-5")
+        payload = api.list_bots()
+        for bot_id, blocked in (("hosted", True),      # needs a key
+                                ("off", False),        # nothing answers, by design
+                                ("offline", False),    # edits only, by design
+                                ("tinygpt", False)):   # ready
+            with self.subTest(bot=bot_id):
+                row = self.row(payload, bot_id)
+                self.assertEqual(row["blocked"], blocked)
+                self.assertEqual(row["blocked"], gn_bots.is_blocked(row["readiness"]))
+
     def test_a_loopback_bot_is_not_marked(self) -> None:
         (self.runtime / "solin_runtime_config.json").write_text(
             json.dumps({"coder": {"local": {"base_url": "http://127.0.0.1:11434/v1"}}}),
@@ -699,9 +717,18 @@ class StudioControlsAreBoundTests(unittest.TestCase):
                 self.assertNotIn(clause, self.JS,
                                  "the app is restating what_it_does instead of printing it")
 
+    def test_the_app_keeps_no_second_copy_of_what_counts_as_a_fault(self) -> None:
+        """``gn_bots.is_blocked`` is the single answer, carried as ``blocked`` in the payload."""
+        self.assertIn("gn_bots.is_blocked(", self.API)
+        self.assertIn("bot.blocked", self.JS)
+        self.assertNotIn("BLOCKING_READINESS", self.JS)
+        for answer in ("needs a key", "needs a model"):
+            self.assertNotIn(f'"{answer}"', self.JS,
+                             "the app is deciding what counts as a fault again")
+
     def test_the_app_reads_the_facts_it_must_not_compute(self) -> None:
         # readiness/key_state/off_machine/endpoint depend on files the browser cannot see.
-        for field in ("readiness", "key_state", "off_machine", "endpoint"):
+        for field in ("readiness", "key_state", "off_machine", "endpoint", "blocked"):
             with self.subTest(field=field):
                 self.assertIn(f'"{field}"', self.API, f"the payload no longer carries {field}")
                 self.assertIn(f"bot.{field}", self.JS, f"the app never reads {field}")

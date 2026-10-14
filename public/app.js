@@ -13,11 +13,6 @@ const DEFAULT_SAMPLING_TEMPERATURE = 0.32;
 // gn_bots.DEFAULT_ID — the bot every unresolvable name falls back to, and the one a profile that
 // has never been set names. Used only to tell "the operator has not chosen a bot" from "they have".
 const DEFAULT_BOT_ID = "tinygpt";
-// The gn_bots.readiness values that mean "this bot cannot answer until you do something". The
-// others it returns — `off`, `edits only`, `inert`, `ready` — are postures the store's own
-// what_it_does sentence already describes, and calling those "not ready" was a surface telling the
-// operator a working bot was broken.
-const BLOCKING_READINESS = ["needs a key", "needs a model"];
 // How the store's provider ids read in the Brain picker. The ids themselves are gn_bots.PROVIDERS
 // and come from /api/bots, so a provider added there appears here even without a label.
 const PROVIDER_LABELS = {
@@ -2546,12 +2541,14 @@ function renderBotReadiness(bot) {
       ? `Live: ${bot.what_it_does}.`
       : `When live: ${bot.what_it_does}.`);
   }
-  // Only the two readiness states that mean the bot CANNOT do what the sentence above just said
-  // are reported as not ready. `off`, `edits only` and `inert` are postures, not failures — and
-  // the sentence has already described each of them, so "Not ready: edits only" was both
-  // redundant and false about a deterministic coder that works exactly as designed.
+  // Only a readiness that means the bot CANNOT do what the sentence above just said is reported as
+  // not ready. `off`, `edits only` and `inert` are postures, not failures — and the sentence has
+  // already described each of them, so "Not ready: edits only" was both redundant and false about
+  // a deterministic coder working exactly as designed. WHICH answers are faults is the store's
+  // judgement (`gn_bots.is_blocked`, carried as `blocked`), not a list kept here: the CLI had this
+  // same bug in its own words, and two copies of one judgement is how they drifted apart.
   if (bot.readiness === "ready") parts.push("Ready.");
-  else if (BLOCKING_READINESS.includes(bot.readiness)) parts.push(`Not ready: ${bot.readiness}.`);
+  else if (bot.blocked) parts.push(`Not ready: ${bot.readiness}.`);
   if (bot.key_state === "configured") parts.push("Key configured.");
   if (bot.key_state === "none") parts.push("No key for this provider yet.");
   if (bot.off_machine) {
@@ -2564,7 +2561,7 @@ function renderBotReadiness(bot) {
   if (bot.trained_at) parts.push(`Trained ${bot.train_note || "by a local run"}.`);
   els.botReadiness.textContent = parts.join(" ");
   els.botReadiness.classList.toggle("is-warn",
-    Boolean(bot.off_machine) || BLOCKING_READINESS.includes(bot.readiness));
+    Boolean(bot.off_machine) || Boolean(bot.blocked));
 }
 
 const activeChatPolls = new Set();

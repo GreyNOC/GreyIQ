@@ -177,8 +177,7 @@ test('the panel shows the store own sentence for what making a bot live means', 
   const state = { activeBotId: 'recon' };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state, botStore: { loaded: true },
-      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+    { els: { botReadiness: node }, state, botStore: { loaded: true } });
   const sentence = 'it answers chat and plans the hunt';
   run.renderBotReadiness({ id: 'recon', readiness: 'ready', key_state: 'not needed',
     what_it_does: sentence });
@@ -202,8 +201,7 @@ test('a posture is not reported as a failure', () => {
   const node = { textContent: '', classList: { add() {}, toggle(_c, on) { node.warn = on; } } };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: { loaded: true },
-      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: { loaded: true } });
 
   for (const posture of ['off', 'edits only', 'inert']) {
     run.renderBotReadiness({ id: 'x', readiness: posture, what_it_does: 'something the store says',
@@ -213,13 +211,14 @@ test('a posture is not reported as a failure', () => {
   }
   // The two that really do block still say so, and still colour the line.
   for (const blocked of ['needs a key', 'needs a model']) {
-    run.renderBotReadiness({ id: 'x', readiness: blocked, provider: 'anthropic',
+    run.renderBotReadiness({ id: 'x', readiness: blocked, blocked: true, provider: 'anthropic',
       what_it_does: 'it answers' });
     assert.match(node.textContent, new RegExp(`Not ready: ${blocked}\.`));
     assert.equal(node.warn, true);
   }
   // And `off` is not reassured about the network: nothing is asked of it.
-  run.renderBotReadiness({ id: 'x', readiness: 'off', provider: 'off', what_it_does: 'nothing' });
+  run.renderBotReadiness({ id: 'x', readiness: 'off', blocked: false, provider: 'off',
+    what_it_does: 'nothing' });
   assert.ok(!/Stays on this machine/.test(node.textContent));
 });
 
@@ -231,8 +230,7 @@ test('a bot with no store record claims neither readiness nor where it runs', ()
   const store = { loaded: true };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: store,
-      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+    { els: { botReadiness: node }, state: { activeBotId: '' }, botStore: store });
   run.renderBotReadiness({ id: 'astra', name: 'Astra' });
   assert.match(node.textContent, /Start the local GreyIQ service/);
   assert.ok(!/Stays on this machine/.test(node.textContent));

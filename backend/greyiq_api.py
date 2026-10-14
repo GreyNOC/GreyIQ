@@ -6412,6 +6412,12 @@ def _bot_payload(gn_bots: Any, bot: Any) -> dict[str, Any]:
         "endpoint": gn_bots.endpoint_for(RUNTIME_DIR, bot),
         "key_state": gn_bots.key_state(RUNTIME_DIR, bot),
         "readiness": gn_bots.readiness(RUNTIME_DIR, bot),
+        # Whether that readiness means something is MISSING, from gn_bots rather than from a list
+        # the browser keeps. `off`, `edits only` and `inert` are postures -- bots working exactly as
+        # designed -- and a surface reporting one as a problem claims a defect that does not exist.
+        # The app had its own copy of this judgement and the CLI had the same bug in its own words,
+        # which is the second time this shape turned up on two surfaces at once.
+        "blocked": gn_bots.is_blocked(gn_bots.readiness(RUNTIME_DIR, bot)),
     }
 
 
