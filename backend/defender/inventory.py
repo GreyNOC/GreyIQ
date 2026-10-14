@@ -265,7 +265,11 @@ def _proxy_endpoint(raw: Any, *, kind: str, source: str) -> dict[str, Any] | Non
     normalized_kind = kind.strip().lower()
     if normalized_kind not in {"http", "https", "ftp", "socks", "socks5", "all", "pac", "system"}:
         normalized_kind = "system"
-    scheme = parsed.scheme or (normalized_kind if normalized_kind.startswith("socks") else "http")
+    scheme = parsed.scheme or (normalized_kind if normalized_kind in
+                               {"http", "https", "ftp", "socks", "socks5"} else "http")
+    if port is None:
+        port = {"http": 80, "https": 443, "ftp": 21,
+                "socks": 1080, "socks5": 1080, "socks5h": 1080}.get(scheme.lower())
     return {"kind": normalized_kind, "host": _clean(host, 255), "port": port,
             "source": source, "scheme": _clean(scheme, 24).lower()}
 

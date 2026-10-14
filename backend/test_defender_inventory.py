@@ -63,6 +63,12 @@ class DefenderBaselineTests(unittest.TestCase):
         self.assertIsNone(_proxy_endpoint("https://[invalid", kind="http", source="test"))
         self.assertEqual(_proxy_endpoint("proxy.example:8080", kind="user:password", source="test")["kind"],
                          "system")
+        self.assertEqual(_proxy_endpoint("https://proxy.example", kind="https", source="test")["port"],
+                         443)
+        self.assertEqual(_proxy_endpoint("proxy.example", kind="https", source="test")["port"],
+                         443)
+        self.assertEqual(_proxy_endpoint("socks5://proxy.example", kind="all", source="test")["port"],
+                         1080)
         with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://user:pass@proxy.example:3128",
                                           "HTTPS_PROXY": "https://proxy.example:8443",
                                           "ALL_PROXY": ""}, clear=True), \
