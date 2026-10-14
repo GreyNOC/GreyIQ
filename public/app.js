@@ -13,6 +13,11 @@ const DEFAULT_SAMPLING_TEMPERATURE = 0.32;
 // gn_bots.DEFAULT_ID — the bot every unresolvable name falls back to, and the one a profile that
 // has never been set names. Used only to tell "the operator has not chosen a bot" from "they have".
 const DEFAULT_BOT_ID = "tinygpt";
+// The gn_bots.readiness values that mean "this bot cannot answer until you do something". The
+// others it returns — `off`, `edits only`, `inert`, `ready` — are postures the store's own
+// what_it_does sentence already describes, and calling those "not ready" was a surface telling the
+// operator a working bot was broken.
+const BLOCKING_READINESS = ["needs a key", "needs a model"];
 // How the store's provider ids read in the Brain picker. The ids themselves are gn_bots.PROVIDERS
 // and come from /api/bots, so a provider added there appears here even without a label.
 const PROVIDER_LABELS = {
@@ -2247,15 +2252,24 @@ function freezeBotEditor() {
   // store had never heard of while the note under the roster called that roster the last copy the
   // browser saw. Refusing at the control is the honest version of the same sentence.
   const frozen = !botStore.loaded;
-  const title = frozen ? "The bot store is served by the local GreyIQ service — start it to edit bots." : "";
   for (const control of [els.botName, els.botPersona, els.botStyle, els.botTemperature,
                          els.botProvider, els.botModel, els.newBotButton, els.cloneBotButton,
                          els.deleteBotButton]) {
     if (!control) continue;
-    if (frozen) control.disabled = true;
-    control.title = frozen ? title : (control === els.deleteBotButton ? control.title : "");
+    if (frozen) {
+      control.disabled = true;
+      control.title = FROZEN_EDITOR_TITLE;
+    } else if (control.title === FROZEN_EDITOR_TITLE) {
+      // Only ever clears its OWN title. renderEditor puts a reason on two of these controls (why a
+      // built-in cannot be deleted, why an inert clone's brain is locked), and blanking those here
+      // would take the explanation off the control that needs it.
+      control.title = "";
+    }
   }
 }
+
+const FROZEN_EDITOR_TITLE =
+  "The bot store is served by the local GreyIQ service — start it to edit bots.";
 
 function setSelectValue(select, value) {
   // A bot's style and provider can be set from the CLI to something this <select> has no option
@@ -2294,8 +2308,12 @@ function renderBotProviderOptions(bot) {
   setSelectValue(els.botProvider, bot.provider);
   // An inert clone's provider is the field that keeps a stranger's agent out of the brain path, so
   // the store refuses to change it (gn_bots.update). Disabled here rather than letting the operator
-  // pick a value that comes back as an error.
+  // pick a value that comes back as an error — and the reason lives on the control, not in the
+  // readiness line, which carries the store's own sentences and nothing written here.
   els.botProvider.disabled = Boolean(bot.inert);
+  els.botProvider.title = bot.inert
+    ? `${bot.id} was cloned from a repository and is inert by design: it cannot become a brain.`
+    : "";
 }
 
 function renderBotReadiness(bot) {
@@ -2313,22 +2331,34 @@ function renderBotReadiness(bot) {
     return;
   }
   const parts = [];
-  if (bot.inert) {
-    parts.push(`${bot.id} is a cloned agent — inventory, never executed, and it cannot become a brain.`);
-  } else {
-    parts.push(bot.readiness === "ready" ? "Ready." : `Not ready: ${bot.readiness}.`);
+  // The store's own sentence for what making this bot live means, verbatim — the same one
+  // `gn bot use` prints and `gn studio`'s /use shows. Clicking a bot in the roster IS that
+  // operation, so composing an equivalent here would be a third copy of a claim that only has to
+  // be wrong once (gn_bots.what_it_does exists because two of them already disagreed).
+  if (bot.what_it_does) {
+    parts.push(bot.id === state.activeBotId
+      ? `Live: ${bot.what_it_does}.`
+      : `When live: ${bot.what_it_does}.`);
   }
+  // Only the two readiness states that mean the bot CANNOT do what the sentence above just said
+  // are reported as not ready. `off`, `edits only` and `inert` are postures, not failures — and
+  // the sentence has already described each of them, so "Not ready: edits only" was both
+  // redundant and false about a deterministic coder that works exactly as designed.
+  if (bot.readiness === "ready") parts.push("Ready.");
+  else if (BLOCKING_READINESS.includes(bot.readiness)) parts.push(`Not ready: ${bot.readiness}.`);
   if (bot.key_state === "configured") parts.push("Key configured.");
   if (bot.key_state === "none") parts.push("No key for this provider yet.");
   if (bot.off_machine) {
     parts.push(`Asking this bot sends your prompt off this machine${bot.endpoint ? ` (${bot.endpoint})` : ""}.`);
-  } else if (!bot.inert) {
+  } else if (bot.provider !== "off") {
+    // Not said of `off`: nothing is asked of it, so where the asking would go is not a fact about
+    // it, and a reassurance nobody needed reads as one that was computed.
     parts.push("Stays on this machine.");
   }
   if (bot.trained_at) parts.push(`Trained ${bot.train_note || "by a local run"}.`);
   els.botReadiness.textContent = parts.join(" ");
   els.botReadiness.classList.toggle("is-warn",
-    Boolean(bot.off_machine) || (!bot.inert && bot.readiness !== "ready"));
+    Boolean(bot.off_machine) || BLOCKING_READINESS.includes(bot.readiness));
 }
 
 const activeChatPolls = new Set();

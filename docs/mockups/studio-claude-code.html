@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en" data-view="proposed" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Studio Redesign</title>
+<style>
+/* ============================================================================
+   A MOCKUP, NOT THE APP. Nothing here is wired to anything: every value on
+   screen is a fixture. It exists to be looked at and argued with before any of
+   it reaches public/styles.css.
+
+   Two token sets, switched by [data-view]:
+     current  -- what the Studio ships today (Burp Suite Professional: charcoal,
+                 one orange, square edges, 1px borders, no soft anything)
+     proposed -- the same instrument re-cut to read like Claude Code's GUI
+   ========================================================================= */
+
+/* ---- CURRENT: lifted verbatim from public/styles.css ---------------------- */
+:root,
+[data-view="current"][data-theme="dark"] {
+  --bg: #1c1f23;
+  --surface: #26292d;
+  --surface-2: #2f3338;
+  --ink: #e6e8ea;
+  --muted: #9aa1a8;
+  --line: #3a3f45;
+  --accent: #ff6633;
+  --on-accent: #1c1f23;
+  --sidebar-bg: #191c1f;
+  --ok: #4bb377;
+  --danger: #ef6b6b;
+  --radius: 0;
+  --radius-lg: 0;
+  --gutter: 0.75rem;
+  --transcript-max: none;
+  --prose: "IBM Plex Sans", -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", ui-monospace, Consolas, monospace;
+  --line-weight: 1px;
+  --turn-gap: 0.75rem;
+}
+[data-view="current"][data-theme="light"] {
+  --bg: #f1f2f3; --surface: #ffffff; --surface-2: #e9eaec;
+  --ink: #17191a; --muted: #5b6165; --line: #cfd3d6;
+  --accent: #bf4508; --on-accent: #ffffff; --sidebar-bg: #e4e6e8;
+  --ok: #17794a; --danger: #c62828;
+}
+
+/* ---- PROPOSED: Claude Code's shape, GreyNOC's signal ---------------------- */
+/* The accent is kept. GreyIQ's #ff6633 and Claude's clay are the same family,
+   and the one-saturated-hue rule is the part of this design system that is
+   working -- orange still means "this acts or is selected" and nothing else. */
+[data-view="proposed"][data-theme="dark"] {
+  --bg: #1a1917;          /* warm near-black, not blue-charcoal */
+  --surface: #21201d;
+  --surface-2: #2a2825;
+  --ink: #e8e6e1;
+  --muted: #a09a90;
+  --line: #34322e;
+  --accent: #e08050;
+  --on-accent: #1a1917;
+  --sidebar-bg: #171614;
+  --ok: #6aa88a;
+  --danger: #d98080;
+  --radius: 6px;          /* the one real break with the current system */
+  --radius-lg: 10px;
+  --gutter: 1rem;
+  --transcript-max: 46rem;
+  --prose: "IBM Plex Sans", -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", ui-monospace, Consolas, monospace;
+  --line-weight: 1px;
+  --turn-gap: 1.5rem;
+}
+[data-view="proposed"][data-theme="light"] {
+  --bg: #f5f3ee; --surface: #fbfaf7; --surface-2: #efece5;
+  --ink: #22201c; --muted: #6b655c; --line: #ddd8ce;
+  --accent: #c25f33; --on-accent: #ffffff; --sidebar-bg: #efece5;
+  --ok: #2f7d58; --danger: #b4443c;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--prose);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ---- the mockup's own chrome (not part of the proposal) ------------------- */
+.harness {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--sidebar-bg);
+}
+.harness h1 { margin: 0; font-size: 0.85rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.harness .spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.seg button {
+  appearance: none; border: 0; padding: 0.35rem 0.8rem; cursor: pointer;
+  background: transparent; color: var(--muted); font: inherit; font-size: 0.8rem; font-weight: 600;
+}
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+.note { color: var(--muted); font-size: 0.78rem; }
+
+/* ---- the Studio itself ---------------------------------------------------- */
+.studio {
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr) 18rem;
+  height: calc(100vh - 3.25rem);
+  min-height: 34rem;
+}
+[data-view="current"] .studio { grid-template-columns: 16rem minmax(0, 1fr) 20rem; }
+
+/* --- left rail --- */
+.rail {
+  background: var(--sidebar-bg);
+  border-right: var(--line-weight) solid var(--line);
+  display: flex; flex-direction: column;
+  padding: var(--gutter);
+  gap: 0.6rem;
+  overflow: auto;
+}
+.rail-head { display: flex; align-items: center; gap: 0.5rem; }
+.rail-head strong { font-size: 0.95rem; }
+.rail-head .glyph {
+  width: 1.6rem; height: 1.6rem; border-radius: var(--radius);
+  background: var(--accent); color: var(--on-accent);
+  display: grid; place-items: center; font-weight: 800; font-size: 0.75rem;
+}
+.rail-label {
+  font-size: 0.68rem; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700; margin-top: 0.4rem;
+}
+.bot {
+  display: flex; align-items: center; gap: 0.55rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: var(--radius);
+  border: var(--line-weight) solid transparent;
+  cursor: default;
+}
+.bot .dot { width: 1.5rem; height: 1.5rem; border-radius: var(--radius); display: grid; place-items: center; font-size: 0.68rem; font-weight: 800; color: #1a1917; flex: none; }
+.bot .meta { min-width: 0; }
+.bot b { display: block; font-size: 0.82rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bot span { display: block; font-size: 0.7rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bot.live { background: var(--surface-2); border-color: var(--line); }
+[data-view="proposed"] .bot.live { border-left: 2px solid var(--accent); }
+.bot .live-mark { margin-left: auto; color: var(--accent); font-weight: 800; }
+
+/* --- centre: the transcript --- */
+.centre { display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+.topbar {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.6rem var(--gutter);
+  border-bottom: var(--line-weight) solid var(--line);
+  background: var(--surface);
+}
+[data-view="proposed"] .topbar { background: transparent; }
+.topbar .who { font-weight: 650; }
+.topbar .sub { color: var(--muted); font-size: 0.76rem; }
+.pill {
+  font-size: 0.68rem; padding: 0.15rem 0.45rem; border-radius: var(--radius);
+  border: 1px solid var(--line); color: var(--muted);
+}
+.pill.warn { color: var(--accent); border-color: var(--accent); }
+
+.stream { flex: 1; overflow: auto; padding: var(--gutter); }
+.column { max-width: var(--transcript-max); margin: 0 auto; display: flex; flex-direction: column; gap: var(--turn-gap); }
+
+.turn { display: grid; gap: 0.3rem; }
+.turn .by {
+  font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700;
+}
+[data-view="current"] .turn .body {
+  background: var(--surface); border: 1px solid var(--line); padding: 0.7rem 0.85rem;
+}
+[data-view="proposed"] .turn.user .body {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius-lg); padding: 0.6rem 0.85rem;
+}
+/* Claude Code does not box the assistant's prose -- it reads as the page. */
+[data-view="proposed"] .turn.bot .body { background: transparent; border: 0; padding: 0; }
+
+/* --- tool rows: the piece the current Studio has no equivalent for --- */
+.tool {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface);
+  font-family: var(--mono); font-size: 0.76rem;
+  overflow: hidden;
+}
+.tool > summary {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.35rem 0.6rem; cursor: pointer; list-style: none;
+  color: var(--muted);
+}
+.tool > summary::-webkit-details-marker { display: none; }
+.tool .caret { transition: transform 0.12s ease; color: var(--muted); }
+.tool[open] .caret { transform: rotate(90deg); }
+.tool .verb { color: var(--accent); font-weight: 700; }
+.tool .arg { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool .count { margin-left: auto; font-size: 0.7rem; }
+.tool .out {
+  border-top: 1px solid var(--line); padding: 0.5rem 0.6rem;
+  background: var(--bg); white-space: pre-wrap; color: var(--muted);
+}
+.tool .ok { color: var(--ok); }
+
+/* --- composer + status line --- */
+.composer { padding: 0 var(--gutter) 0.5rem; }
+.composer .inner { max-width: var(--transcript-max); margin: 0 auto; }
+.box {
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  background: var(--surface); padding: 0.6rem 0.75rem;
+  color: var(--muted);
+}
+[data-view="proposed"] .box:focus-within, [data-view="current"] .box:focus-within { border-color: var(--accent); }
+.statusline {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  max-width: var(--transcript-max); margin: 0.35rem auto 0;
+  font-family: var(--mono); font-size: 0.7rem; color: var(--muted);
+}
+.statusline .sep { opacity: 0.4; }
+.statusline .hot { color: var(--accent); }
+[data-view="current"] .statusline { display: none; }
+[data-view="current"] .composer-legacy { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.4rem; }
+[data-view="proposed"] .composer-legacy { display: none; }
+.chip { font-size: 0.7rem; border: 1px solid var(--line); padding: 0.2rem 0.45rem; border-radius: var(--radius); color: var(--muted); }
+
+/* --- right pane --- */
+.aside {
+  border-left: var(--line-weight) solid var(--line);
+  background: var(--surface); padding: var(--gutter);
+  display: flex; flex-direction: column; gap: 0.75rem; overflow: auto;
+}
+[data-view="proposed"] .aside { background: var(--bg); }
+.aside h3 {
+  margin: 0; font-size: 0.68rem; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700;
+}
+.card { border: 1px solid var(--line); border-radius: var(--radius); padding: 0.55rem 0.65rem; background: var(--surface); }
+[data-view="proposed"] .card { background: var(--surface); }
+.kv { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.78rem; padding: 0.15rem 0; }
+.kv span:first-child { color: var(--muted); }
+.kv code { font-family: var(--mono); font-size: 0.74rem; }
+.tabs { display: flex; gap: 0.25rem; }
+.tabs button {
+  appearance: none; border: 1px solid var(--line); background: transparent; color: var(--muted);
+  font: inherit; font-size: 0.72rem; padding: 0.22rem 0.5rem; border-radius: var(--radius); cursor: pointer;
+}
+.tabs button[aria-pressed="true"] { color: var(--ink); background: var(--surface-2); }
+
+/* ---- the written argument under the mockup -------------------------------- */
+.prose { max-width: 52rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+.prose h2 { font-size: 1rem; margin: 2rem 0 0.5rem; }
+.prose h2:first-child { margin-top: 0; }
+.prose p, .prose li { color: var(--muted); }
+.prose strong { color: var(--ink); }
+.prose table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.82rem; }
+.prose th, .prose td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.prose th { color: var(--ink); font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.prose td code { font-family: var(--mono); font-size: 0.78rem; }
+.swatches { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+.sw { width: 2.4rem; height: 2.4rem; border: 1px solid var(--line); border-radius: var(--radius); }
+.flag { border-left: 3px solid var(--accent); padding: 0.6rem 0.85rem; background: var(--surface); border-radius: var(--radius); }
+.flag strong { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="harness">
+  <h1>GreyIQ Studio &mdash; redesign mockup</h1>
+  <div class="seg" role="group" aria-label="Which design">
+    <button type="button" data-set-view="current" aria-pressed="false">Current</button>
+    <button type="button" data-set-view="proposed" aria-pressed="true">Proposed</button>
+  </div>
+  <div class="seg" role="group" aria-label="Theme">
+    <button type="button" data-set-theme="dark" aria-pressed="true">Dark</button>
+    <button type="button" data-set-theme="light" aria-pressed="false">Light</button>
+  </div>
+  <span class="spacer"></span>
+  <span class="note">Fixtures only &mdash; nothing here is wired to the app.</span>
+</div>
+
+<div class="studio">
+  <!-- ========================= left rail ========================= -->
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="glyph">GN</span>
+      <strong>GreyIQ</strong>
+    </div>
+
+    <div class="rail-label">Bots</div>
+    <div class="bot">
+      <span class="dot" style="background:#e08050">T</span>
+      <span class="meta"><b>TinyGPT</b><span>tinygpt &middot; bundled local model</span></span>
+    </div>
+    <div class="bot live">
+      <span class="dot" style="background:#8ec7d8">RS</span>
+      <span class="meta"><b>Recon Scout</b><span>anthropic &middot; claude-opus-5 &rarr;net</span></span>
+      <span class="live-mark">&#9679;</span>
+    </div>
+    <div class="bot">
+      <span class="dot" style="background:#6aa88a">F</span>
+      <span class="meta"><b>Forge</b><span>local &middot; qwen2.5-coder:32b</span></span>
+    </div>
+    <div class="bot">
+      <span class="dot" style="background:#a09a90">OC</span>
+      <span class="meta"><b>Offline coder</b><span>offline &middot; edits only</span></span>
+    </div>
+
+    <div class="rail-label">Panels</div>
+    <div class="bot"><span class="meta"><b>Brain</b><span>provider, key, skills</span></span></div>
+    <div class="bot"><span class="meta"><b>Train</b><span>corpus, runs, curve</span></span></div>
+    <div class="bot"><span class="meta"><b>Security</b><span>hunts, programs</span></span></div>
+  </aside>
+
+  <!-- ========================= transcript ========================= -->
+  <section class="centre">
+    <header class="topbar">
+      <span class="who">Recon Scout</span>
+      <span class="sub">anthropic &middot; claude-opus-5</span>
+      <span class="pill warn">&rarr;net</span>
+      <span class="spacer" style="flex:1"></span>
+      <span class="pill">needs a key</span>
+    </header>
+
+    <div class="stream">
+      <div class="column">
+
+        <div class="turn user">
+          <div class="by">You</div>
+          <div class="body">Check whether the staging host still exposes the old admin route.</div>
+        </div>
+
+        <div class="turn bot">
+          <div class="by">Recon Scout</div>
+          <div class="body">
+            <p style="margin:0 0 0.6rem">I&rsquo;ll read the recorded surface first, then probe only what scope allows.</p>
+
+            <details class="tool" open>
+              <summary><span class="caret">&rsaquo;</span><span class="verb">Read</span><span class="arg">runtime/recon/staging.surface.json</span><span class="count">142 lines</span></summary>
+              <div class="out">admin.staging.example.net  &rarr;  /admin   (last seen 2026-09-02, 302)
+                                        /admin/v1 (last seen 2026-09-02, 200)</div>
+            </details>
+
+            <details class="tool">
+              <summary><span class="caret">&rsaquo;</span><span class="verb">Probe</span><span class="arg">GET https://admin.staging.example.net/admin/v1</span><span class="count ok">200</span></summary>
+              <div class="out">in scope &middot; read-only &middot; 1 request</div>
+            </details>
+
+            <p style="margin:0.6rem 0 0">The route is still reachable and answers 200 unauthenticated. That is a finding worth proving &mdash; shall I capture the minimal evidence for it?</p>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="inner">
+        <div class="box">Ask Recon Scout&hellip;</div>
+        <div class="composer-legacy">
+          <span class="chip">Agent: off</span><span class="chip">Workspace</span>
+          <span class="chip">Review project</span><span class="chip">Explain repo</span>
+          <span class="chip">Create README</span><span class="chip">Fix failing tests</span>
+        </div>
+        <div class="statusline">
+          <span class="hot">recon-scout</span><span class="sep">|</span>
+          <span>anthropic &middot; claude-opus-5</span><span class="sep">|</span>
+          <span>needs a key</span><span class="sep">|</span>
+          <span>agent off</span><span class="sep">|</span>
+          <span>no workspace</span><span class="sep">|</span>
+          <span>offline planner</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================= right pane ========================= -->
+  <aside class="aside">
+    <div class="tabs">
+      <button type="button" aria-pressed="true">Bot</button>
+      <button type="button" aria-pressed="false">Diff</button>
+      <button type="button" aria-pressed="false">Files</button>
+    </div>
+
+    <h3>This bot</h3>
+    <div class="card">
+      <div class="kv"><span>id</span><code>recon-scout</code></div>
+      <div class="kv"><span>brain</span><code>anthropic</code></div>
+      <div class="kv"><span>model</span><code>claude-opus-5</code></div>
+      <div class="kv"><span>variation</span><code>0.46</code></div>
+      <div class="kv"><span>key</span><code>none</code></div>
+    </div>
+
+    <h3>Taught</h3>
+    <div class="card" style="font-size:0.78rem;color:var(--muted)">
+      1. prefer read-only probes until scope is confirmed<br>
+      2. always cite the endpoint you probed
+    </div>
+
+    <h3>Store</h3>
+    <div class="card" style="font-size:0.76rem;color:var(--muted)">
+      <code style="font-family:var(--mono);font-size:0.72rem">runtime/bots.json</code><br>
+      9 bots &middot; shared with <code style="font-family:var(--mono);font-size:0.72rem">gn bot ls</code>
+    </div>
+  </aside>
+</div>
+
+<!-- ========================= the argument ========================= -->
+<div class="prose">
+
+  <h2>What changes, and why</h2>
+  <table>
+    <tr><th>Area</th><th>Today</th><th>Proposed</th></tr>
+    <tr>
+      <td><strong>Layout</strong></td>
+      <td>Fixed three columns; the bot roster, the persona editor and the panel stack all compete in one rail; the transcript runs the full window width.</td>
+      <td>Claude Code's three zones: a collapsible rail that is <em>only</em> navigation (bots, then panels), a centred transcript capped at ~46rem so lines stay readable, and a right pane that switches between the bot's record, a diff and files.</td>
+    </tr>
+    <tr>
+      <td><strong>Turns</strong></td>
+      <td>Every message is the same bordered card, so the operator's question and the model's answer look alike.</td>
+      <td>The operator's turn keeps a card; the assistant's prose is unboxed and reads as the page &mdash; the asymmetry is how Claude Code makes a transcript scannable.</td>
+    </tr>
+    <tr>
+      <td><strong>Tool calls</strong></td>
+      <td>No equivalent. A scan or a probe arrives as prose in the stream, or not at all.</td>
+      <td>A compact monospace row per call: verb, argument, result, collapsed by default and expandable to the output. This is the single biggest readability win and the piece the Studio genuinely lacks.</td>
+    </tr>
+    <tr>
+      <td><strong>Composer</strong></td>
+      <td>A textarea with two rows of template chips under it, always visible.</td>
+      <td>The box alone, with a <strong>status line</strong> beneath it carrying the facts that matter per prompt: live bot, provider &middot; model, readiness, agent mode, workspace, and whether the hunt is on the offline planner. Templates move behind a key, as Claude Code does with slash commands.</td>
+    </tr>
+    <tr>
+      <td><strong>Palette</strong></td>
+      <td>Blue-leaning charcoal (<code>#1c1f23</code>) with full-strength <code>#ff6633</code>.</td>
+      <td>Warm near-black (<code>#1a1917</code>) and a slightly calmer clay accent (<code>#e08050</code>). The one-saturated-hue rule is <em>kept</em> &mdash; it is the part of the current system that works, and orange still means &ldquo;this acts or is selected&rdquo;.</td>
+    </tr>
+    <tr>
+      <td><strong>Type</strong></td>
+      <td>IBM Plex Sans throughout; mono only inside code blocks.</td>
+      <td>Unchanged families. Mono widens to carry every <em>machine</em> fact &mdash; tool rows, the status line, ids, paths &mdash; so prose and evidence are told apart at a glance.</td>
+    </tr>
+  </table>
+
+  <h2>Palette, side by side</h2>
+  <p>Current (dark):</p>
+  <div class="swatches">
+    <div class="sw" style="background:#1c1f23" title="--bg #1c1f23"></div>
+    <div class="sw" style="background:#26292d" title="--surface #26292d"></div>
+    <div class="sw" style="background:#2f3338" title="--surface-2 #2f3338"></div>
+    <div class="sw" style="background:#3a3f45" title="--line #3a3f45"></div>
+    <div class="sw" style="background:#9aa1a8" title="--muted #9aa1a8"></div>
+    <div class="sw" style="background:#ff6633" title="--accent #ff6633"></div>
+  </div>
+  <p>Proposed (dark):</p>
+  <div class="swatches">
+    <div class="sw" style="background:#1a1917" title="--bg #1a1917"></div>
+    <div class="sw" style="background:#21201d" title="--surface #21201d"></div>
+    <div class="sw" style="background:#2a2825" title="--surface-2 #2a2825"></div>
+    <div class="sw" style="background:#34322e" title="--line #34322e"></div>
+    <div class="sw" style="background:#a09a90" title="--muted #a09a90"></div>
+    <div class="sw" style="background:#e08050" title="--accent #e08050"></div>
+  </div>
+
+  <h2>One thing to decide before any of this ships</h2>
+  <div class="flag">
+    <p style="margin:0 0 0.5rem"><strong>The square-edge rule is a deliberate decision, and mirroring Claude Code breaks it.</strong></p>
+    <p style="margin:0">
+      <code>public/styles.css</code> opens with it in writing: &ldquo;SQUARE EDGES EVERYWHERE &mdash; every
+      <code>--radius-*</code> is 0. A pro tool is rectangles&rdquo;, plus no gradients, glows or shadows, with
+      Burp Suite Professional named as the reference. Claude Code's GUI is softly rounded. The mockup above
+      proposes <code>--radius: 6px</code> / <code>--radius-lg: 10px</code>, which is the single change here that
+      overrides a documented decision rather than filling a gap. The tokens already exist precisely so this is a
+      one-line change, and the comment says so &mdash; but it should be <em>your</em> one line, not a redesign that
+      quietly drops the rule.
+    </p>
+    <p style="margin:0.5rem 0 0">
+      Toggle <strong>Current</strong> / <strong>Proposed</strong> above with the theme on both settings to judge it.
+      Everything else in this proposal is additive or neutral; the corners are the only argument.
+    </p>
+  </div>
+
+  <h2>What it costs</h2>
+  <ul>
+    <li><strong>Palette, type, status line, tool rows:</strong> <code>public/styles.css</code> plus markup in
+      <code>public/index.html</code>. No behaviour changes, nothing to re-verify beyond looking at it.</li>
+    <li><strong>Layout and the right pane:</strong> real markup restructuring in <code>index.html</code> and the
+      render functions in <code>public/app.js</code> that write into those containers. The Workbench already has a
+      file/diff pane, so the right zone is mostly re-homing what exists.</li>
+    <li><strong>Tool rows:</strong> the only part that needs something new on the data side &mdash; the chat path
+      would have to emit a structured record per tool call rather than prose. Worth splitting into its own change.</li>
+  </ul>
+</div>
+
+<script>
+(function () {
+  const root = document.documentElement;
+  for (const button of document.querySelectorAll("[data-set-view]")) {
+    button.addEventListener("click", () => {
+      root.dataset.view = button.dataset.setView;
+      for (const other of document.querySelectorAll("[data-set-view]")) {
+        other.setAttribute("aria-pressed", String(other === button));
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-set-theme]")) {
+    button.addEventListener("click", () => {
+      root.dataset.theme = button.dataset.setTheme;
+      for (const other of document.querySelectorAll("[data-set-theme]")) {
+        other.setAttribute("aria-pressed", String(other === button));
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

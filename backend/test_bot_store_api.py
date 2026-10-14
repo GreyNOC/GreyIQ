@@ -22,6 +22,7 @@ is not an invariant.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -495,13 +496,36 @@ class StudioControlsAreBoundTests(unittest.TestCase):
         self.assertNotIn("temperature / 100", self.JS)
 
     def test_the_app_does_not_write_the_bot_setting_itself(self) -> None:
-        """``set_active`` is the only writer, so the app must reach it through its own route."""
+        """``set_active`` is the only writer, so the app must reach it through its own route.
+
+        Two halves, because either alone would pass while the rule was broken: the app has to USE
+        the route, and the API must have no other way to write the setting.
+        """
         self.assertIn('"/api/bots/active"', self.JS)
-        for forbidden in ('"bot": ', "{ bot: state.activeBotId }"):
-            self.assertNotIn(f'/api/settings\', {forbidden}', self.JS)
-        # The handler is the only place in the API that writes the setting from this surface.
-        self.assertEqual(self.API.count("gn_bots.set_active("), 2,
+        # Only the two handlers with a reason to call it: making a bot live, and re-pointing the
+        # profile after the live bot is deleted.
+        callers = sorted(node.name for node in ast.walk(ast.parse(self.API))
+                         if isinstance(node, ast.FunctionDef)
+                         and "gn_bots.set_active(" in (ast.get_source_segment(self.API, node) or ""))
+        self.assertEqual(callers, ["delete_bot", "set_active_bot"],
                          "set_active is called from somewhere new -- it is the single writer")
+        # And nothing in the API reaches the profile's own writers, which is the second door
+        # set_active exists to prevent.
+        for writer in ("gn_profile.set_value(", "gn_profile.save("):
+            self.assertNotIn(writer, self.API,
+                             f"{writer} in the API is a second door into the operator profile")
+
+    def test_the_payload_carries_the_stores_own_sentence_rather_than_a_third_copy(self) -> None:
+        """``what_it_does`` is one sentence for both doors; the app must print it, not rewrite it."""
+        self.assertIn("gn_bots.what_it_does(bot)", self.API)
+        self.assertIn("bot.what_it_does", self.JS)
+        # The app may frame it ("Live:" / "When live:") but must not carry its own version of the
+        # claim. These are the clauses gn_bots owns.
+        for clause in ("answers chat and plans the hunt", "the hunt stays deterministic",
+                       "bundled offline pack"):
+            with self.subTest(clause=clause):
+                self.assertNotIn(clause, self.JS,
+                                 "the app is restating what_it_does instead of printing it")
 
     def test_the_app_reads_the_facts_it_must_not_compute(self) -> None:
         # readiness/key_state/off_machine/endpoint depend on files the browser cannot see.

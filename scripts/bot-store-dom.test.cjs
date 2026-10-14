@@ -165,6 +165,60 @@ test('the store own complaint is carried, not swallowed', () => {
   assert.match(api.botStore.error, /ghost/);
 });
 
+test('the panel shows the store own sentence for what making a bot live means', () => {
+  // gn_bots.what_it_does is "one sentence, both doors" -- it exists because the CLI and the studio
+  // each had their own copy and one of them was false. Clicking a bot in the roster IS `gn bot use`,
+  // so the app must print that sentence rather than compose an equivalent.
+  const READINESS = slice('function renderBotReadiness(bot)', 'const activeChatPolls');
+  const node = { textContent: '', classList: { add() {}, toggle() {} } };
+  const state = { activeBotId: 'recon' };
+  const run = vm.runInNewContext(`${READINESS}
+({ renderBotReadiness })`,
+    { els: { botReadiness: node }, state, BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+  const sentence = 'it answers chat and plans the hunt';
+  run.renderBotReadiness({ id: 'recon', readiness: 'ready', key_state: 'not needed',
+    what_it_does: sentence });
+  assert.match(node.textContent, new RegExp(`^Live: ${sentence}\.`));
+  run.renderBotReadiness({ id: 'other', readiness: 'ready', key_state: 'not needed',
+    what_it_does: sentence });
+  assert.match(node.textContent, new RegExp(`^When live: ${sentence}\.`));
+  // An inert clone gets the store's wording too, not a sentence written in the browser.
+  const inert = 'it answers here from the offline pack; it is an inert clone, so it never runs';
+  run.renderBotReadiness({ id: 'stranger', inert: true, readiness: 'inert', what_it_does: inert });
+  assert.ok(node.textContent.includes(inert));
+  assert.ok(!/cannot become a brain/.test(node.textContent),
+    'that explanation belongs on the disabled control, not restated here');
+});
+
+test('a posture is not reported as a failure', () => {
+  // gn_bots.readiness returns `off`, `edits only` and `inert` for bots that work exactly as
+  // designed. Calling those "Not ready" told the operator a working bot was broken, and said it
+  // on the same line as the sentence that had just described what the bot does.
+  const READINESS = slice('function renderBotReadiness(bot)', 'const activeChatPolls');
+  const node = { textContent: '', classList: { add() {}, toggle(_c, on) { node.warn = on; } } };
+  const run = vm.runInNewContext(`${READINESS}
+({ renderBotReadiness })`,
+    { els: { botReadiness: node }, state: { activeBotId: '' },
+      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
+
+  for (const posture of ['off', 'edits only', 'inert']) {
+    run.renderBotReadiness({ id: 'x', readiness: posture, what_it_does: 'something the store says',
+      provider: posture === 'off' ? 'off' : 'offline' });
+    assert.ok(!/Not ready/.test(node.textContent), `"${posture}" is a posture, not a failure`);
+    assert.equal(node.warn, false, `"${posture}" must not be flagged as a problem`);
+  }
+  // The two that really do block still say so, and still colour the line.
+  for (const blocked of ['needs a key', 'needs a model']) {
+    run.renderBotReadiness({ id: 'x', readiness: blocked, provider: 'anthropic',
+      what_it_does: 'it answers' });
+    assert.match(node.textContent, new RegExp(`Not ready: ${blocked}\.`));
+    assert.equal(node.warn, true);
+  }
+  // And `off` is not reassured about the network: nothing is asked of it.
+  run.renderBotReadiness({ id: 'x', readiness: 'off', provider: 'off', what_it_does: 'nothing' });
+  assert.ok(!/Stays on this machine/.test(node.textContent));
+});
+
 test('a bot with no store record claims neither readiness nor where it runs', () => {
   // The cached roster shown while the service is down carries neither fact, and those two are the
   // ones this panel most has to be right about.
@@ -172,7 +226,8 @@ test('a bot with no store record claims neither readiness nor where it runs', ()
   const node = { textContent: '', classList: { add() { node.added = true; }, toggle() {} } };
   const run = vm.runInNewContext(`${READINESS}
 ({ renderBotReadiness })`,
-    { els: { botReadiness: node } });
+    { els: { botReadiness: node }, state: { activeBotId: '' },
+      BLOCKING_READINESS: ['needs a key', 'needs a model'] });
   run.renderBotReadiness({ id: 'astra', name: 'Astra' });
   assert.match(node.textContent, /Start the local GreyIQ service/);
   assert.ok(!/Stays on this machine/.test(node.textContent));

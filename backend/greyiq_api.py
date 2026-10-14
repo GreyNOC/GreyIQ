@@ -6393,6 +6393,11 @@ def _bot_payload(gn_bots: Any, bot: Any) -> dict[str, Any]:
         "trained_at": bot.trained_at,
         "train_note": bot.train_note,
         "describe": bot.describe(),
+        # What making THIS bot live actually means, from gn_bots rather than composed here. It is
+        # the sentence `gn bot use` prints and the studio's `/use` shows, and clicking a bot in the
+        # app's roster IS that operation -- so a third copy written in the browser is how the three
+        # doors end up disagreeing. One of them already did, which is why the function exists.
+        "what_it_does": gn_bots.what_it_does(bot),
         "runnable": bot.runnable,
         "builtin": bot.id in {shipped.id for shipped in gn_bots.BUILTINS},
         # Resolved, never read off the bot: see gn_bots.sends_off_machine.

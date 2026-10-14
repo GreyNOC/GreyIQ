@@ -51,6 +51,16 @@ Notable changes to GreyIQ.
   with `gn bot use` is not overruled by a browser arriving late. A browser that never had its own
   bots migrates nothing — a registry record names a provider and a browser-only bot never did, which
   is how the two are told apart.
+- **Three sentences on that panel were the app's own, and one of them was false.** `gn_bots` owns
+  one sentence for "what making this bot live means" (`what_it_does`) precisely because the CLI and
+  the studio each had their own and one contradicted itself inside a single line. Clicking a bot in
+  the app's roster IS `gn bot use`, so the panel now prints that sentence verbatim — *Live: it
+  answers chat and plans the hunt*, *Live: nothing answers, and the hunt stays deterministic* — and
+  a test fails if the clauses it owns ever appear in `app.js`. The panel was also rendering the
+  store's `readiness` as *Not ready: {x}*, which turned `edits only` and `off` — postures
+  `readiness()` returns for bots working exactly as designed — into a claim that the bot was
+  broken; only *needs a key* and *needs a model* are reported as blockers now, and `off` is no
+  longer reassured that it *stays on this machine* when nothing is asked of it at all.
 - **Four defects found by driving the app rather than by running the tests.** A bot whose temperature
   is unset — a real state, meaning "whatever the provider defaults to" — read back as a temperature
   of ZERO, because `Number(null)` is 0 and `Number.isFinite(0)` is true: the editor showed `0.00`
