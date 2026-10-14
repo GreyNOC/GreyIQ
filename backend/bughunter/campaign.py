@@ -473,6 +473,15 @@ def _run_campaign_body(
     iterate: bool = False,
     on_progress: Any = None,
     on_auth_needed: Any = None,
+    # The operator's kill switch and traffic tap, as callables the caller owns. ``progress_run_id``
+    # below is the OTHER source of Stop — the dashboard's run registry — and it is the only one a
+    # direct CLI campaign cannot use, because nothing registers a run id for it. So a threat board
+    # showing `q`/STOP over a `gn campaign` had no way to reach this engine at all: the board said
+    # STOP REQUESTED and the campaign kept sending. Both are plumbed to the per-URL hunts, which
+    # already take them (``bounty.run_bounty_hunt``), so a control the board advertises is honoured
+    # on every surface that advertises it.
+    should_stop: Any = None,
+    on_request: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
@@ -557,6 +566,21 @@ def _run_campaign_body(
                 on_progress(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _stopped() -> bool:
+        """True once this run has been asked to stop, from EITHER source — the dashboard's run
+        registry or the caller's own predicate (the CLI's threat board, whose `q` sets a flag no
+        run id can see). Total: a raising or absent predicate means "keep going", because a broken
+        kill switch must not abort a legitimate campaign; the checks below are placed where
+        honouring it early is always safe."""
+        if progress.is_stopped(progress_run_id):
+            return True
+        if not callable(should_stop):
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     auth_requested = False
     auth_refresh_attempted = False
@@ -652,16 +676,19 @@ def _run_campaign_body(
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
         # in-scope cross-host expansion (a wildcard program) is followed and ONLY
         # in-scope hosts are ever fetched -- excluded_hosts rides on campaign_settings.
-        # Pinned to the campaign's own host unless the program asked for a wildcard: a bare host
-        # token is exact-OR-proper-subdomain at host_in_active_scope, and a scope DERIVED from the
-        # target by -y (bounty.self_scope_grant) is an attestation about ONE host. A `*.` token is
-        # what a wildcard program types, and keeps the cross-host expansion this comment's
-        # predecessor describes.
-        _wildcard_scope = active_verify_service.scope_admits_subdomains(scope)
-        _campaign_host = "" if _wildcard_scope else (urlparse(clean_target).hostname or "").lower()
+        # Pinned to the campaign's own host unless the program's scope wildcards the host being
+        # considered: a bare host token is exact-OR-proper-subdomain at host_in_active_scope, and a
+        # scope DERIVED from the target by -y (bounty.self_scope_grant) is an attestation about ONE
+        # host. A `*.` token is what a wildcard program types, and keeps the cross-host expansion
+        # this comment's predecessor describes — but only across the domain that token names, which
+        # is why the question is asked per host (active_verify_service.wildcard_admits_host) rather
+        # than of the scope text as a whole. Asked globally, one `*.other.example` grant lifted the
+        # pin off every other token in the same scope.
+        _campaign_host = (urlparse(clean_target).hostname or "").lower()
         scope_gate = (
             (lambda h: active_verify_service.host_in_active_scope(h, scope, campaign_settings)
-             and (_wildcard_scope or (h or "").strip().lower().strip("[]") == _campaign_host))
+             and ((h or "").strip().lower().strip("[]") == _campaign_host
+                  or active_verify_service.wildcard_admits_host(scope, h)))
             if str(scope or "").strip() else None
         )
         # Draw passive recon from the PROCESS-WIDE per-host token bucket, so concurrent span/portfolio
@@ -983,7 +1010,7 @@ def _run_campaign_body(
     for index, url in enumerate(urls, 1):
         # Cooperative cancellation: the operator's Stop halts BETWEEN url hunts (a hunt
         # in flight finishes its current url, then we bail with whatever's been found).
-        if progress.is_stopped(progress_run_id):
+        if _stopped():
             _emit("stop requested — halting this target after the current URL")
             break
         _emit(f"hunt {index}/{len(urls)}: {url}")
@@ -1000,10 +1027,15 @@ def _run_campaign_body(
             on_learning_outcomes=url_confirmations.extend,
             settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
-            # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks on
-            # progress.is_stopped, but a single URL's active fan-out, re-plan wave and OOB provers can run
-            # for a long time — so without this the operator waits out the current URL after hitting Stop.
-            should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
+            # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks
+            # on _stopped(), but a single URL's active fan-out, re-plan wave and OOB provers can run
+            # for a long time — so without this the operator waits out the current URL after hitting
+            # Stop. Passed unconditionally: _stopped() reads both sources, and a direct CLI campaign
+            # has only the second one.
+            should_stop=_stopped,
+            # The board's TRAFFIC view over a campaign, for the same reason: it is a view onto live
+            # probing, so it has to be fed by the layer the requests actually leave from.
+            on_request=on_request,
             oob_base=oob_base, oob_secret=oob_secret,
             external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
             on_auth_needed=(lambda context, request_target=url: _request_auth(context, request_target))
@@ -1748,6 +1780,11 @@ def run_campaign_over_targets(
     deep: bool = False,
     on_progress: Any = None,
     on_auth_needed: Any = None,
+    # Forwarded to every per-target run_campaign, for the same reason it exists there: a surface
+    # watching this span owns the Stop flag and the traffic feed, and a run id only exists when a
+    # dashboard registered one.
+    should_stop: Any = None,
+    on_request: Any = None,
     max_targets: int = _MAX_PROGRAM_TARGETS,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
@@ -1810,6 +1847,18 @@ def run_campaign_over_targets(
                 on_progress(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _stopped() -> bool:
+        """True once this span has been asked to stop, from either source — see the same helper in
+        ``_run_campaign_body``. Total: a raising or absent predicate means "keep going"."""
+        if progress.is_stopped(progress_run_id):
+            return True
+        if not callable(should_stop):
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     # A credential with no verified issuer may be used for one target (or a
     # same-registrable-site set), but must not be re-bound across unrelated
@@ -1920,7 +1969,7 @@ def run_campaign_over_targets(
                 progress.mark_target(progress_run_id, target, "error", error=error)
             _target_emit(f"skipped — {error}")
             return (target, {"ok": False, "error": error}, None)
-        if progress.is_stopped(progress_run_id):
+        if _stopped():
             if progress_unit is None:
                 progress.mark_target(progress_run_id, target, "skipped")
             _target_emit("skipped — campaign stopped")
@@ -1944,6 +1993,7 @@ def run_campaign_over_targets(
                 admin_account_access=admin_access_for_targets, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
+                should_stop=should_stop, on_request=on_request,
                 submission_claim=submission_claim,  # dedup identical findings across concurrent targets
                 oob_base=oob_base, oob_secret=oob_secret,
                 external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,

@@ -665,9 +665,11 @@ def self_scope_grant(target: str) -> str:
     is exact-OR-proper-subdomain at :func:`active_verify_service.host_in_active_scope` — long
     established, and what a wildcard program wants — so the scope text alone cannot say whether
     subdomains were attested to. ``run_bounty_hunt`` and ``campaign`` therefore PIN their recon
-    gate and their prover to this exact host unless the scope carries a ``*.`` token
-    (``active_verify_service.scope_admits_subdomains``). ``gn takeover`` does not pin, because
-    enumerating the named apex's subdomains is the whole verb — and it says so on the way in.
+    gate and their prover to this exact host unless a ``*.`` token in the scope asks for the host
+    being considered (``active_verify_service.wildcard_admits_host`` — a question about THAT host,
+    so a wildcard over one domain cannot lift the pin off a bare token for another). ``gn takeover``
+    does not pin, because enumerating the named apex's subdomains is the whole verb — and it says
+    so on the way in.
 
     Returns ``""`` — never a guess — for a local path (which needs no scope), for anything
     unparseable, and for any token the preflight would then reject as ambiguous, so the operator
@@ -2999,15 +3001,17 @@ def _run_bounty_hunt_body(
         if scope_error:
             return {"ok": False, "error": scope_error}
 
-    # Does this scope ask for more than the hosts it literally names? A ``*.`` token does; a bare
-    # host token is exact-OR-proper-subdomain at ``host_in_active_scope``, which is the established
-    # semantics and what a wildcard program wants — but a token DERIVED from the target by ``-y``
-    # (``self_scope_grant``) is an attestation about ONE host, and the scope text cannot carry that
-    # difference. So when no wildcard was asked for, the active paths below pin to this exact host.
+    # The host the active paths below are PINNED to. A bare host token is exact-OR-proper-subdomain
+    # at ``host_in_active_scope``, which is the established semantics and what a wildcard program
+    # wants — but a token DERIVED from the target by ``-y`` (``self_scope_grant``) is an attestation
+    # about ONE host, and the scope text cannot carry that difference. So the pin holds unless a
+    # ``*.`` token in the scope asks for the host being considered, which is a question about THAT
+    # host (``active_verify_service.wildcard_admits_host``) and not about the scope text as a whole:
+    # asked globally, a ``-s *.other.example`` grant lifted the pin off ``acme.example`` as well and
+    # the prover could reach ``admin.acme.example``, which nobody attested to.
     # Resolved HERE, beside the preflight that produced it: the recon block and the active target
     # list both read it, and neither is guaranteed to run.
-    wildcard_scope = active_verify_service.scope_admits_subdomains(scope)
-    exact_active_host = "" if wildcard_scope else scope_host
+    exact_active_host = scope_host
 
     # Optional authenticated scanning: bind the operator's cookie/headers to the
     # target host. Attached SAME-SITE only (see scan_auth) so the session reaches
@@ -3087,7 +3091,8 @@ def _run_bounty_hunt_body(
             # the active prover it feeds — would reach a subdomain the operator never named.
             scope_gate = (
                 (lambda h: active_verify_service.host_in_active_scope(h, scope, active_settings)
-                 and (wildcard_scope or _canonical_scope_host(h) == exact_active_host))
+                 and (_canonical_scope_host(h) == exact_active_host
+                      or active_verify_service.wildcard_admits_host(scope, h)))
                 if str(scope or "").strip()
                 else None
             )
@@ -3261,9 +3266,12 @@ def _run_bounty_hunt_body(
                 # derived grant (-y, no -s) attests to ONE host, and a bare host token reads as
                 # exact-OR-proper-subdomain at host_in_active_scope. Done on the LIST rather than
                 # through verify_active's ``scope_host``, which is the chat-run mode (one attempt,
-                # halt on 429, no host-header check) and would change what a hunt does.
+                # halt on 429, no host-header check) and would change what a hunt does. The two
+                # gates have to agree about a wildcard, so the same per-host question is asked here.
                 _pinned = [u for u in active_targets
-                           if _canonical_scope_host(urlparse(u).hostname or "") == exact_active_host]
+                           if _canonical_scope_host(urlparse(u).hostname or "") == exact_active_host
+                           or active_verify_service.wildcard_admits_host(
+                               scope, urlparse(u).hostname or "")]
                 if len(_pinned) != len(active_targets):
                     _emit(f"active: {len(active_targets) - len(_pinned)} discovered endpoint(s) are "
                           f"off {exact_active_host} — not probed (scope names one host; -s *.{exact_active_host} widens it)")

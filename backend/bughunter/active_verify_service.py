@@ -207,24 +207,55 @@ def _scope_hosts(scope: str) -> set[str]:
     return hosts
 
 
-def scope_admits_subdomains(scope: str) -> bool:
-    """Whether this scope text asks for more than the hosts it literally names.
+def _scope_wildcard_suffixes(scope: str) -> set[str]:
+    """The domains a ``*.`` token in this scope text wildcards, with the ``*.`` stripped.
 
-    A ``*.domain`` token does (that is what a wildcard program is), and so does a bare host token
-    at :func:`host_in_active_scope`, whose established semantics are exact-OR-proper-subdomain.
-    The caller needs to tell those two apart: an operator who typed ``-s *.acme.example`` asked for
-    cross-host expansion, while a bare ``acme.example`` — in particular one DERIVED from the target
-    by ``-y`` (``bounty.self_scope_grant``) — is an attestation about one host, and the scope text
-    cannot carry that distinction on its own.
-
-    ``True`` when any token is a ``*.`` wildcard. Callers that want exact-host behaviour otherwise
-    pin their own gate; this never widens anything by itself.
+    Tokenized exactly as :func:`_scope_hosts` does — a URL-shaped word contributes no host
+    authority, and a comma inside a URL path does not begin a new grant — so the two cannot
+    disagree about what a word in the operator's scope text means.
     """
+    suffixes: set[str] = set()
     for word in re.split(r"\s+", str(scope or "").lower()):
         for raw in re.split(r"[,;]+", word):
             token = raw.strip().strip("()<>[]\"'")
-            if token.startswith("*."):
-                return True
+            if not token:
+                continue
+            if any(ch in token for ch in "/?:#@%\\"):
+                break
+            if token.startswith("*.") and _HOST_ONLY_SCOPE_TOKEN.fullmatch(token):
+                suffixes.add(token.removeprefix("*."))
+    return suffixes
+
+
+def wildcard_admits_host(scope: str, host: str) -> bool:
+    """Whether a ``*.`` token in this scope text asks for THIS host. Asked per target, by design.
+
+    A ``*.domain`` token asks for cross-host expansion (that is what a wildcard program is), while
+    a bare host token is an attestation about ONE host — in particular one DERIVED from the target
+    by ``-y`` (``bounty.self_scope_grant``) — even though :func:`host_in_active_scope` reads either
+    as exact-OR-proper-subdomain. A caller that pins active probing to the host the operator named
+    has to tell those two apart, and the scope text cannot carry the distinction on its own.
+
+    This used to be asked GLOBALLY — "does any token in this text carry a ``*.``" — and that was
+    itself a scope-widening defect. In the scope ``acme.example *.other.example``, which is what
+    ``gn hunt https://acme.example -y -s '*.other.example'`` produces, the one wildcard lifted the
+    pin off the OTHER token, so ``admin.acme.example`` — a host whose only grant was a ``-y``
+    attestation about its parent — became eligible for active probing. A wildcard is a grant about
+    the domain it names and cannot speak for a different one, so the question now takes the host it
+    is being asked about, and the global form is no longer expressible.
+
+    Matched exact-OR-proper-dotted-suffix against the stripped token, which is what
+    ``host_in_active_scope`` already does with the same token, so a real wildcard program's reach
+    is unchanged. Both callers AND this with ``host_in_active_scope``, so it can only ever narrow:
+    a bare public suffix (``*.herokuapp.com``) is still refused there, and an ``excluded_hosts``
+    entry still wins over all of it.
+    """
+    cleaned = (host or "").strip().lower().strip("[]")
+    if not cleaned:
+        return False
+    for suffix in _scope_wildcard_suffixes(scope):
+        if cleaned == suffix or cleaned.endswith("." + suffix):
+            return True
     return False
 
 
@@ -421,12 +452,22 @@ class _Http:
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
+        # ``sent`` is incremented in _fetch_impl immediately before the socket opens, so comparing
+        # it across the call is the one honest test of whether anything left this process. Every
+        # PREFLIGHT refusal — an exhausted request budget, a standing halt_reason, a virtual-host
+        # header on an exact-host run, an http URL under an HTTPS-only session, the SSRF guard, the
+        # governor — raises one of these three BEFORE that line, and reporting those as traffic put
+        # requests that never happened into the board's TRAFFIC view and its sparkline, which is
+        # exactly what ``on_request``'s contract says the feed must never contain. They are still
+        # counted in ``failed`` and surfaced as refusals by the callers that raise them.
+        before = self.sent
         try:
             result = self._fetch_impl(url, method=method, extra_headers=extra_headers,
                                       read_body=read_body)
         except (_ActiveError, _RateLimited, WebsiteFetchError) as exc:
             self.failed += 1
-            self._observe(method, url, type(exc).__name__)
+            if self.sent > before:  # a transport failure on a request that really went out
+                self._observe(method, url, type(exc).__name__)
             raise
         self._observe(method, url, (result or {}).get("status", ""))
         return result

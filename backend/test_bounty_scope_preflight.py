@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -277,33 +279,140 @@ class SelfScopeGrantTests(unittest.TestCase):
         ``host_in_active_scope`` reads a bare host token as exact-OR-proper-subdomain — long
         established, and what a wildcard program wants. But a token DERIVED from the target by
         ``-y`` is an attestation about one host, so the scope text alone cannot carry the
-        difference. ``scope_admits_subdomains`` is how a caller tells them apart, and the hunt's
-        own recon gate and prover pin to the exact host when no wildcard was asked for. Without
-        that, `gn hunt https://acme.example -y --active` could probe admin.acme.example.
+        difference. ``wildcard_admits_host`` is how a caller tells them apart, and the hunt's
+        own recon gate and prover pin to the exact host unless a ``*.`` token asks for the host
+        in hand. Without that, `gn hunt https://acme.example -y --active` could probe
+        admin.acme.example.
         """
         from bughunter.active_verify_service import get_settings, host_in_active_scope
-        from bughunter.active_verify_service import scope_admits_subdomains
+        from bughunter.active_verify_service import wildcard_admits_host
 
         settings = get_settings()
         derived = bounty.self_scope_grant("https://acme.example")
         self.assertEqual(derived, "acme.example")
-        self.assertFalse(scope_admits_subdomains(derived),
+        self.assertFalse(wildcard_admits_host(derived, "admin.acme.example"),
                          "a derived grant must not read as a wildcard request")
-        self.assertTrue(scope_admits_subdomains("*.acme.example"),
+        self.assertTrue(wildcard_admits_host("*.acme.example", "admin.acme.example"),
                         "...and an operator-typed wildcard must")
         # The gate itself is unchanged; the caller is what pins it.
         self.assertTrue(host_in_active_scope("admin.acme.example", derived, settings))
         pinned = (lambda host: host_in_active_scope(host, derived, settings)
-                  and (scope_admits_subdomains(derived) or host == derived))
+                  and (host == derived or wildcard_admits_host(derived, host)))
         self.assertTrue(pinned("acme.example"))
         self.assertFalse(pinned("admin.acme.example"),
                          "the hunt's gate must refuse a host the operator never named")
+
+    def test_a_wildcard_for_one_domain_does_not_lift_the_pin_off_another(self) -> None:
+        """``gn hunt https://acme.example -y -s '*.other.example'`` — the mixed scope.
+
+        ``-y`` appends the target's own exact host, so the effective scope is
+        ``*.other.example acme.example``: a wildcard the operator typed about ONE domain, beside a
+        bare token that is an attestation about a DIFFERENT one. Asked of the scope text as a whole
+        ("does any token carry a ``*.``"), the wildcard lifted the exact-host pin for every other
+        token too, and the prover could reach ``admin.acme.example`` — a host nobody attested to,
+        on the strength of a grant about somebody else's domain. The question is per host.
+        """
+        from bughunter.active_verify_service import get_settings, host_in_active_scope
+        from bughunter.active_verify_service import wildcard_admits_host
+
+        settings = get_settings()
+        target_host = bounty.self_scope_grant("https://acme.example")
+        scope = f"*.other.example {target_host}"
+        # host_in_active_scope still admits the subdomain on the bare token's own semantics —
+        # which is exactly why the caller's pin is what has to hold.
+        self.assertTrue(host_in_active_scope("admin.acme.example", scope, settings))
+        pinned = (lambda host: host_in_active_scope(host, scope, settings)
+                  and (host == target_host or wildcard_admits_host(scope, host)))
+        self.assertTrue(pinned("acme.example"), "the attested host is still probed")
+        self.assertFalse(pinned("admin.acme.example"),
+                         "a *.other.example grant must not authorize probing acme.example's "
+                         "subdomains")
+        # ...and the wildcard the operator DID type keeps its full reach.
+        for admitted in ("other.example", "api.other.example", "deep.api.other.example"):
+            with self.subTest(host=admitted):
+                self.assertTrue(pinned(admitted))
+        self.assertFalse(pinned("notother.example"))
 
     def test_a_program_exclusion_still_wins_over_the_self_grant(self) -> None:
         settings = SimpleNamespace(excluded_hosts=("acme.example",))
         _host, error = bounty._url_scope_preflight(
             "https://acme.example", bounty.self_scope_grant("https://acme.example"), settings)
         self.assertIn("excluded", error)
+
+
+class TheMixedScopePinsTheRealHuntTests(unittest.TestCase):
+    """``gn hunt https://acme.example -y -s '*.other.example'`` — driving ``run_bounty_hunt``.
+
+    The tests above pin what the scope functions MEAN. This one pins what a hunt DOES with them,
+    because the defect was in the call site: the wildcard question was asked of the whole scope
+    text, so the one ``*.other.example`` grant the operator typed lifted the exact-host pin off the
+    bare ``acme.example`` token that ``-y`` derived — and both halves of the pin went with it, the
+    recon crawl's gate AND the list of endpoints handed to the prover. So rather than rebuild the
+    gate here, this captures the gate the engine itself builds and the targets the prover itself
+    receives. The scanners, the crawl and the prover are stubbed; the scope decisions are real.
+    """
+
+    TARGET = "https://acme.example"
+    SCOPE = "*.other.example acme.example"   # what -y + -s '*.other.example' produces
+
+    def _run(self, discovered: list[str]) -> tuple[list[Any], list[str]]:
+        """Run a hunt whose crawl finds ``discovered``. Returns (captured gates, probed targets)."""
+        gates: list[Any] = []
+        probed: list[str] = []
+
+        def _fake_discover(target: str, **kwargs: Any) -> dict[str, Any]:
+            gates.append(kwargs.get("scope_in"))
+            return {"urls": list(discovered), "params": [], "forms": [], "tech": [],
+                    "hints": {}, "observations": {}, "host": "acme.example"}
+
+        def _fake_verify(target: str, *_args: Any, **_kwargs: Any) -> tuple[list, dict]:
+            probed.append(str(target))
+            return ([], {"in_scope": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(bounty, "_run_scanners",
+                              return_value=([], ["web"], {"web": {}}, "clean", 0.0, [])), \
+                 patch.object(bounty.recon, "discover", side_effect=_fake_discover), \
+                 patch.object(bounty.active_verify_service, "verify_active",
+                              side_effect=_fake_verify):
+                result = bounty.run_bounty_hunt(
+                    self.TARGET, "web-app", None, tmp, self.SCOPE, True, {},
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                    runtime_dir=Path(tmp), active=True,
+                )
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertTrue(gates, "the hunt's own recon gate was never built")
+        self.assertIsNotNone(gates[0], "a scope was given, so the crawl must be gated")
+        return gates, probed
+
+    def test_the_crawl_gate_refuses_a_subdomain_of_the_attested_host(self) -> None:
+        gates, _probed = self._run([self.TARGET + "/"])
+        gate = gates[0]
+        self.assertTrue(gate("acme.example"), "the attested host is still crawled")
+        self.assertFalse(gate("admin.acme.example"),
+                         "a *.other.example grant must not authorize crawling acme.example's "
+                         "subdomains")
+
+    def test_the_crawl_gate_keeps_the_wildcard_the_operator_typed(self) -> None:
+        gates, _probed = self._run([self.TARGET + "/"])
+        gate = gates[0]
+        for admitted in ("other.example", "api.other.example"):
+            with self.subTest(host=admitted):
+                self.assertTrue(gate(admitted), "the typed wildcard keeps its full reach")
+        self.assertFalse(gate("notother.example"))
+
+    def test_the_prover_is_never_handed_an_endpoint_off_the_pin(self) -> None:
+        """The second half of the pin, and the one that actually bounds live traffic."""
+        _gates, probed = self._run([
+            self.TARGET + "/",
+            "https://admin.acme.example/login",     # the leak: never attested to
+            "https://api.other.example/v1/users",   # the typed wildcard: fair game
+        ])
+        self.assertTrue(probed, "the active pass never ran, so it proves nothing")
+        hosts = {urlparse(url).hostname for url in probed}
+        self.assertNotIn("admin.acme.example", hosts,
+                         "the prover was handed a host the operator never attested to")
+        self.assertIn("acme.example", hosts, "the attested host is still probed")
 
 
 if __name__ == "__main__":

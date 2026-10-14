@@ -1593,6 +1593,76 @@ class TheBoardAnimatesOnlyWhatHappenedTests(unittest.TestCase):
         http._observe("GET", "https://acme.example/x", 200)   # must not raise
 
 
+class EveryBoardsControlsReachTheEngineTests(unittest.TestCase):
+    """The class above pins the key to the flag. This pins the flag to the engine.
+
+    ``gn_cli._fx`` passes ``controls=True`` for every scoped board, so `q` prints STOP REQUESTED
+    over a campaign and over a `gn auto` cycle exactly as it does over a hunt — but only the hunt
+    handed the board's predicate to its engine. A direct campaign registers no progress run id
+    either, so ``progress.is_stopped`` could not see the key press from the other side: the board
+    said stopped and the campaign kept probing. Driven through the real verbs with a real board, so
+    what is pinned is the whole journey — key, flag, predicate, engine argument.
+    """
+
+    def _board(self) -> gn_fx.Board:
+        with mock.patch.object(gn_fx, "_terminal_size", return_value=(104, 30)):
+            return gn_fx.Board("t", stream=_tty("utf-8"), active=True, clock_base=0.0,
+                               controls=True)
+
+    def _captured(self, board: gn_fx.Board, run: object) -> dict:
+        """Run a CLI verb with ``board`` as its surface; return the engine's kwargs."""
+        captured: dict = {}
+
+        def _campaign(*_args: object, **kwargs: object) -> dict:
+            captured.update(kwargs)
+            return {"ok": True, "findings": [], "severity_counts": {}, "campaign_path": "c.md"}
+
+        # The keyboard reader wants a real tty; `_handle_key` is driven directly here, and `hold`
+        # would park the suite on the final frame for a second and a half.
+        with (
+            mock.patch("bughunter.campaign.run_campaign", side_effect=_campaign),
+            mock.patch.object(gn_fx.Board, "_acquire_keys"),
+            mock.patch.object(gn_fx.Board, "_release_keys"),
+            mock.patch.object(gn_fx.Board, "hold"),
+        ):
+            run()
+        self.assertTrue(captured, "the campaign engine was never reached, so this proves nothing")
+        return captured
+
+    def test_a_direct_campaigns_board_can_stop_it_and_see_its_traffic(self) -> None:
+        import gn_cli
+
+        board = self._board()
+        args = gn_cli.build_parser().parse_args(["campaign", "https://acme.example", "-y"])
+        with mock.patch.object(gn_cli, "_fx", return_value=board):
+            captured = self._captured(board, lambda: gn_cli._cmd_campaign(args))
+        self.assertTrue(callable(captured.get("should_stop")),
+                        "the board advertises `q` over a campaign it could not stop")
+        self.assertEqual(captured.get("on_request"), board.request,
+                         "the TRAFFIC view over a campaign was fed by nothing")
+        self.assertFalse(captured["should_stop"]())
+        board._handle_key("q")
+        self.assertTrue(captured["should_stop"](),
+                        "pressing q printed STOP REQUESTED and the campaign never heard it")
+
+    def test_the_auto_cycles_board_can_stop_its_campaigns_too(self) -> None:
+        """`gn auto`'s reviewed cycle is the longest thing an operator watches, and its board
+        carries the same keys. ``progress_run_id`` covers the DASHBOARD's stop; nothing turns a
+        board key into a run-registry stop, which is why the board's own predicate goes beside
+        it."""
+        import gn_cli
+
+        board = self._board()
+        run_campaign_fn = gn_cli._operator_campaign_fn({}, board)
+        captured = self._captured(board, lambda: run_campaign_fn(
+            "https://acme.example", scope="acme.example", program="demo",
+            active=True, live=False))
+        self.assertTrue(callable(captured.get("should_stop")))
+        self.assertEqual(captured.get("on_request"), board.request)
+        board._handle_key("q")
+        self.assertTrue(captured["should_stop"]())
+
+
 class TheResidentBoardTakesACommandLineTests(unittest.TestCase):
     """``interactive=True`` — the board `gn dash` sits on, with an input line under it.
 

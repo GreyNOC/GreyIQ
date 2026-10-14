@@ -909,6 +909,14 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             platform=getattr(args, "platform", "hackerone") or "hackerone",
             deep=getattr(args, "deep", False),
             on_progress=_progress(args, fx),
+            # The board over a campaign advertises the same keys as the board over a hunt, so it
+            # has to reach the same hooks: `q` asks the campaign to stop at the next safe point
+            # (between URLs, and within a URL's own fan-out), and the TRAFFIC view is fed from the
+            # layer the requests leave from. A direct campaign has no progress run id, so without
+            # these the board printed STOP REQUESTED over a campaign that kept probing. getattr:
+            # the one-line Scanner fallback has neither.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
         fx.phase("campaign complete")
@@ -998,6 +1006,11 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             max_pages=args.max_pages,
             platform=args.platform,
             on_progress=_progress(args, fx),
+            # `gn osint --hunt` runs on the one-line Scanner (``_fx`` with no scope), which reads no
+            # keys — so these are None today. Wired anyway: the span must honour whatever surface it
+            # is given, rather than depending on the surface happening to offer no controls.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
             on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
         )
         if not hunt_result.get("ok"):
@@ -1268,6 +1281,13 @@ def _operator_campaign_fn(coder_cfg: dict, fx: Any = None, *, on_auth_needed: An
             disclose_automation=bool(saved.get("disclose_automation")),
             on_auth_needed=on_auth_needed,
             on_progress=sink,
+            # The reviewed `gn auto` cycle runs on a board with the same keys as a hunt's, and a
+            # cycle is the longest-running thing the operator watches — so `q` has to reach the
+            # campaign and the TRAFFIC view has to be fed. ``progress_run_id`` above covers the
+            # DASHBOARD's Stop; nothing translates a board key into a run-registry stop, which is
+            # why the board's own predicate goes in beside it.
+            should_stop=getattr(fx, "stop_requested", None),
+            on_request=getattr(fx, "request", None),
         )
         _fx_report(fx, result, default=str(target))
         return result

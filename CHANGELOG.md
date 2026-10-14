@@ -21,6 +21,15 @@ Notable changes to GreyIQ.
   flight finishes and the report is still written — Ctrl-C remains the hard way out. The board
   releases the keyboard before the engine's auth prompt reads stdin, which is what keeps the two
   off the same tty.
+  A review of this branch caught `q` reaching only one of the three surfaces that offer it. Every
+  scoped board advertises the key, but only `gn hunt` passed the board's predicate to its engine:
+  `gn campaign` and `gn auto`'s reviewed cycle passed neither it nor the request feed, and a direct
+  campaign registers no dashboard run id, so the engine's own `progress.is_stopped` could not see
+  the key press either — the board printed STOP REQUESTED and the campaign went on sending requests
+  at someone else's host. `run_campaign` and `run_campaign_over_targets` now take `should_stop` and
+  `on_request` beside the run id, honour Stop from either source between URLs and inside a single
+  URL's own fan-out, and the CLI wires every board to both. A surface does not offer a control this
+  engine will not honour.
 - **More animation, all of it driven by something real.** A **tracking reticle** closes around the
   asset the prover is hitting at that instant — from the request feed, so when the traffic stops so
   does the reticle; a **request-rate sparkline** on the status bar, one cell per second off the same
@@ -28,7 +37,14 @@ Notable changes to GreyIQ.
   moment it drops, which is the one state change on this board an operator must not miss. The
   traffic feed is taken at `active_verify_service._Http.fetch` — the single chokepoint every active
   request passes through — so it is what actually left the machine rather than a guess from a
-  progress line, and an observer that raises can never cost a probe.
+  progress line, and an observer that raises can never cost a probe. That promise needed one more
+  line to be true: `fetch` reported every refusal it caught, and the preflight refusals — an
+  exhausted request budget, a standing halt, a virtual-host header on an exact-host run, an http URL
+  under an HTTPS-only session, the SSRF guard, the governor — are raised before a socket is opened.
+  The feed and the sparkline gained rows for requests that never happened. The observation is now
+  drawn at the transport attempt itself (the line that increments `sent`), so a refusal is counted
+  as a failure and never shown as traffic, while a request that really went out and then failed
+  still appears.
 
 - **An agent studio, in the board's own theme.** `gn studio` (also `/studio` from the threat board,
   and `gn dash --studio`) is the third view of one cockpit: **BRAIN** (which bot answers, the
@@ -144,7 +160,14 @@ Notable changes to GreyIQ.
   established, and what a wildcard program wants — so a derived grant would have let an `--active`
   hunt reach `admin.acme.example` off `gn hunt https://acme.example -y`. `run_bounty_hunt` and
   `campaign` now **pin** their recon gate and their active prover to the exact host unless the scope
-  carries a `*.` token (`active_verify_service.scope_admits_subdomains`). A URL on a code forge — a
+  carries a `*.` token. That question was first asked of the scope TEXT as a whole — "does any
+  token carry a `*.`" — and a second review pass caught it widening scope on its own: with `-s
+  '*.other.example'`, `-y` makes the effective scope `*.other.example acme.example`, and the one
+  wildcard lifted the pin off the other token, so the crawl and the prover could reach
+  `admin.acme.example` on the strength of a grant about somebody else's domain. A wildcard is a
+  grant about the domain it names, so the question now takes the host it is being asked about
+  (`active_verify_service.wildcard_admits_host`) and the global form is gone. A real wildcard
+  program's reach is unchanged. A URL on a code forge — a
   repository link with a query, a fragment, a `/tree/` path, or an org with no repository — grants
   **nothing** rather than the whole forge, which is a shared platform with thousands of unrelated
   tenants; the canonical repository root still grants the repository and no host authority at all.
